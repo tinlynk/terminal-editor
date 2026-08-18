@@ -1,0 +1,40 @@
+[package]
+name = "tinlynk-terminal-editor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A lightweight terminal-native editor and multiplexer."
+license = "MIT"
+
+[[bin]]
+name = "tinlynk-editor"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "=0.23.1"
+crossterm = "=0.29.0"
+globset = "=0.4.20"
+libc = "=0.2.189"
+portable-pty = "=0.9.0"
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+ropey = "=1.6.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = "=1.1.4"
+toml_edit = "=0.25.13"
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.2"
+vte = "=0.15.0"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "deny"

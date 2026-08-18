@@ -1,0 +1,1043 @@
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use toml_edit::DocumentMut;
+
+use crate::{AppError, Result};
+
+const CONFIG_RELATIVE_PATH: &str = ".tinlynk/terminal-editor/config.toml";
+const DEFAULT_UNDO_LIMIT_MIB: usize = 32;
+const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineEnding {
+    #[default]
+    Lf,
+    Crlf,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct EditorConfig {
+    pub indent_width: u8,
+    pub insert_spaces: bool,
+    pub default_line_ending: LineEnding,
+    pub undo_limit_mib: usize,
+    pub line_numbers: bool,
+    pub scrollbar: bool,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            indent_width: 4,
+            insert_spaces: true,
+            default_line_ending: LineEnding::Lf,
+            undo_limit_mib: DEFAULT_UNDO_LIMIT_MIB,
+            line_numbers: true,
+            scrollbar: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    pub minimum_pane_width: u16,
+    pub minimum_pane_height: u16,
+    pub initial_split_ratio: f32,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            minimum_pane_width: 12,
+            minimum_pane_height: 4,
+            initial_split_ratio: 0.5,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ExplorerConfig {
+    pub visible: bool,
+    pub width: u16,
+    pub exclusions: Vec<String>,
+    pub refresh_interval_seconds: u64,
+}
+
+impl Default for ExplorerConfig {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            width: 24,
+            exclusions: vec![".git".to_owned(), ".git/**".to_owned()],
+            refresh_interval_seconds: 5,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct MouseConfig {
+    pub enabled: bool,
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    pub osc52: bool,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self { osc52: true }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    pub shell: Option<PathBuf>,
+    pub arguments: Vec<String>,
+    pub scrollback_lines: usize,
+    pub allow_child_osc52_write: bool,
+    pub leader: String,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            shell: None,
+            arguments: Vec::new(),
+            scrollback_lines: DEFAULT_SCROLLBACK_LINES,
+            allow_child_osc52_write: false,
+            leader: "ctrl+b".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub bottom_terminal_visible: bool,
+    pub bottom_terminal_height: u16,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            bottom_terminal_visible: false,
+            bottom_terminal_height: 8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct Config {
+    pub editor: EditorConfig,
+    pub workspace: WorkspaceConfig,
+    pub explorer: ExplorerConfig,
+    pub mouse: MouseConfig,
+    pub clipboard: ClipboardConfig,
+    pub terminal: TerminalConfig,
+    pub ui: UiConfig,
+    pub keybindings: BTreeMap<String, String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            editor: EditorConfig::default(),
+            workspace: WorkspaceConfig::default(),
+            explorer: ExplorerConfig::default(),
+            mouse: MouseConfig::default(),
+            clipboard: ClipboardConfig::default(),
+            terminal: TerminalConfig::default(),
+            ui: UiConfig::default(),
+            keybindings: default_keybindings(),
+        }
+    }
+}
+
+fn default_keybindings() -> BTreeMap<String, String> {
+    [
+        ("ctrl+q", "quit"),
+        ("ctrl+s", "save"),
+        ("ctrl+o", "open"),
+        ("ctrl+w", "close-pane"),
+        ("ctrl+z", "undo"),
+        ("ctrl+y", "redo"),
+        ("ctrl+g", "settings"),
+        ("ctrl+t", "toggle-terminal"),
+    ]
+    .into_iter()
+    .map(|(key, command)| (key.to_owned(), command.to_owned()))
+    .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigScope {
+    Default,
+    User,
+    Workspace,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigDiagnostic {
+    pub scope: ConfigScope,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedConfig {
+    pub effective: Config,
+    pub user_path: PathBuf,
+    pub workspace_path: PathBuf,
+    pub diagnostics: Vec<ConfigDiagnostic>,
+    pub provenance: BTreeMap<String, ConfigScope>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialConfig {
+    editor: Option<PartialEditorConfig>,
+    workspace: Option<PartialWorkspaceConfig>,
+    explorer: Option<PartialExplorerConfig>,
+    mouse: Option<PartialMouseConfig>,
+    clipboard: Option<PartialClipboardConfig>,
+    terminal: Option<PartialTerminalConfig>,
+    ui: Option<PartialUiConfig>,
+    keybindings: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialEditorConfig {
+    indent_width: Option<u8>,
+    insert_spaces: Option<bool>,
+    default_line_ending: Option<LineEnding>,
+    undo_limit_mib: Option<usize>,
+    line_numbers: Option<bool>,
+    scrollbar: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialWorkspaceConfig {
+    minimum_pane_width: Option<u16>,
+    minimum_pane_height: Option<u16>,
+    initial_split_ratio: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialExplorerConfig {
+    visible: Option<bool>,
+    width: Option<u16>,
+    exclusions: Option<Vec<String>>,
+    refresh_interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialMouseConfig {
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialClipboardConfig {
+    osc52: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialTerminalConfig {
+    shell: Option<PathBuf>,
+    arguments: Option<Vec<String>>,
+    scrollback_lines: Option<usize>,
+    allow_child_osc52_write: Option<bool>,
+    leader: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialUiConfig {
+    bottom_terminal_visible: Option<bool>,
+    bottom_terminal_height: Option<u16>,
+}
+
+impl LoadedConfig {
+    pub fn load(workspace_root: &Path) -> Result<Self> {
+        let user_path = user_config_path()?;
+        let workspace_path = workspace_root.join(CONFIG_RELATIVE_PATH);
+        Self::load_paths(user_path, workspace_path)
+    }
+
+    fn load_paths(user_path: PathBuf, workspace_path: PathBuf) -> Result<Self> {
+        let mut diagnostics = Vec::new();
+        let user = read_scope(&user_path, ConfigScope::User, &mut diagnostics)?;
+        let workspace = read_scope(&workspace_path, ConfigScope::Workspace, &mut diagnostics)?;
+        let mut effective = Config::default();
+        let mut provenance = default_provenance();
+        apply_scope(
+            &mut effective,
+            user,
+            ConfigScope::User,
+            &mut provenance,
+            &mut diagnostics,
+        );
+        apply_scope(
+            &mut effective,
+            workspace,
+            ConfigScope::Workspace,
+            &mut provenance,
+            &mut diagnostics,
+        );
+        validate(&mut effective, &mut diagnostics);
+        Ok(Self {
+            effective,
+            user_path,
+            workspace_path,
+            diagnostics,
+            provenance,
+        })
+    }
+
+    pub fn ensure_raw_config(&self, scope: ConfigScope) -> Result<PathBuf> {
+        let path = match scope {
+            ConfigScope::User => &self.user_path,
+            ConfigScope::Workspace => &self.workspace_path,
+            ConfigScope::Default => {
+                return Err(AppError::Arguments(
+                    "default settings do not have a writable raw configuration".to_owned(),
+                ));
+            }
+        };
+        if path.exists() {
+            return Ok(path.clone());
+        }
+        let parent = path.parent().ok_or_else(|| {
+            AppError::Arguments(format!("{} has no parent directory", path.display()))
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::io(format!("could not create {}", parent.display()), error)
+        })?;
+        let starter =
+            toml::to_string_pretty(&Config::default()).map_err(|error| AppError::Config {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        fs::write(path, starter)
+            .map_err(|error| AppError::io(format!("could not create {}", path.display()), error))?;
+        Ok(path.clone())
+    }
+
+    pub fn reset_setting(&mut self, scope: ConfigScope, dotted_key: &str) -> Result<()> {
+        let path = match scope {
+            ConfigScope::User => self.user_path.clone(),
+            ConfigScope::Workspace => self.workspace_path.clone(),
+            ConfigScope::Default => {
+                return Err(AppError::Arguments(
+                    "default settings cannot be reset".to_owned(),
+                ));
+            }
+        };
+        if scope == ConfigScope::Workspace && dotted_key.starts_with("terminal.") {
+            return Err(AppError::Arguments(
+                "terminal settings are restricted to user configuration".to_owned(),
+            ));
+        }
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(AppError::io(
+                    format!("could not read {}", path.display()),
+                    error,
+                ));
+            }
+        };
+        let mut document = text
+            .parse::<DocumentMut>()
+            .map_err(|error| AppError::Config {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        remove_dotted_key(&mut document, dotted_key)?;
+        atomic_config_write(&path, document.to_string().as_bytes())?;
+        *self = Self::load_paths(self.user_path.clone(), self.workspace_path.clone())?;
+        Ok(())
+    }
+}
+
+fn remove_dotted_key(document: &mut DocumentMut, dotted_key: &str) -> Result<()> {
+    let mut segments = dotted_key.split('.').collect::<Vec<_>>();
+    let leaf = segments
+        .pop()
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(|| AppError::Arguments("setting key must not be empty".to_owned()))?;
+    let mut table = document.as_table_mut();
+    for segment in segments {
+        let Some(item) = table.get_mut(segment) else {
+            return Ok(());
+        };
+        let Some(next) = item.as_table_mut() else {
+            return Err(AppError::Arguments(format!(
+                "`{segment}` is not a configuration table"
+            )));
+        };
+        table = next;
+    }
+    table.remove(leaf);
+    Ok(())
+}
+
+fn atomic_config_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Arguments(format!("{} has no parent directory", path.display()))
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| AppError::io(format!("could not create {}", parent.display()), error))?;
+    let temporary = path.with_extension("toml.tinlynk.tmp");
+    fs::write(&temporary, bytes)
+        .map_err(|error| AppError::io(format!("could not write {}", temporary.display()), error))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| AppError::io(format!("could not replace {}", path.display()), error))
+}
+
+fn user_config_path() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join(CONFIG_RELATIVE_PATH))
+        .ok_or_else(|| {
+            AppError::Arguments("HOME is not set; user configuration is unavailable".to_owned())
+        })
+}
+
+fn read_scope(
+    path: &Path,
+    scope: ConfigScope,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<PartialConfig> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PartialConfig::default());
+        }
+        Err(error) => {
+            return Err(AppError::io(
+                format!("could not read {}", path.display()),
+                error,
+            ));
+        }
+    };
+    let value: toml::Value = match toml::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.push(ConfigDiagnostic {
+                scope,
+                message: format!("could not parse {}: {error}", path.display()),
+            });
+            return Ok(PartialConfig::default());
+        }
+    };
+    warn_unknown_keys(&value, scope, diagnostics);
+    Ok(parse_partial_config(&value, path, scope, diagnostics))
+}
+
+fn parse_partial_config(
+    value: &toml::Value,
+    path: &Path,
+    scope: ConfigScope,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> PartialConfig {
+    let Some(root) = value.as_table() else {
+        diagnostics.push(ConfigDiagnostic {
+            scope,
+            message: format!("{} must contain configuration tables", path.display()),
+        });
+        return PartialConfig::default();
+    };
+    PartialConfig {
+        editor: config_table(root, "editor", path, scope, diagnostics).map(|table| {
+            PartialEditorConfig {
+                indent_width: config_value(
+                    table,
+                    "indent_width",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                insert_spaces: config_value(
+                    table,
+                    "insert_spaces",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                default_line_ending: config_value(
+                    table,
+                    "default_line_ending",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                undo_limit_mib: config_value(
+                    table,
+                    "undo_limit_mib",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                line_numbers: config_value(
+                    table,
+                    "line_numbers",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                scrollbar: config_value(table, "scrollbar", "editor", path, scope, diagnostics),
+            }
+        }),
+        workspace: config_table(root, "workspace", path, scope, diagnostics).map(|table| {
+            PartialWorkspaceConfig {
+                minimum_pane_width: config_value(
+                    table,
+                    "minimum_pane_width",
+                    "workspace",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                minimum_pane_height: config_value(
+                    table,
+                    "minimum_pane_height",
+                    "workspace",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                initial_split_ratio: config_value(
+                    table,
+                    "initial_split_ratio",
+                    "workspace",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+            }
+        }),
+        explorer: config_table(root, "explorer", path, scope, diagnostics).map(|table| {
+            PartialExplorerConfig {
+                visible: config_value(table, "visible", "explorer", path, scope, diagnostics),
+                width: config_value(table, "width", "explorer", path, scope, diagnostics),
+                exclusions: config_value(table, "exclusions", "explorer", path, scope, diagnostics),
+                refresh_interval_seconds: config_value(
+                    table,
+                    "refresh_interval_seconds",
+                    "explorer",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+            }
+        }),
+        mouse: config_table(root, "mouse", path, scope, diagnostics).map(|table| {
+            PartialMouseConfig {
+                enabled: config_value(table, "enabled", "mouse", path, scope, diagnostics),
+            }
+        }),
+        clipboard: config_table(root, "clipboard", path, scope, diagnostics).map(|table| {
+            PartialClipboardConfig {
+                osc52: config_value(table, "osc52", "clipboard", path, scope, diagnostics),
+            }
+        }),
+        terminal: config_table(root, "terminal", path, scope, diagnostics).map(|table| {
+            PartialTerminalConfig {
+                shell: config_value(table, "shell", "terminal", path, scope, diagnostics),
+                arguments: config_value(table, "arguments", "terminal", path, scope, diagnostics),
+                scrollback_lines: config_value(
+                    table,
+                    "scrollback_lines",
+                    "terminal",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                allow_child_osc52_write: config_value(
+                    table,
+                    "allow_child_osc52_write",
+                    "terminal",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                leader: config_value(table, "leader", "terminal", path, scope, diagnostics),
+            }
+        }),
+        ui: config_table(root, "ui", path, scope, diagnostics).map(|table| PartialUiConfig {
+            bottom_terminal_visible: config_value(
+                table,
+                "bottom_terminal_visible",
+                "ui",
+                path,
+                scope,
+                diagnostics,
+            ),
+            bottom_terminal_height: config_value(
+                table,
+                "bottom_terminal_height",
+                "ui",
+                path,
+                scope,
+                diagnostics,
+            ),
+        }),
+        keybindings: config_table(root, "keybindings", path, scope, diagnostics).map(|table| {
+            table
+                .iter()
+                .filter_map(|(key, value)| match value.clone().try_into::<String>() {
+                    Ok(command) if valid_keybinding(key, &command) => Some((key.clone(), command)),
+                    Ok(command) => {
+                        diagnostics.push(ConfigDiagnostic {
+                            scope,
+                            message: format!(
+                                "invalid known value `keybindings.{key}` in {}: `{command}` is not a supported non-empty command; its default or lower-scope value was used",
+                                path.display()
+                            ),
+                        });
+                        None
+                    }
+                    Err(error) => {
+                        invalid_config_value(
+                            path,
+                            scope,
+                            &format!("keybindings.{key}"),
+                            &error,
+                            diagnostics,
+                        );
+                        None
+                    }
+                })
+                .collect()
+        }),
+    }
+}
+
+fn config_table<'a>(
+    root: &'a toml::Table,
+    key: &str,
+    path: &Path,
+    scope: ConfigScope,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Option<&'a toml::Table> {
+    let value = root.get(key)?;
+    match value.as_table() {
+        Some(table) => Some(table),
+        None => {
+            diagnostics.push(ConfigDiagnostic {
+                scope,
+                message: format!(
+                    "invalid known value `{key}` in {}: expected a table",
+                    path.display()
+                ),
+            });
+            None
+        }
+    }
+}
+
+fn config_value<T: DeserializeOwned>(
+    table: &toml::Table,
+    key: &str,
+    table_name: &str,
+    path: &Path,
+    scope: ConfigScope,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Option<T> {
+    let value = table.get(key)?;
+    match value.clone().try_into() {
+        Ok(value) => Some(value),
+        Err(error) => {
+            invalid_config_value(
+                path,
+                scope,
+                &format!("{table_name}.{key}"),
+                &error,
+                diagnostics,
+            );
+            None
+        }
+    }
+}
+
+fn invalid_config_value(
+    path: &Path,
+    scope: ConfigScope,
+    key: &str,
+    error: &toml::de::Error,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    diagnostics.push(ConfigDiagnostic {
+        scope,
+        message: format!(
+            "invalid known value `{key}` in {}: {error}; its default or lower-scope value was used",
+            path.display()
+        ),
+    });
+}
+
+fn warn_unknown_keys(
+    value: &toml::Value,
+    scope: ConfigScope,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    const KNOWN: &[&str] = &[
+        "editor",
+        "workspace",
+        "explorer",
+        "mouse",
+        "clipboard",
+        "terminal",
+        "ui",
+        "keybindings",
+    ];
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for key in table.keys().filter(|key| !KNOWN.contains(&key.as_str())) {
+        diagnostics.push(ConfigDiagnostic {
+            scope,
+            message: format!("unknown configuration table or key `{key}`"),
+        });
+    }
+}
+
+fn apply_scope(
+    config: &mut Config,
+    partial: PartialConfig,
+    scope: ConfigScope,
+    provenance: &mut BTreeMap<String, ConfigScope>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    if let Some(editor) = partial.editor {
+        assign(&mut config.editor.indent_width, editor.indent_width);
+        assign(&mut config.editor.insert_spaces, editor.insert_spaces);
+        assign(
+            &mut config.editor.default_line_ending,
+            editor.default_line_ending,
+        );
+        assign(&mut config.editor.undo_limit_mib, editor.undo_limit_mib);
+        assign(&mut config.editor.line_numbers, editor.line_numbers);
+        assign(&mut config.editor.scrollbar, editor.scrollbar);
+        provenance.insert("editor".to_owned(), scope);
+    }
+    if let Some(workspace) = partial.workspace {
+        assign(
+            &mut config.workspace.minimum_pane_width,
+            workspace.minimum_pane_width,
+        );
+        assign(
+            &mut config.workspace.minimum_pane_height,
+            workspace.minimum_pane_height,
+        );
+        assign(
+            &mut config.workspace.initial_split_ratio,
+            workspace.initial_split_ratio,
+        );
+        provenance.insert("workspace".to_owned(), scope);
+    }
+    if let Some(explorer) = partial.explorer {
+        assign(&mut config.explorer.visible, explorer.visible);
+        assign(&mut config.explorer.width, explorer.width);
+        assign(&mut config.explorer.exclusions, explorer.exclusions);
+        assign(
+            &mut config.explorer.refresh_interval_seconds,
+            explorer.refresh_interval_seconds,
+        );
+        provenance.insert("explorer".to_owned(), scope);
+    }
+    if let Some(mouse) = partial.mouse {
+        assign(&mut config.mouse.enabled, mouse.enabled);
+        provenance.insert("mouse".to_owned(), scope);
+    }
+    if let Some(clipboard) = partial.clipboard {
+        assign(&mut config.clipboard.osc52, clipboard.osc52);
+        provenance.insert("clipboard".to_owned(), scope);
+    }
+    if let Some(ui) = partial.ui {
+        assign(
+            &mut config.ui.bottom_terminal_visible,
+            ui.bottom_terminal_visible,
+        );
+        assign(
+            &mut config.ui.bottom_terminal_height,
+            ui.bottom_terminal_height,
+        );
+        provenance.insert("ui".to_owned(), scope);
+    }
+    if let Some(bindings) = partial.keybindings {
+        config.keybindings.extend(bindings);
+        provenance.insert("keybindings".to_owned(), scope);
+    }
+    if let Some(terminal) = partial.terminal {
+        if scope == ConfigScope::Workspace {
+            diagnostics.push(ConfigDiagnostic {
+                scope,
+                message: "workspace terminal settings are restricted and were ignored".to_owned(),
+            });
+        } else {
+            assign(&mut config.terminal.shell, terminal.shell.map(Some));
+            assign(&mut config.terminal.arguments, terminal.arguments);
+            assign(
+                &mut config.terminal.scrollback_lines,
+                terminal.scrollback_lines,
+            );
+            assign(
+                &mut config.terminal.allow_child_osc52_write,
+                terminal.allow_child_osc52_write,
+            );
+            assign(&mut config.terminal.leader, terminal.leader);
+            provenance.insert("terminal".to_owned(), scope);
+        }
+    }
+}
+
+fn assign<T>(target: &mut T, value: Option<T>) {
+    if let Some(value) = value {
+        *target = value;
+    }
+}
+
+fn validate(config: &mut Config, diagnostics: &mut Vec<ConfigDiagnostic>) {
+    let defaults = Config::default();
+    let mut fallback = |condition: bool, message: &str| {
+        if condition {
+            diagnostics.push(ConfigDiagnostic {
+                scope: ConfigScope::Default,
+                message: message.to_owned(),
+            });
+        }
+        condition
+    };
+    if fallback(
+        !(1..=16).contains(&config.editor.indent_width),
+        "editor.indent_width must be between 1 and 16; the default was used",
+    ) {
+        config.editor.indent_width = defaults.editor.indent_width;
+    }
+    if fallback(
+        config.editor.undo_limit_mib == 0,
+        "editor.undo_limit_mib must be greater than zero; the default was used",
+    ) {
+        config.editor.undo_limit_mib = defaults.editor.undo_limit_mib;
+    }
+    if fallback(
+        !(0.1..=0.9).contains(&config.workspace.initial_split_ratio),
+        "workspace.initial_split_ratio must be between 0.1 and 0.9; the default was used",
+    ) {
+        config.workspace.initial_split_ratio = defaults.workspace.initial_split_ratio;
+    }
+    if fallback(
+        config.terminal.scrollback_lines == 0,
+        "terminal.scrollback_lines must be greater than zero; the default was used",
+    ) {
+        config.terminal.scrollback_lines = defaults.terminal.scrollback_lines;
+    }
+}
+
+fn valid_keybinding(sequence: &str, command: &str) -> bool {
+    const COMMANDS: &[&str] = &[
+        "quit",
+        "save",
+        "open",
+        "close-pane",
+        "split-vertical",
+        "split-horizontal",
+        "undo",
+        "redo",
+        "settings",
+        "toggle-terminal",
+        "toggle-explorer",
+    ];
+    !sequence.trim().is_empty() && COMMANDS.contains(&command)
+}
+
+fn default_provenance() -> BTreeMap<String, ConfigScope> {
+    [
+        "editor",
+        "workspace",
+        "explorer",
+        "mouse",
+        "clipboard",
+        "terminal",
+        "ui",
+        "keybindings",
+    ]
+    .into_iter()
+    .map(|key| (key.to_owned(), ConfigScope::Default))
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn defaults_are_safe() {
+        let config = Config::default();
+        assert_eq!(config.editor.undo_limit_mib, 32);
+        assert_eq!(config.explorer.refresh_interval_seconds, 5);
+        assert_eq!(config.terminal.scrollback_lines, 10_000);
+        assert!(!config.terminal.allow_child_osc52_write);
+    }
+
+    #[test]
+    fn workspace_terminal_settings_are_restricted() {
+        let mut config = Config::default();
+        let mut diagnostics = Vec::new();
+        let partial = PartialConfig {
+            terminal: Some(PartialTerminalConfig {
+                shell: Some(PathBuf::from("/untrusted/shell")),
+                ..PartialTerminalConfig::default()
+            }),
+            ..PartialConfig::default()
+        };
+        apply_scope(
+            &mut config,
+            partial,
+            ConfigScope::Workspace,
+            &mut default_provenance(),
+            &mut diagnostics,
+        );
+        assert_eq!(config.terminal.shell, None);
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn workspace_bindings_merge_individually() {
+        let mut config = Config::default();
+        let mut diagnostics = Vec::new();
+        let partial = PartialConfig {
+            keybindings: Some(BTreeMap::from([(
+                "ctrl+s".to_owned(),
+                "save-as".to_owned(),
+            )])),
+            ..PartialConfig::default()
+        };
+        apply_scope(
+            &mut config,
+            partial,
+            ConfigScope::Workspace,
+            &mut default_provenance(),
+            &mut diagnostics,
+        );
+        assert_eq!(config.keybindings["ctrl+s"], "save-as");
+        assert!(config.keybindings.contains_key("ctrl+q"));
+    }
+
+    #[test]
+    fn partial_table_override_preserves_other_values() {
+        let mut config = Config::default();
+        config.editor.indent_width = 2;
+        let partial = PartialConfig {
+            editor: Some(PartialEditorConfig {
+                line_numbers: Some(false),
+                ..PartialEditorConfig::default()
+            }),
+            ..PartialConfig::default()
+        };
+        apply_scope(
+            &mut config,
+            partial,
+            ConfigScope::Workspace,
+            &mut default_provenance(),
+            &mut Vec::new(),
+        );
+        assert_eq!(config.editor.indent_width, 2);
+        assert!(!config.editor.line_numbers);
+    }
+
+    #[test]
+    fn invalid_value_preserves_valid_siblings() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(
+            &user_path,
+            "[editor]\nindent_width = \"invalid\"\nline_numbers = false\n[explorer]\nwidth = 31\n",
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+        assert_eq!(loaded.effective.editor.indent_width, 4);
+        assert!(!loaded.effective.editor.line_numbers);
+        assert_eq!(loaded.effective.explorer.width, 31);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("editor.indent_width"))
+        );
+    }
+
+    #[test]
+    fn invalid_keybinding_preserves_the_lower_scope_binding() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(&user_path, "[keybindings]\n\"ctrl+s\" = \"unknown\"\n").unwrap();
+        let loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+        assert_eq!(loaded.effective.keybindings["ctrl+s"], "save");
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("keybindings.ctrl+s"))
+        );
+    }
+
+    #[test]
+    fn reset_preserves_comments_and_unrelated_values() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(
+            &user_path,
+            "# retained comment\n[editor]\nindent_width = 2\nline_numbers = false\n",
+        )
+        .unwrap();
+        let mut loaded = LoadedConfig::load_paths(user_path.clone(), workspace_path).unwrap();
+        loaded
+            .reset_setting(ConfigScope::User, "editor.indent_width")
+            .unwrap();
+        let text = fs::read_to_string(user_path).unwrap();
+        assert!(text.contains("# retained comment"));
+        assert!(text.contains("line_numbers = false"));
+        assert!(!text.contains("indent_width"));
+        assert_eq!(loaded.effective.editor.indent_width, 4);
+    }
+}

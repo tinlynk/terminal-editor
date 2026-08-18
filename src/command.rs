@@ -1,0 +1,42 @@
+use std::path::PathBuf;
+
+use crate::layout::{FocusDirection, SplitDirection, SplitId};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    Quit,
+    Save,
+    SaveAs(PathBuf),
+    OpenDialog,
+    Open(PathBuf),
+    ClosePane,
+    Split(SplitDirection),
+    OpenInSplit(PathBuf, SplitDirection),
+    MoveFocus(FocusDirection),
+    ResizeSplit { id: SplitId, ratio: f32 },
+    ToggleExplorer,
+    ToggleBottomTerminal,
+    OpenSettings,
+    Undo,
+    Redo,
+    Copy,
+    Cut,
+    PasteClipboard,
+    Paste(String),
+    Insert(String),
+    Newline,
+    DeleteBackward,
+    DeleteForward,
+    Indent,
+    Unindent,
+    MoveLeft { selecting: bool },
+    MoveRight { selecting: bool },
+    MoveUp { selecting: bool },
+    MoveDown { selecting: bool },
+    Home { selecting: bool },
+    End { selecting: bool },
+    PageUp { selecting: bool },
+    PageDown { selecting: bool },
+    Scroll(i16),
+    NoOp,
+}
