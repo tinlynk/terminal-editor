@@ -55,9 +55,7 @@ impl Application {
                 view.viewport_wrap_segment = 0;
             }
         }
-        if let (Some(area), Some(session)) =
-            (geometry.terminal, self.bottom_terminal.as_mut())
-        {
+        if let (Some(area), Some(session)) = (geometry.terminal, self.bottom_terminal.as_mut()) {
             session.resize_screen(
                 area.height.saturating_sub(2).max(1),
                 area.width.saturating_sub(2).max(1),

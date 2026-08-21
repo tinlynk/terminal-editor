@@ -21,6 +21,14 @@ pub enum LineEnding {
     Crlf,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorHeaderStyle {
+    #[default]
+    Tabs,
+    Breadcrumbs,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct EditorConfig {
@@ -31,6 +39,7 @@ pub struct EditorConfig {
     pub line_numbers: bool,
     pub scrollbar: bool,
     pub soft_wrap: bool,
+    pub header_style: EditorHeaderStyle,
 }
 
 impl Default for EditorConfig {
@@ -43,6 +52,7 @@ impl Default for EditorConfig {
             line_numbers: true,
             scrollbar: true,
             soft_wrap: false,
+            header_style: EditorHeaderStyle::Tabs,
         }
     }
 }
@@ -253,6 +263,7 @@ struct PartialEditorConfig {
     line_numbers: Option<bool>,
     scrollbar: Option<bool>,
     soft_wrap: Option<bool>,
+    header_style: Option<EditorHeaderStyle>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -598,6 +609,7 @@ fn parse_partial_config(
                 ),
                 scrollbar: config_value(table, "scrollbar", "editor", path, scope, diagnostics),
                 soft_wrap: config_value(table, "soft_wrap", "editor", path, scope, diagnostics),
+                header_style: config_value(table, "header_style", "editor", path, scope, diagnostics),
             }
         }),
         workspace: config_table(root, "workspace", path, scope, diagnostics).map(|table| {
@@ -838,6 +850,7 @@ fn apply_scope(
         assign(&mut config.editor.line_numbers, editor.line_numbers);
         assign(&mut config.editor.scrollbar, editor.scrollbar);
         assign(&mut config.editor.soft_wrap, editor.soft_wrap);
+        assign(&mut config.editor.header_style, editor.header_style);
         provenance.insert("editor".to_owned(), scope);
     }
     if let Some(workspace) = partial.workspace {
@@ -1038,9 +1051,26 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.editor.undo_limit_mib, 32);
         assert!(!config.editor.soft_wrap);
+        assert_eq!(config.editor.header_style, EditorHeaderStyle::Tabs);
         assert_eq!(config.explorer.refresh_interval_seconds, 5);
         assert_eq!(config.terminal.scrollback_lines, 10_000);
         assert!(!config.terminal.allow_child_osc52_write);
+    }
+
+    #[test]
+    fn header_style_can_be_configured_to_breadcrumbs() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(&user_path, "[editor]\nheader_style = \"breadcrumbs\"\n").unwrap();
+
+        let loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+
+        assert_eq!(
+            loaded.effective.editor.header_style,
+            EditorHeaderStyle::Breadcrumbs
+        );
+        assert_eq!(loaded.provenance["editor"], ConfigScope::User);
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub enum TitleControlAction {
 impl TitleControlAction {
     pub fn status_hint(self) -> &'static str {
         match self {
-            Self::ToggleLeftPanel => "Toggle Left Panel",
+            Self::ToggleLeftPanel => "Toggle Explorer",
             Self::ToggleBottomPanel => "Toggle Bottom Panel",
             Self::OpenSettings => "Open Settings",
         }
@@ -50,7 +50,10 @@ pub struct TitleControls {
 
 impl TitleControls {
     pub fn action_at(self, column: u16, row: u16) -> Option<TitleControlAction> {
-        if self.left_panel_toggle.is_some_and(|area| area.contains(column, row)) {
+        if self
+            .left_panel_toggle
+            .is_some_and(|area| area.contains(column, row))
+        {
             Some(TitleControlAction::ToggleLeftPanel)
         } else if self
             .bottom_panel_toggle
@@ -201,6 +204,50 @@ pub fn explorer_rows(area: Rect, open_editor_count: usize, expanded: bool) -> Ex
     }
 }
 
+pub fn editor_tab_at(
+    application: &Application,
+    pane_area: Rect,
+    x: u16,
+    y: u16,
+) -> Option<crate::document::DocumentId> {
+    if y != pane_area.y {
+        return None;
+    }
+    if application.config.effective.editor.header_style != crate::config::EditorHeaderStyle::Tabs {
+        return None;
+    }
+    let open_ids = application.open_document_ids();
+    if open_ids.is_empty() {
+        return None;
+    }
+    // Tabs are rendered in the title starting at pane_area.x + 1 (inside the top-left corner)
+    let mut current_x = pane_area.x.saturating_add(1);
+    for (index, doc_id) in open_ids.iter().enumerate() {
+        if index > 0 {
+            current_x = current_x.saturating_add(1); // divider "│"
+        }
+        let doc = application.documents.get(*doc_id);
+        let name = doc
+            .path
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .map_or("Untitled".to_owned(), |n| n.to_string_lossy().into_owned());
+        let modified = if doc.is_modified() {
+            format!(" {}", application.theme.icons.modified)
+        } else {
+            String::new()
+        };
+        let label = format!(" {name}{modified} ");
+        let tab_width = u16::try_from(UnicodeWidthStr::width(label.as_str())).unwrap_or(u16::MAX);
+        let tab_end = current_x.saturating_add(tab_width);
+        if x >= current_x && x < tab_end {
+            return Some(*doc_id);
+        }
+        current_x = tab_end;
+    }
+    None
+}
+
 pub fn geometry(application: &Application, screen: Rect) -> WorkbenchGeometry {
     let status_height = u16::from(screen.height > 0);
     let show_title = screen.height >= 12;
@@ -320,7 +367,7 @@ pub fn draw(frame: &mut Frame<'_>, application: &Application) {
             ..area
         };
         frame.render_widget(
-            Paragraph::new(APPLICATION_TITLE).style(title_style),
+            Paragraph::new(APPLICATION_TITLE).style(title_style.add_modifier(Modifier::BOLD)),
             to_tui(title_row),
         );
         draw_title_controls(frame, application, geometry.title_controls);
@@ -348,10 +395,9 @@ fn draw_title_controls(frame: &mut Frame<'_>, application: &Application, control
         .fg(application.theme.colors.title_foreground)
         .bg(background)
         .add_modifier(Modifier::BOLD);
-    // keep this here; do not remove
-    // let disabled = Style::default()
-    //     .fg(application.theme.colors.disabled)
-    //     .bg(background);
+    let disabled = Style::default()
+        .fg(application.theme.colors.disabled)
+        .bg(background);
     for (area, label, style) in [
         (
             controls.left_panel_toggle,
@@ -371,12 +417,11 @@ fn draw_title_controls(frame: &mut Frame<'_>, application: &Application, control
             },
             available,
         ),
-        // keep this here; do not remove
-        // (
-        //     controls.right_panel_toggle,
-        //     application.theme.icons.right_panel_hidden.as_str(),
-        //     disabled,
-        // ),
+        (
+            controls.right_panel_toggle,
+            application.theme.icons.right_panel_hidden.as_str(),
+            disabled,
+        ),
         (
             controls.settings,
             application.theme.icons.settings.as_str(),
@@ -384,10 +429,7 @@ fn draw_title_controls(frame: &mut Frame<'_>, application: &Application, control
         ),
     ] {
         if let Some(area) = area {
-            frame.render_widget(
-                Block::default().style(style),
-                to_tui(area),
-            );
+            frame.render_widget(Block::default().style(style), to_tui(area));
             let label_row = Rect {
                 y: area.y.saturating_add(area.height.saturating_sub(1) / 2),
                 height: 1,
@@ -410,8 +452,11 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
         Style::default()
             .bg(application.theme.colors.selected_row_background)
             .fg(application.theme.colors.foreground)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(application.theme.colors.muted)
+        Style::default()
+            .fg(application.theme.colors.muted)
+            .add_modifier(Modifier::BOLD)
     };
     let mut lines = vec![Line::styled(
         format!(
@@ -446,27 +491,27 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
         }
     }
     lines.push(Line::raw(""));
+    let root_name = application
+        .explorer
+        .root
+        .file_name()
+        .unwrap_or(application.explorer.root.as_os_str())
+        .to_string_lossy();
     lines.push(Line::styled(
-        application
-            .explorer
-            .root
-            .file_name()
-            .unwrap_or(application.explorer.root.as_os_str())
-            .to_string_lossy()
-            .into_owned(),
+        format!("{} {root_name}", application.theme.icons.folder_open),
         Style::default()
             .fg(application.theme.colors.muted)
             .add_modifier(Modifier::BOLD),
     ));
     for (index, entry) in application.explorer.entries().iter().enumerate() {
-        let prefix = if entry.is_directory && !entry.is_symlink {
+        let (prefix, is_dir) = if entry.is_directory && !entry.is_symlink {
             if entry.expanded {
-                application.theme.icons.tree_expanded.as_str()
+                (application.theme.icons.folder_open.as_str(), true)
             } else {
-                application.theme.icons.tree_collapsed.as_str()
+                (application.theme.icons.folder_closed.as_str(), true)
             }
         } else {
-            " "
+            ("", false)
         };
         let name = entry.path.file_name().map_or_else(
             || entry.path.display().to_string(),
@@ -479,10 +524,13 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
         } else {
             Style::default()
         };
-        lines.push(Line::styled(
-            format!("{}{} {name}", "  ".repeat(entry.depth), prefix),
-            style,
-        ));
+        let indent = "  ".repeat(entry.depth + 1);
+        let line_text = if is_dir {
+            format!("{indent}{prefix} {name}")
+        } else {
+            format!("{indent}  {name}")
+        };
+        lines.push(Line::styled(line_text, style));
     }
     let border = if application.focus_owner == FocusOwner::Explorer {
         application.theme.colors.active_border
@@ -493,6 +541,7 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(application.theme.border_type())
                 .border_style(Style::default().fg(border))
                 .style(
                     Style::default()
@@ -514,6 +563,7 @@ fn draw_workspace(frame: &mut Frame<'_>, application: &Application, layout: &Cal
             Pane::Empty => {
                 let block = Block::default()
                     .borders(Borders::ALL)
+                    .border_type(application.theme.border_type())
                     .border_style(Style::default().fg(application.theme.colors.inactive_border))
                     .style(
                         Style::default()
@@ -524,8 +574,108 @@ fn draw_workspace(frame: &mut Frame<'_>, application: &Application, layout: &Cal
             }
             Pane::Editor { document_id, view } => {
                 let document = application.documents.get(*document_id);
-                draw_editor(frame, application, *pane_id, *area, document, view);
+                draw_editor(
+                    frame,
+                    application,
+                    *pane_id,
+                    *area,
+                    document,
+                    view,
+                    *document_id,
+                );
             }
+        }
+    }
+}
+
+fn editor_header_title<'a>(
+    application: &Application,
+    current_doc_id: crate::document::DocumentId,
+) -> Line<'a> {
+    match application.config.effective.editor.header_style {
+        crate::config::EditorHeaderStyle::Tabs => {
+            let mut spans = Vec::new();
+            let open_ids = application.open_document_ids();
+            if open_ids.is_empty() {
+                let doc = application.documents.get(current_doc_id);
+                let name = doc
+                    .path
+                    .as_deref()
+                    .and_then(|path| path.file_name())
+                    .map_or("Untitled".to_owned(), |n| n.to_string_lossy().into_owned());
+                let modified = if doc.is_modified() {
+                    format!(" {}", application.theme.icons.modified)
+                } else {
+                    String::new()
+                };
+                spans.push(Span::styled(
+                    format!(" {name}{modified} "),
+                    Style::default()
+                        .bg(application.theme.colors.tab_active_background)
+                        .fg(application.theme.colors.tab_active_foreground)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                for (index, doc_id) in open_ids.iter().enumerate() {
+                    if index > 0 {
+                        spans.push(Span::styled(
+                            "│",
+                            Style::default().fg(application.theme.colors.tab_border),
+                        ));
+                    }
+                    let doc = application.documents.get(*doc_id);
+                    let name = doc
+                        .path
+                        .as_deref()
+                        .and_then(|path| path.file_name())
+                        .map_or("Untitled".to_owned(), |n| n.to_string_lossy().into_owned());
+                    let modified = if doc.is_modified() {
+                        format!(" {}", application.theme.icons.modified)
+                    } else {
+                        String::new()
+                    };
+                    if *doc_id == current_doc_id {
+                        spans.push(Span::styled(
+                            format!(" {name}{modified} "),
+                            Style::default()
+                                .bg(application.theme.colors.tab_active_background)
+                                .fg(application.theme.colors.tab_active_foreground)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            format!(" {name}{modified} "),
+                            Style::default()
+                                .bg(application.theme.colors.tab_inactive_background)
+                                .fg(application.theme.colors.tab_inactive_foreground),
+                        ));
+                    }
+                }
+            }
+            Line::from(spans)
+        }
+        crate::config::EditorHeaderStyle::Breadcrumbs => {
+            let doc = application.documents.get(current_doc_id);
+            let name = doc
+                .path
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .map_or("Untitled".to_owned(), |n| n.to_string_lossy().into_owned());
+            let modified = if doc.is_modified() {
+                format!(" {}", application.theme.icons.modified)
+            } else {
+                String::new()
+            };
+            let root_name = application
+                .explorer
+                .root
+                .file_name()
+                .unwrap_or(application.explorer.root.as_os_str())
+                .to_string_lossy();
+            Line::styled(
+                format!(" {root_name} › {name}{modified} "),
+                Style::default().fg(application.theme.colors.title_foreground),
+            )
         }
     }
 }
@@ -537,20 +687,9 @@ fn draw_editor(
     area: Rect,
     document: &Document,
     view: &crate::editor::EditorView,
+    document_id: crate::document::DocumentId,
 ) {
-    let name = document
-        .path
-        .as_deref()
-        .and_then(|path| path.file_name())
-        .map_or("Untitled".to_owned(), |name| {
-            name.to_string_lossy().into_owned()
-        });
-    let modified = if document.is_modified() {
-        format!(" {}", application.theme.icons.modified)
-    } else {
-        String::new()
-    };
-    let title = format!(" {name}{modified} ");
+    let title = editor_header_title(application, document_id);
     let content = editor_content_geometry(application, area, document);
     let inner_height = content.height;
     let viewport_line = view.clamped_viewport_line(document, inner_height);
@@ -567,6 +706,9 @@ fn draw_editor(
     let wrap_width = available_text_width.max(1);
     let mut lines = Vec::with_capacity(inner_height);
     let selection = view.selection();
+    let is_focused_editor = pane_id == application.workspace.focused
+        && application.focus_owner == FocusOwner::Workspace;
+    let cursor_line = document.char_to_line(view.cursor);
     let wrapped_viewport = crate::editor::WrappedPosition {
         line: view.viewport_line,
         segment: view.viewport_wrap_segment,
@@ -577,6 +719,11 @@ fn draw_editor(
         crate::editor::wrapped_rows(document, wrapped_viewport, wrap_width, inner_height)
     } else {
         Vec::new()
+    };
+    let cursor_wrapped = if soft_wrap {
+        crate::editor::wrapped_position_for_cursor(document, view.cursor, wrap_width)
+    } else {
+        crate::editor::WrappedPosition::default()
     };
     if soft_wrap {
         for row in &visible_wrapped_rows {
@@ -592,10 +739,15 @@ fn draw_editor(
                 } else {
                     " ".repeat(line_number_width)
                 };
-                spans.push(Span::styled(
-                    number,
-                    Style::default().fg(application.theme.colors.muted),
-                ));
+                let is_active = is_focused_editor && position.line == cursor_wrapped.line;
+                let num_style = if is_active {
+                    Style::default()
+                        .fg(application.theme.colors.line_number_active)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(application.theme.colors.muted)
+                };
+                spans.push(Span::styled(number, num_style));
             }
             spans.extend(styled_editor_text(
                 &document.slice(row.start, row.end),
@@ -623,9 +775,17 @@ fn draw_editor(
             let text_width = available_text_width.saturating_sub(usize::from(overflow));
             let mut spans = Vec::new();
             if line_number_width > 0 {
+                let is_active = is_focused_editor && line_index == cursor_line;
+                let num_style = if is_active {
+                    Style::default()
+                        .fg(application.theme.colors.line_number_active)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(application.theme.colors.muted)
+                };
                 spans.push(Span::styled(
                     format!("{:>width$} ", line_index + 1, width = line_number_width - 1),
-                    Style::default().fg(application.theme.colors.muted),
+                    num_style,
                 ));
             }
             spans.extend(styled_editor_text(
@@ -654,7 +814,7 @@ fn draw_editor(
             lines.push(Line::from(spans));
         }
     }
-    let block = pane_block(application, pane_id, &title);
+    let block = pane_block(application, pane_id, title);
     frame.render_widget(Paragraph::new(lines).block(block), to_tui(area));
     if scrollbar_visible {
         let current_wrapped_rows = if soft_wrap {
@@ -796,7 +956,7 @@ fn styled_editor_text(
     spans
 }
 
-fn pane_block<'a>(application: &Application, pane_id: PaneId, title: &'a str) -> Block<'a> {
+fn pane_block<'a>(application: &Application, pane_id: PaneId, title: Line<'a>) -> Block<'a> {
     let style = if application.focus_owner == FocusOwner::Workspace
         && pane_id == application.workspace.focused
     {
@@ -806,6 +966,7 @@ fn pane_block<'a>(application: &Application, pane_id: PaneId, title: &'a str) ->
     };
     Block::default()
         .borders(Borders::ALL)
+        .border_type(application.theme.border_type())
         .border_style(style)
         .style(
             Style::default()
@@ -836,6 +997,7 @@ fn draw_bottom_terminal(frame: &mut Frame<'_>, application: &Application, area: 
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(application.theme.border_type())
                 .border_style(style)
                 .title(" Terminal "),
         ),
@@ -907,9 +1069,48 @@ fn terminal_color(color: TerminalColor) -> Color {
 }
 
 fn draw_status(frame: &mut Frame<'_>, application: &Application, area: Rect) {
+    let mut spans = Vec::new();
+    let (mode_text, mode_bg, mode_fg) = match application.focus_owner {
+        FocusOwner::Workspace => (
+            " EDIT ",
+            application.theme.colors.status_mode_background,
+            application.theme.colors.status_mode_foreground,
+        ),
+        FocusOwner::BottomTerminal => (
+            " TERM ",
+            application.theme.colors.status_mode_background,
+            application.theme.colors.status_mode_foreground,
+        ),
+        FocusOwner::Explorer => (
+            " EXPLORER ",
+            application.theme.colors.status_mode_background,
+            application.theme.colors.status_mode_foreground,
+        ),
+        FocusOwner::Overlay => (
+            " DIALOG ",
+            application.theme.colors.status_mode_background,
+            application.theme.colors.status_mode_foreground,
+        ),
+    };
+    spans.push(Span::styled(
+        mode_text,
+        Style::default()
+            .bg(mode_bg)
+            .fg(mode_fg)
+            .add_modifier(Modifier::BOLD),
+    ));
+
     let status = application.status_text();
+    spans.push(Span::styled(
+        format!(" {status} "),
+        Style::default()
+            .bg(application.theme.colors.status_background)
+            .fg(application.theme.colors.status_foreground),
+    ));
+
+    let line = Line::from(spans);
     frame.render_widget(
-        Paragraph::new(format!(" {status}")).style(
+        Paragraph::new(line).style(
             Style::default()
                 .bg(application.theme.colors.status_background)
                 .fg(application.theme.colors.status_foreground),
@@ -1006,7 +1207,8 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
             (
                 " Settings ",
                 format!(
-                    "Scope: {scope:?}  Search: {query}\n\n{listing}\n\nUp/Down selects, Ctrl+R resets, Tab changes scope, Enter opens configuration or the theme picker, and Esc closes."
+                    "Scope: {scope:?}  {} Search: {query}\n\n{listing}\n\nUp/Down selects, Ctrl+R resets, Tab changes scope, Enter opens configuration or the theme picker, and Esc closes.",
+                    application.theme.icons.search
                 ),
             )
         }
@@ -1094,6 +1296,7 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(application.theme.border_type())
                 .border_style(Style::default().fg(application.theme.colors.active_border))
                 .style(
                     Style::default()
@@ -1333,7 +1536,7 @@ mod tests {
         let right = controls.right_panel_toggle.unwrap();
         let settings = controls.settings.unwrap();
 
-        let explorer_cell = buffer.cell((explorer.x + 1, explorer.y + 1)).unwrap();
+        let explorer_cell = buffer.cell((explorer.x + 1, explorer.y)).unwrap();
         assert_eq!(
             explorer_cell.symbol(),
             application.theme.icons.left_panel_visible
@@ -1341,7 +1544,7 @@ mod tests {
         assert_eq!(explorer_cell.fg, application.theme.colors.title_foreground);
         assert_eq!(explorer_cell.bg, application.theme.colors.title_background);
         assert!(explorer_cell.modifier.contains(Modifier::BOLD));
-        let bottom_cell = buffer.cell((bottom.x + 1, bottom.y + 1)).unwrap();
+        let bottom_cell = buffer.cell((bottom.x + 1, bottom.y)).unwrap();
         assert_eq!(
             bottom_cell.symbol(),
             application.theme.icons.bottom_panel_hidden
@@ -1349,15 +1552,15 @@ mod tests {
         assert_eq!(bottom_cell.fg, application.theme.colors.title_foreground);
         assert_eq!(bottom_cell.bg, application.theme.colors.title_background);
         assert_eq!(
-            buffer.cell((right.x + 1, right.y + 1)).unwrap().fg,
+            buffer.cell((right.x + 1, right.y)).unwrap().fg,
             Color::DarkGray
         );
         assert_eq!(
-            buffer.cell((right.x + 1, right.y + 1)).unwrap().symbol(),
+            buffer.cell((right.x + 1, right.y)).unwrap().symbol(),
             application.theme.icons.right_panel_hidden
         );
         assert!((settings.x..settings.x + settings.width).any(|column| {
-            buffer.cell((column, settings.y + 1)).unwrap().symbol() == application.theme.icons.settings
+            buffer.cell((column, settings.y)).unwrap().symbol() == application.theme.icons.settings
         }));
 
         application.explorer.visible = false;
@@ -1365,11 +1568,11 @@ mod tests {
         terminal.draw(|frame| draw(frame, &application)).unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(
-            buffer.cell((explorer.x + 1, explorer.y + 1)).unwrap().symbol(),
+            buffer.cell((explorer.x + 1, explorer.y)).unwrap().symbol(),
             application.theme.icons.left_panel_hidden
         );
         assert_eq!(
-            buffer.cell((bottom.x + 1, bottom.y + 1)).unwrap().symbol(),
+            buffer.cell((bottom.x + 1, bottom.y)).unwrap().symbol(),
             application.theme.icons.bottom_panel_visible
         );
 
@@ -1383,7 +1586,7 @@ mod tests {
         let settings_cell = terminal
             .backend()
             .buffer()
-            .cell((settings.x + 1, settings.y + 1))
+            .cell((settings.x + 1, settings.y))
             .unwrap();
         assert_eq!(settings_cell.bg, application.theme.colors.title_background);
         assert_eq!(settings_cell.fg, application.theme.colors.title_foreground);
@@ -1411,17 +1614,17 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert!(
             (explorer.x..explorer.x + explorer.width).any(|column| buffer
-                .cell((column, explorer.y + 1))
+                .cell((column, explorer.y))
                 .unwrap()
                 .symbol()
                 == "E")
         );
         assert_eq!(
-            buffer.cell((explorer.x + 1, explorer.y + 1)).unwrap().fg,
+            buffer.cell((explorer.x + 1, explorer.y)).unwrap().fg,
             Color::Rgb(4, 5, 6)
         );
         assert_eq!(
-            buffer.cell((explorer.x + 1, explorer.y + 1)).unwrap().bg,
+            buffer.cell((explorer.x + 1, explorer.y)).unwrap().bg,
             Color::Rgb(1, 2, 3)
         );
         assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(1, 2, 3));
@@ -1445,7 +1648,7 @@ mod tests {
         .explorer
         .unwrap();
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.cell((area.x, area.y)).unwrap().symbol(), "┌");
+        assert_eq!(buffer.cell((area.x, area.y)).unwrap().symbol(), "╭");
         assert_eq!(
             buffer.cell((area.x, area.y)).unwrap().fg,
             Color::Rgb(0, 122, 204)
@@ -1558,9 +1761,12 @@ mod tests {
                 .map(|column| buffer.cell((column, row)).unwrap().symbol())
                 .collect::<String>()
         };
-        assert!(row_text(area.y + 1).trim().starts_with("> Open Editors"));
+        assert!(row_text(area.y + 1).trim().starts_with(&format!(
+            "{} Open Editors",
+            application.theme.icons.tree_collapsed
+        )));
         assert!(row_text(area.y + 2).trim().is_empty());
-        assert_eq!(row_text(area.y + 3).trim(), root_name);
+        assert!(row_text(area.y + 3).trim().contains(&root_name));
         assert!(!row_text(area.y + 1).contains("Untitled"));
         let root_cell = buffer.cell((area.x + 1, area.y + 3)).unwrap();
         assert!(root_cell.modifier.contains(Modifier::BOLD));
@@ -2001,5 +2207,124 @@ mod tests {
         assert_eq!(file_dialog_view_start(4, 20, 5), 0);
         assert_eq!(file_dialog_view_start(6, 20, 5), 2);
         assert_eq!(file_dialog_view_start(19, 20, 5), 15);
+    }
+
+    #[test]
+    fn editor_header_renders_tabs_and_breadcrumbs_according_to_config() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+
+        // Default: Tabs
+        assert_eq!(
+            application.config.effective.editor.header_style,
+            crate::config::EditorHeaderStyle::Tabs
+        );
+        let tab_line = editor_header_title(&application, document_id);
+        assert!(!tab_line.spans.is_empty());
+        assert!(
+            tab_line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("Untitled"))
+        );
+        // Active tab should not contain file_default icon
+        assert!(
+            !tab_line
+                .spans
+                .iter()
+                .any(|span| span.content.contains(&application.theme.icons.file_default))
+        );
+
+        // Configured: Breadcrumbs
+        application.config.effective.editor.header_style =
+            crate::config::EditorHeaderStyle::Breadcrumbs;
+        let breadcrumb_line = editor_header_title(&application, document_id);
+        assert!(breadcrumb_line.spans[0].content.contains("›"));
+        assert!(breadcrumb_line.spans[0].content.contains("Untitled"));
+    }
+
+    #[test]
+    fn active_line_number_highlighted_when_focused() {
+        let mut application = Application::new_for_test();
+        application
+            .apply(crate::command::Command::Insert(
+                "line1\nline2\nline3".to_owned(),
+            ))
+            .unwrap();
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("expected editor pane");
+        };
+        view.cursor = 0; // on line 1
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &application)).unwrap();
+        let area = geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+        )
+        .pane_layout
+        .panes[&application.workspace.focused];
+        let buffer = terminal.backend().buffer();
+        // Line 1 gutter cell (active)
+        let active_gutter_cell = buffer.cell((area.x + 1, area.y + 1)).unwrap();
+        assert_eq!(
+            active_gutter_cell.fg,
+            application.theme.colors.line_number_active
+        );
+        assert!(active_gutter_cell.modifier.contains(Modifier::BOLD));
+        // Line 2 gutter cell (inactive)
+        let inactive_gutter_cell = buffer.cell((area.x + 1, area.y + 2)).unwrap();
+        assert_eq!(inactive_gutter_cell.fg, application.theme.colors.muted);
+    }
+
+    #[test]
+    fn explorer_open_editors_and_entries_have_clean_file_labels_without_bullets() {
+        let mut application = Application::new_for_test();
+        application.explorer.open_editors_expanded = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &application)).unwrap();
+        let area = geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        )
+        .explorer
+        .unwrap();
+        let buffer = terminal.backend().buffer();
+        let open_editor_row = (area.x.saturating_add(1)
+            ..area.x.saturating_add(area.width.saturating_sub(1)))
+            .map(|column| buffer.cell((column, area.y + 2)).unwrap().symbol())
+            .collect::<String>();
+        assert!(open_editor_row.contains("Untitled"));
+        assert!(!open_editor_row.contains(&application.theme.icons.file_default));
+    }
+
+    #[test]
+    fn status_bar_renders_mode_pill_and_metadata() {
+        let application = Application::new_for_test();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &application)).unwrap();
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let status_y = bounds.height - 1;
+        let buffer = terminal.backend().buffer();
+        let status_row = (0..bounds.width)
+            .map(|col| buffer.cell((col, status_y)).unwrap().symbol())
+            .collect::<String>();
+        assert!(status_row.contains("EDIT"));
+        assert!(status_row.contains("Ln 1, Col 1"));
+        assert!(status_row.contains("UTF-8"));
     }
 }

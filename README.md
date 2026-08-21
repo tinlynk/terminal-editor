@@ -51,7 +51,7 @@ The title row uses `◧` and `◫` for the visible and hidden Explorer, and `⬓
 
 When the terminal reports mouse movement, hovering an available title control shows its action in the status bar.
 
-Long editor lines show `›` in the reserved right-edge cell when content continues beyond the viewport, and the status bar reports `HScroll` while the horizontal viewport is offset. The editor calculates the complete document width when the file opens and updates it after every edit, undo, and redo. When any line exceeds the viewport, a proportional scrollbar appears in the editor's bottom border; click its track or drag its thumb without moving the cursor. Shift plus vertical mouse-wheel also pans when reported by the outer terminal. A native trackpad left or right gesture pans when the outer terminal reports horizontal-wheel events, but some macOS terminal emulators do not forward either gesture. Set `editor.soft_wrap = true` to wrap long lines into visual rows instead; soft wrapping defaults to `false` and disables horizontal panning, the horizontal scrollbar, and overflow markers.
+Long editor lines show `›` in the reserved right-edge cell when content continues beyond the viewport, and the status bar reports `HScroll` while the horizontal viewport is offset. The editor calculates the complete document width when the file opens and updates it after every edit, undo, and redo. When any line exceeds the viewport, a proportional scrollbar appears in the editor's bottom border; click its track or drag its thumb without moving the cursor. Shift plus vertical mouse-wheel also pans when reported by the outer terminal. A native trackpad left or right gesture pans when the outer terminal reports horizontal-wheel events, but some macOS terminal emulators do not forward either gesture. Set `editor.soft_wrap = true` to wrap long lines into visual rows instead; soft wrapping defaults to `false` and disables horizontal panning, the horizontal scrollbar, and overflow markers. Set `editor.header_style = "breadcrumbs"` to switch editor pane headers from tab strips to breadcrumbs.
 
 Editor scrollbars use continuous proportional thumbs with a one-cell minimum. The horizontal thumb uses the theme's foreground-only `icons.scrollbar_horizontal` glyph so it remains visually as slim as the vertical thumb.
 
@@ -137,14 +137,21 @@ User themes may define only the values they change because omitted values inheri
 [meta]
 name = "Ocean"
 schema_version = 1
+border_type = "rounded"
 
 [colors]
 accent = "#0088CC"
 active_border = "#0088CC"
 editor_selection = "#264F78"
+tab_active_background = "#1E1E1E"
+tab_inactive_background = "#2D2D30"
+status_mode_background = "#0088CC"
 
 [icons]
 modified = "●"
+folder_open = "▾"
+folder_closed = "▸"
+file_default = "•"
 ```
 
 Colors accept `default`, the sixteen ANSI color names, or `#RRGGBB` values without alpha.

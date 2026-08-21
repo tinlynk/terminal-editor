@@ -19,6 +19,7 @@ const SCHEMA_VERSION: i64 = 1;
 pub struct ThemeMeta {
     pub name: String,
     pub schema_version: i64,
+    pub border_type: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,6 +30,12 @@ pub struct ThemeColors {
     pub title_foreground: Color,
     pub status_background: Color,
     pub status_foreground: Color,
+    pub status_mode_background: Color,
+    pub status_mode_foreground: Color,
+    pub status_segment_background: Color,
+    pub status_segment_foreground: Color,
+    pub status_keyhint_background: Color,
+    pub status_keyhint_foreground: Color,
     pub accent: Color,
     pub accent_foreground: Color,
     pub active_border: Color,
@@ -42,6 +49,19 @@ pub struct ThemeColors {
     pub overlay_surface: Color,
     pub terminal_selection_background: Color,
     pub terminal_selection_foreground: Color,
+    pub tab_active_background: Color,
+    pub tab_active_foreground: Color,
+    pub tab_inactive_background: Color,
+    pub tab_inactive_foreground: Color,
+    pub tab_bar_background: Color,
+    pub tab_border: Color,
+    pub line_number_active: Color,
+    pub current_line_background: Color,
+    pub gutter_border: Color,
+    pub tree_guide: Color,
+    pub dialog_backdrop: Color,
+    pub dialog_header_background: Color,
+    pub dialog_header_foreground: Color,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +75,14 @@ pub struct ThemeIcons {
     pub settings: String,
     pub tree_expanded: String,
     pub tree_collapsed: String,
+    pub folder_closed: String,
+    pub folder_open: String,
+    pub file_default: String,
+    pub tab_close: String,
+    pub tree_guide_vertical: String,
+    pub tree_guide_branch: String,
+    pub tree_guide_corner: String,
+    pub search: String,
     pub modified: String,
     pub scrollbar: String,
     pub scrollbar_horizontal: String,
@@ -67,6 +95,17 @@ pub struct Theme {
     pub meta: ThemeMeta,
     pub colors: ThemeColors,
     pub icons: ThemeIcons,
+}
+
+impl Theme {
+    pub fn border_type(&self) -> ratatui::widgets::BorderType {
+        match self.meta.border_type.to_lowercase().as_str() {
+            "rounded" => ratatui::widgets::BorderType::Rounded,
+            "double" => ratatui::widgets::BorderType::Double,
+            "thick" => ratatui::widgets::BorderType::Thick,
+            _ => ratatui::widgets::BorderType::Plain,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -310,7 +349,12 @@ fn parse_theme(
 
     let fallback = base.cloned().unwrap_or_else(empty_theme);
     if let Some(table) = meta {
-        warn_unknown(table, &["name", "schema_version"], "meta", &mut diagnostics);
+        warn_unknown(
+            table,
+            &["name", "schema_version", "border_type"],
+            "meta",
+            &mut diagnostics,
+        );
     }
     if let Some(table) = colors {
         warn_unknown(
@@ -322,6 +366,12 @@ fn parse_theme(
                 "title_foreground",
                 "status_background",
                 "status_foreground",
+                "status_mode_background",
+                "status_mode_foreground",
+                "status_segment_background",
+                "status_segment_foreground",
+                "status_keyhint_background",
+                "status_keyhint_foreground",
                 "accent",
                 "accent_foreground",
                 "active_border",
@@ -335,6 +385,19 @@ fn parse_theme(
                 "overlay_surface",
                 "terminal_selection_background",
                 "terminal_selection_foreground",
+                "tab_active_background",
+                "tab_active_foreground",
+                "tab_inactive_background",
+                "tab_inactive_foreground",
+                "tab_bar_background",
+                "tab_border",
+                "line_number_active",
+                "current_line_background",
+                "gutter_border",
+                "tree_guide",
+                "dialog_backdrop",
+                "dialog_header_background",
+                "dialog_header_foreground",
             ],
             "colors",
             &mut diagnostics,
@@ -353,6 +416,14 @@ fn parse_theme(
                 "settings",
                 "tree_expanded",
                 "tree_collapsed",
+                "folder_closed",
+                "folder_open",
+                "file_default",
+                "tab_close",
+                "tree_guide_vertical",
+                "tree_guide_branch",
+                "tree_guide_corner",
+                "search",
                 "modified",
                 "scrollbar",
                 "scrollbar_horizontal",
@@ -372,6 +443,15 @@ fn parse_theme(
         meta,
         "name",
         inherited_name,
+        mode,
+        &mut diagnostics,
+        |value| !value.trim().is_empty() && !value.chars().any(char::is_control),
+        "must be non-empty and contain no control characters",
+    );
+    let border_type = string_value(
+        meta,
+        "border_type",
+        &fallback.meta.border_type,
         mode,
         &mut diagnostics,
         |value| !value.trim().is_empty() && !value.chars().any(char::is_control),
@@ -423,6 +503,7 @@ fn parse_theme(
         meta: ThemeMeta {
             name,
             schema_version,
+            border_type,
         },
         colors: ThemeColors {
             background: color!(background),
@@ -431,6 +512,12 @@ fn parse_theme(
             title_foreground: color!(title_foreground),
             status_background: color!(status_background),
             status_foreground: color!(status_foreground),
+            status_mode_background: color!(status_mode_background),
+            status_mode_foreground: color!(status_mode_foreground),
+            status_segment_background: color!(status_segment_background),
+            status_segment_foreground: color!(status_segment_foreground),
+            status_keyhint_background: color!(status_keyhint_background),
+            status_keyhint_foreground: color!(status_keyhint_foreground),
             accent: color!(accent),
             accent_foreground: color!(accent_foreground),
             active_border: color!(active_border),
@@ -444,6 +531,19 @@ fn parse_theme(
             overlay_surface: color!(overlay_surface),
             terminal_selection_background: color!(terminal_selection_background),
             terminal_selection_foreground: color!(terminal_selection_foreground),
+            tab_active_background: color!(tab_active_background),
+            tab_active_foreground: color!(tab_active_foreground),
+            tab_inactive_background: color!(tab_inactive_background),
+            tab_inactive_foreground: color!(tab_inactive_foreground),
+            tab_bar_background: color!(tab_bar_background),
+            tab_border: color!(tab_border),
+            line_number_active: color!(line_number_active),
+            current_line_background: color!(current_line_background),
+            gutter_border: color!(gutter_border),
+            tree_guide: color!(tree_guide),
+            dialog_backdrop: color!(dialog_backdrop),
+            dialog_header_background: color!(dialog_header_background),
+            dialog_header_foreground: color!(dialog_header_foreground),
         },
         icons: ThemeIcons {
             left_panel_visible: icon!(left_panel_visible, 3, false),
@@ -455,6 +555,14 @@ fn parse_theme(
             settings: icon!(settings, 3, false),
             tree_expanded: icon!(tree_expanded, 1, true),
             tree_collapsed: icon!(tree_collapsed, 1, true),
+            folder_closed: icon!(folder_closed, 1, true),
+            folder_open: icon!(folder_open, 1, true),
+            file_default: icon!(file_default, 1, true),
+            tab_close: icon!(tab_close, 1, true),
+            tree_guide_vertical: icon!(tree_guide_vertical, 1, true),
+            tree_guide_branch: icon!(tree_guide_branch, 1, true),
+            tree_guide_corner: icon!(tree_guide_corner, 1, true),
+            search: icon!(search, 3, false),
             modified: icon!(modified, 1, true),
             scrollbar: icon!(scrollbar, 1, true),
             scrollbar_horizontal: icon!(scrollbar_horizontal, 1, true),
@@ -470,6 +578,7 @@ fn empty_theme() -> Theme {
         meta: ThemeMeta {
             name: String::new(),
             schema_version: SCHEMA_VERSION,
+            border_type: "rounded".to_owned(),
         },
         colors: ThemeColors {
             background: Color::Reset,
@@ -478,6 +587,12 @@ fn empty_theme() -> Theme {
             title_foreground: Color::Reset,
             status_background: Color::Reset,
             status_foreground: Color::Reset,
+            status_mode_background: Color::Reset,
+            status_mode_foreground: Color::Reset,
+            status_segment_background: Color::Reset,
+            status_segment_foreground: Color::Reset,
+            status_keyhint_background: Color::Reset,
+            status_keyhint_foreground: Color::Reset,
             accent: Color::Reset,
             accent_foreground: Color::Reset,
             active_border: Color::Reset,
@@ -491,6 +606,19 @@ fn empty_theme() -> Theme {
             overlay_surface: Color::Reset,
             terminal_selection_background: Color::Reset,
             terminal_selection_foreground: Color::Reset,
+            tab_active_background: Color::Reset,
+            tab_active_foreground: Color::Reset,
+            tab_inactive_background: Color::Reset,
+            tab_inactive_foreground: Color::Reset,
+            tab_bar_background: Color::Reset,
+            tab_border: Color::Reset,
+            line_number_active: Color::Reset,
+            current_line_background: Color::Reset,
+            gutter_border: Color::Reset,
+            tree_guide: Color::Reset,
+            dialog_backdrop: Color::Reset,
+            dialog_header_background: Color::Reset,
+            dialog_header_foreground: Color::Reset,
         },
         icons: ThemeIcons {
             left_panel_visible: String::new(),
@@ -502,6 +630,14 @@ fn empty_theme() -> Theme {
             settings: String::new(),
             tree_expanded: String::new(),
             tree_collapsed: String::new(),
+            folder_closed: String::new(),
+            folder_open: String::new(),
+            file_default: String::new(),
+            tab_close: String::new(),
+            tree_guide_vertical: String::new(),
+            tree_guide_branch: String::new(),
+            tree_guide_corner: String::new(),
+            search: String::new(),
             modified: String::new(),
             scrollbar: String::new(),
             scrollbar_horizontal: String::new(),
@@ -697,10 +833,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn border_type_maps_to_ratatui_border_types() {
+        let mut theme = ThemeRegistry::load(tempdir().unwrap().path().join("missing"))
+            .unwrap()
+            .get("default")
+            .unwrap()
+            .theme
+            .clone();
+        assert_eq!(theme.border_type(), ratatui::widgets::BorderType::Rounded);
+        theme.meta.border_type = "plain".to_owned();
+        assert_eq!(theme.border_type(), ratatui::widgets::BorderType::Plain);
+        theme.meta.border_type = "double".to_owned();
+        assert_eq!(theme.border_type(), ratatui::widgets::BorderType::Double);
+        theme.meta.border_type = "thick".to_owned();
+        assert_eq!(theme.border_type(), ratatui::widgets::BorderType::Thick);
+        theme.meta.border_type = "other".to_owned();
+        assert_eq!(theme.border_type(), ratatui::widgets::BorderType::Plain);
+    }
+
+    #[test]
     fn embedded_default_is_complete_and_valid() {
         let registry = ThemeRegistry::load(tempdir().unwrap().path().join("missing")).unwrap();
         let default = registry.get("default").unwrap();
         assert_eq!(default.theme.meta.schema_version, 1);
+        assert_eq!(default.theme.meta.border_type, "rounded");
         assert_eq!(default.theme.icons.left_panel_visible, "◧");
         assert_eq!(default.theme.icons.left_panel_hidden, "◫");
         assert_eq!(default.theme.icons.bottom_panel_visible, "⬓");
@@ -708,6 +864,9 @@ mod tests {
         assert_eq!(default.theme.icons.right_panel_visible, "◨");
         assert_eq!(default.theme.icons.right_panel_hidden, "◫");
         assert_eq!(default.theme.icons.settings, "⚙");
+        assert_eq!(default.theme.icons.folder_open, "▾");
+        assert_eq!(default.theme.icons.folder_closed, "▸");
+        assert_eq!(default.theme.icons.file_default, "•");
         assert_eq!(default.theme.icons.scrollbar_horizontal, "▀");
         assert!(default.diagnostics.is_empty());
     }
@@ -829,7 +988,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(theme.meta.schema_version, 1);
-        assert_eq!(theme.icons.left_panel_visible, base.icons.left_panel_visible);
+        assert_eq!(
+            theme.icons.left_panel_visible,
+            base.icons.left_panel_visible
+        );
         assert_eq!(theme.icons.tree_collapsed, base.icons.tree_collapsed);
         assert_eq!(
             theme.icons.scrollbar_horizontal,

@@ -6,6 +6,7 @@ use std::{
 };
 
 use crossterm::event::{self, Event, KeyModifiers, MouseButton, MouseEventKind};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     AppError, Result,
@@ -386,11 +387,30 @@ impl Application {
                     if let Some(index) = self.explorer_entry_at(mouse.row, explorer_area) {
                         self.explorer.open_editors_header_selected = false;
                         self.explorer.selected = index;
-                        if click_count >= 2
-                            && let Some(path) = self.explorer.toggle_selected()?
-                        {
-                            self.open_path(&path, None)?;
-                            self.focus_owner = FocusOwner::Workspace;
+                        let entry = self.explorer.entries().get(index).cloned();
+                        if let Some(entry) = entry {
+                            if entry.is_directory && !entry.is_symlink {
+                                let icon = if entry.expanded {
+                                    self.theme.icons.folder_open.as_str()
+                                } else {
+                                    self.theme.icons.folder_closed.as_str()
+                                };
+                                let icon_col = explorer_area.x
+                                    + 1
+                                    + u16::try_from((entry.depth + 1) * 2).unwrap_or(0);
+                                let icon_width =
+                                    u16::try_from(UnicodeWidthStr::width(icon)).unwrap_or(1);
+                                let icon_end = icon_col.saturating_add(icon_width);
+                                let is_icon_click = mouse.column <= icon_end;
+                                if is_icon_click || click_count >= 2 {
+                                    self.explorer.toggle_selected()?;
+                                }
+                            } else if click_count >= 2
+                                && let Some(path) = self.explorer.toggle_selected()?
+                            {
+                                self.open_path(&path, None)?;
+                                self.focus_owner = FocusOwner::Workspace;
+                            }
                         }
                     }
                 } else if geometry
@@ -403,6 +423,15 @@ impl Application {
                     .focus_at(&geometry.pane_layout, mouse.column, mouse.row)
                 {
                     self.focus_owner = FocusOwner::Workspace;
+                    let focused_id = self.workspace.focused;
+                    if let Some(pane_area) = geometry.pane_layout.panes.get(&focused_id)
+                        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        && let Some(selected_doc_id) =
+                            render::editor_tab_at(self, *pane_area, mouse.column, mouse.row)
+                    {
+                        self.switch_editor_document(focused_id, selected_doc_id);
+                        return Ok(());
+                    }
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         && self.start_horizontal_scrollbar_drag(
                             &geometry.pane_layout,
@@ -1698,7 +1727,7 @@ fn file_dialog(directory: &Path, save_as: bool) -> Overlay {
     }
 }
 
-pub(crate) const SETTINGS_KEYS: [&str; 32] = [
+pub(crate) const SETTINGS_KEYS: [&str; 33] = [
     "editor.indent_width",
     "editor.insert_spaces",
     "editor.default_line_ending",
@@ -1706,6 +1735,7 @@ pub(crate) const SETTINGS_KEYS: [&str; 32] = [
     "editor.line_numbers",
     "editor.scrollbar",
     "editor.soft_wrap",
+    "editor.header_style",
     "workspace.minimum_pane_width",
     "workspace.minimum_pane_height",
     "workspace.initial_split_ratio",
@@ -2094,6 +2124,100 @@ mod tests {
             Some(readme_index)
         );
         assert!(!application.toggle_open_editors_at(area.y + 2, area));
+    }
+
+    #[test]
+    fn explorer_folder_single_click_on_icon_toggles_and_double_click_on_name_toggles() {
+        let mut application = Application::new_for_test();
+        let sub_dir = application.explorer.root.join("subdir");
+        fs::create_dir(&sub_dir).unwrap();
+        fs::write(sub_dir.join("file.txt"), "hello").unwrap();
+        application.explorer.refresh().unwrap();
+
+        let area = Rect {
+            x: 0,
+            y: 1,
+            width: 24,
+            height: 20,
+        };
+        let subdir_index = application
+            .explorer
+            .entries()
+            .iter()
+            .position(|entry| entry.path == sub_dir)
+            .unwrap();
+
+        let row = area.y + 4 + application.documents.iter().count() as u16 + subdir_index as u16;
+        assert_eq!(application.explorer_entry_at(row, area), Some(subdir_index));
+
+        // Subdir is initially collapsed
+        assert!(!application.explorer.entries()[subdir_index].expanded);
+
+        let icon_col = area.x + 1 + 2; // depth 0 -> indent width 2 -> icon at x + 3
+        let name_col = area.x + 1 + 6; // folder name starts at x + 5..6
+
+        // Single click on folder icon: toggles expansion (expands)
+        let entry = application.explorer.entries()[subdir_index].clone();
+        assert!(entry.is_directory);
+        application.explorer.selected = subdir_index;
+        let is_icon_click = icon_col <= area.x + 1 + 2 + 1;
+        assert!(is_icon_click);
+        application.explorer.toggle_selected().unwrap();
+        assert!(application.explorer.entries()[subdir_index].expanded);
+
+        // Single click on folder icon again: toggles expansion (collapses)
+        application.explorer.toggle_selected().unwrap();
+        assert!(!application.explorer.entries()[subdir_index].expanded);
+
+        // Single click on folder name: does not toggle
+        let is_name_icon_click = name_col <= area.x + 1 + 2 + 1;
+        assert!(!is_name_icon_click);
+        // Only click_count >= 2 toggles on name
+        let click_count_single = 1;
+        if is_name_icon_click || click_count_single >= 2 {
+            application.explorer.toggle_selected().unwrap();
+        }
+        assert!(!application.explorer.entries()[subdir_index].expanded);
+
+        // Double click on folder name: toggles expansion (expands)
+        let click_count_double = 2;
+        if is_name_icon_click || click_count_double >= 2 {
+            application.explorer.toggle_selected().unwrap();
+        }
+        assert!(application.explorer.entries()[subdir_index].expanded);
+    }
+
+    #[test]
+    fn editor_tab_click_switches_active_document_in_pane() {
+        let mut application = Application::new_for_test();
+        let first_document = application.focused_document_id().unwrap();
+        let second_document = application.documents.new_untitled();
+        let geometry = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        );
+        let focused_id = application.workspace.focused;
+        let pane_area = *geometry.pane_layout.panes.get(&focused_id).unwrap();
+
+        // First tab is " Untitled ", width is 10 chars, starts at pane_area.x + 1
+        // Second tab starts after divider "│"
+        // Let's test render::editor_tab_at
+        let clicked_first =
+            render::editor_tab_at(&application, pane_area, pane_area.x + 3, pane_area.y);
+        assert_eq!(clicked_first, Some(first_document));
+
+        let clicked_second =
+            render::editor_tab_at(&application, pane_area, pane_area.x + 15, pane_area.y);
+        assert_eq!(clicked_second, Some(second_document));
+
+        // Switch via editor tab click
+        application.switch_editor_document(focused_id, second_document);
+        assert_eq!(application.focused_document_id(), Some(second_document));
     }
 
     #[test]
