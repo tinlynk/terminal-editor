@@ -9,18 +9,12 @@ use crate::{
     },
 };
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TerminalId(pub u64);
-
 #[derive(Clone, Debug)]
 pub enum Pane {
     Empty,
     Editor {
         document_id: DocumentId,
         view: EditorView,
-    },
-    Terminal {
-        terminal_id: TerminalId,
     },
 }
 
@@ -31,7 +25,6 @@ pub struct Workspace {
     pub focused: PaneId,
     next_pane_id: u64,
     next_split_id: u64,
-    next_terminal_id: u64,
     initial_split_ratio: f32,
 }
 
@@ -44,7 +37,6 @@ impl Workspace {
             focused: pane_id,
             next_pane_id: 2,
             next_split_id: 1,
-            next_terminal_id: 1,
             initial_split_ratio,
         }
     }
@@ -63,7 +55,6 @@ impl Workspace {
             focused: pane_id,
             next_pane_id: 2,
             next_split_id: 1,
-            next_terminal_id: 1,
             initial_split_ratio,
         }
     }
@@ -85,11 +76,6 @@ impl Workspace {
                 document_id,
                 view: EditorView::default(),
             },
-            Pane::Terminal { .. } => {
-                let terminal_id = TerminalId(self.next_terminal_id);
-                self.next_terminal_id += 1;
-                Pane::Terminal { terminal_id }
-            }
         };
         self.insert_split(pane, direction)
     }
@@ -106,13 +92,6 @@ impl Workspace {
             },
             direction,
         )
-    }
-
-    pub fn split_with_terminal(&mut self, direction: SplitDirection) -> (PaneId, TerminalId) {
-        let terminal_id = TerminalId(self.next_terminal_id);
-        self.next_terminal_id += 1;
-        let pane_id = self.insert_split(Pane::Terminal { terminal_id }, direction);
-        (pane_id, terminal_id)
     }
 
     fn insert_split(&mut self, pane: Pane, direction: SplitDirection) -> PaneId {
@@ -179,6 +158,10 @@ impl Workspace {
     pub fn resize_split(&mut self, split_id: SplitId, ratio: f32) -> bool {
         self.layout.set_ratio(split_id, ratio)
     }
+
+    pub fn set_initial_split_ratio(&mut self, ratio: f32) {
+        self.initial_split_ratio = ratio;
+    }
 }
 
 #[cfg(test)]
@@ -203,14 +186,6 @@ mod tests {
             panic!("expected editor pane");
         };
         assert_eq!(view.cursor, 0);
-    }
-
-    #[test]
-    fn terminal_split_creates_distinct_session() {
-        let mut workspace = Workspace::with_editor(DocumentId(1), 0.5);
-        let (_, first) = workspace.split_with_terminal(SplitDirection::Horizontal);
-        let (_, second) = workspace.split_with_terminal(SplitDirection::Vertical);
-        assert_ne!(first, second);
     }
 
     #[test]

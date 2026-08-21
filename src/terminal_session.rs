@@ -96,6 +96,12 @@ impl TerminalSession {
             .map_err(|error| AppError::io("could not write terminal input", error))
     }
 
+    pub fn apply_runtime_config(&mut self, scrollback_limit: usize, allow_child_osc52: bool) {
+        self.emulator
+            .apply_runtime_config(scrollback_limit, allow_child_osc52);
+        self.scroll_offset = self.scroll_offset.min(self.emulator.scrollback_len());
+    }
+
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         self.master
             .resize(PtySize {

@@ -5,25 +5,36 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use portable_pty::PtySize;
+use crossterm::event::{self, Event, KeyModifiers, MouseButton, MouseEventKind};
 
 use crate::{
     AppError, Result,
     command::Command,
     config::{ConfigScope, LoadedConfig},
+    document::DocumentId,
     explorer::{Explorer, root_for_startup},
-    file_io::{DocumentRegistry, SaveOutcome},
+    file_io::DocumentRegistry,
     input::InputMapper,
-    layout::{Rect, SplitDirection},
+    layout::{PaneId, Rect, SplitDirection},
     render,
     terminal::{TerminalGuard, install_panic_restoration_hook},
-    terminal_emulator::MouseTrackingMode,
     terminal_session::TerminalSession,
-    workspace::{Pane, TerminalId, Workspace},
+    theme::{Theme, ThemeRegistry},
+    workspace::{Pane, Workspace},
 };
+
+mod config_runtime;
+mod document_lifecycle;
+mod events;
+mod overlay_events;
+mod terminal_runtime;
+
+#[cfg(test)]
+use crossterm::event::KeyCode;
+#[cfg(test)]
+use crossterm::event::MouseEvent;
+#[cfg(test)]
+use terminal_runtime::{terminal_mouse_code, terminal_mouse_sequence};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -32,6 +43,15 @@ const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 enum WorkbenchDrag {
     Explorer,
     BottomTerminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EditorVisibilityAnchor {
+    pane_id: PaneId,
+    document_id: DocumentId,
+    revision: u64,
+    cursor: usize,
+    area: Rect,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,18 +77,23 @@ pub enum Overlay {
         scope: ConfigScope,
         selected: usize,
     },
+    ThemePicker {
+        scope: ConfigScope,
+        selected: usize,
+    },
     Message {
         title: String,
         message: String,
     },
     ConfirmQuit,
     ConfirmTerminateAll,
-    ConfirmTerminalClose {
-        terminal_id: TerminalId,
-        bottom: bool,
-    },
+    ConfirmTerminalClose,
     ConfirmDocumentClose,
     SaveConflict,
+    ConfirmSaveAsOverwrite {
+        document_id: crate::document::DocumentId,
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -77,21 +102,27 @@ pub struct Application {
     pub documents: DocumentRegistry,
     pub workspace: Workspace,
     pub explorer: Explorer,
-    pub terminal_sessions: BTreeMap<TerminalId, TerminalSession>,
-    pub bottom_terminal: Option<TerminalId>,
+    pub bottom_terminal: Option<TerminalSession>,
     pub bottom_terminal_visible: bool,
     pub focus_owner: FocusOwner,
     pub overlay: Option<Overlay>,
+    pub theme_registry: ThemeRegistry,
+    pub theme: Theme,
     pub clipboard: String,
     pub message: Option<String>,
+    saved_editor_views: BTreeMap<crate::document::DocumentId, crate::editor::EditorView>,
     pending_terminal_control: Vec<u8>,
+    pending_close_document: Option<crate::document::DocumentId>,
+    pending_mouse_capture: Option<bool>,
     running: bool,
     input: InputMapper,
     drag_split: Option<crate::layout::SplitterRect>,
     workbench_drag: Option<WorkbenchDrag>,
+    horizontal_scrollbar_drag_offset: Option<u16>,
     selection_drag: bool,
     scrollbar_drag: bool,
-    terminal_selection_drag: Option<TerminalId>,
+    terminal_selection_drag: bool,
+    title_control_hover: Option<render::TitleControlAction>,
     last_explorer_refresh: Instant,
     last_click: Option<(Instant, u16, u16)>,
     click_count: u8,
@@ -103,6 +134,9 @@ impl Application {
             .map_err(|error| AppError::io("could not determine current directory", error))?;
         let explorer_root = root_for_startup(startup_path.as_deref(), &current_directory);
         let config = LoadedConfig::load(&explorer_root)?;
+        let theme_registry = ThemeRegistry::load_for_config(&config.user_path)?;
+        let (theme, theme_message) = theme_registry.resolve(&config.effective.theme.active);
+        let theme = theme.clone();
         let history_limit = config
             .effective
             .editor
@@ -130,14 +164,16 @@ impl Application {
             .as_deref()
             .filter(|path| path.is_dir())
             .map(|path| file_dialog(path, false));
-        let input = InputMapper::new(config.effective.keybindings.clone());
-        Ok(Self {
+        let input = InputMapper::new(
+            config.effective.keybindings.clone(),
+            &config.effective.terminal.leader,
+        );
+        let mut application = Self {
             bottom_terminal_visible: config.effective.ui.bottom_terminal_visible,
             config,
             documents,
             workspace,
             explorer,
-            terminal_sessions: BTreeMap::new(),
             bottom_terminal: None,
             focus_owner: if overlay.is_some() {
                 FocusOwner::Overlay
@@ -145,20 +181,31 @@ impl Application {
                 FocusOwner::Workspace
             },
             overlay,
+            theme_registry,
+            theme,
             clipboard: String::new(),
-            message: None,
+            message: theme_message,
+            saved_editor_views: BTreeMap::new(),
             pending_terminal_control: Vec::new(),
+            pending_close_document: None,
+            pending_mouse_capture: None,
             running: true,
             input,
             drag_split: None,
             workbench_drag: None,
+            horizontal_scrollbar_drag_offset: None,
             selection_drag: false,
             scrollbar_drag: false,
-            terminal_selection_drag: None,
+            terminal_selection_drag: false,
+            title_control_hover: None,
             last_explorer_refresh: Instant::now(),
             last_click: None,
             click_count: 0,
-        })
+        };
+        if application.bottom_terminal_visible {
+            application.bottom_terminal = Some(application.spawn_terminal(None)?);
+        }
+        Ok(application)
     }
 
     #[cfg(test)]
@@ -174,6 +221,8 @@ impl Application {
                 crate::config::ConfigScope::Default,
             )]),
         };
+        let theme_registry = ThemeRegistry::load(directory.join("themes")).unwrap();
+        let theme = theme_registry.get("default").unwrap().theme.clone();
         let mut documents = DocumentRegistry::new(crate::config::LineEnding::Lf, 1024);
         let document_id = documents.new_untitled();
         Self {
@@ -181,21 +230,27 @@ impl Application {
             explorer: Explorer::new(directory, true, &[".git".to_owned()]).unwrap(),
             config,
             documents,
-            terminal_sessions: BTreeMap::new(),
             bottom_terminal: None,
             bottom_terminal_visible: false,
             focus_owner: FocusOwner::Workspace,
             overlay: None,
+            theme_registry,
+            theme,
             clipboard: String::new(),
             message: None,
+            saved_editor_views: BTreeMap::new(),
             pending_terminal_control: Vec::new(),
+            pending_close_document: None,
+            pending_mouse_capture: None,
             running: true,
             input: InputMapper::default(),
             drag_split: None,
             workbench_drag: None,
+            horizontal_scrollbar_drag_offset: None,
             selection_drag: false,
             scrollbar_drag: false,
-            terminal_selection_drag: None,
+            terminal_selection_drag: false,
+            title_control_hover: None,
             last_explorer_refresh: Instant::now(),
             last_click: None,
             click_count: 0,
@@ -219,339 +274,29 @@ impl Application {
             {
                 let event = event::read()
                     .map_err(|error| AppError::io("could not read terminal input", error))?;
-                self.handle_event(event)?;
+                let (columns, rows) = match &event {
+                    Event::Resize(columns, rows) => (*columns, *rows),
+                    _ => crossterm::terminal::size()
+                        .map_err(|error| AppError::io("could not inspect terminal size", error))?,
+                };
+                self.handle_event_and_sync_editor_viewport(event, columns, rows)?;
                 redraw = true;
             }
             redraw |= self.refresh_explorer_if_due(Instant::now());
+            redraw |= self.input.expire_leader(Instant::now());
             if !self.pending_terminal_control.is_empty() {
                 let control = std::mem::take(&mut self.pending_terminal_control);
                 terminal.write_control(&control)?;
             }
-            for session in self.terminal_sessions.values_mut() {
+            if let Some(enabled) = self.pending_mouse_capture.take() {
+                terminal.set_mouse_capture(enabled)?;
+            }
+            if let Some(session) = self.bottom_terminal.as_mut() {
                 redraw |= session.drain_output()?;
                 if let Some(clipboard) = session.take_child_clipboard_write() {
                     self.clipboard = clipboard;
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn handle_event(&mut self, event: Event) -> Result<()> {
-        if self.overlay.is_some() {
-            return self.handle_overlay_event(event);
-        }
-        if let Event::Resize(columns, rows) = event {
-            return self.resize_terminals(columns, rows);
-        }
-        if let Event::Mouse(mouse) = event {
-            return self.handle_mouse(mouse);
-        }
-        if self.focus_owner == FocusOwner::Explorer {
-            return self.handle_explorer_event(event);
-        }
-        let terminal_focused = self.focus_owner == FocusOwner::BottomTerminal
-            || matches!(self.workspace.focused_pane(), Pane::Terminal { .. });
-        let command = self.input.map(event, terminal_focused);
-        self.apply(command)
-    }
-
-    fn handle_explorer_event(&mut self, event: Event) -> Result<()> {
-        let Event::Key(key) = event else {
-            return Ok(());
-        };
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return Ok(());
-        }
-        let command = self.input.map(Event::Key(key), false);
-        if global_command(&command) {
-            return self.apply(command);
-        }
-        match key.code {
-            KeyCode::Up => self.explorer.move_selection(-1),
-            KeyCode::Down => self.explorer.move_selection(1),
-            KeyCode::Enter | KeyCode::Right => {
-                if let Some(path) = self.explorer.toggle_selected()? {
-                    self.open_path(&path, None)?;
-                    self.focus_owner = FocusOwner::Workspace;
-                }
-            }
-            KeyCode::Esc | KeyCode::Left => self.focus_owner = FocusOwner::Workspace,
-            KeyCode::Char('r') => {
-                self.explorer.refresh()?;
-                self.last_explorer_refresh = Instant::now();
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn resize_terminals(&mut self, columns: u16, rows: u16) -> Result<()> {
-        let geometry = render::geometry(
-            self,
-            Rect {
-                x: 0,
-                y: 0,
-                width: columns,
-                height: rows,
-            },
-        );
-        let sizes = geometry
-            .pane_layout
-            .panes
-            .iter()
-            .filter_map(|(pane_id, area)| match self.workspace.panes.get(pane_id) {
-                Some(Pane::Terminal { terminal_id }) => Some((
-                    *terminal_id,
-                    area.height.saturating_sub(2).max(1),
-                    area.width.saturating_sub(2).max(1),
-                )),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for (terminal_id, terminal_rows, terminal_columns) in sizes {
-            if let Some(session) = self.terminal_sessions.get_mut(&terminal_id) {
-                session.resize_screen(terminal_rows, terminal_columns)?;
-            }
-        }
-        if let (Some(area), Some(terminal_id)) = (geometry.bottom_terminal, self.bottom_terminal)
-            && let Some(session) = self.terminal_sessions.get_mut(&terminal_id)
-        {
-            session.resize_screen(
-                area.height.saturating_sub(2).max(1),
-                area.width.saturating_sub(2).max(1),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn handle_overlay_event(&mut self, event: Event) -> Result<()> {
-        if let Event::Mouse(mouse) = event {
-            let click_count = matches!(mouse.kind, MouseEventKind::Down(_))
-                .then(|| self.register_click(mouse.column, mouse.row));
-            let click_area = if click_count.is_some() {
-                let (columns, rows) = crossterm::terminal::size()
-                    .map_err(|error| AppError::io("could not inspect terminal size", error))?;
-                self.overlay.as_ref().map(|overlay| {
-                    render::overlay_area(
-                        Rect {
-                            x: 0,
-                            y: 0,
-                            width: columns,
-                            height: rows,
-                        },
-                        overlay,
-                    )
-                })
-            } else {
-                None
-            };
-            let mut clicked_entry = false;
-            if let Some(Overlay::FileDialog {
-                entries, selected, ..
-            }) = self.overlay.as_mut()
-            {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => *selected = selected.saturating_sub(3),
-                    MouseEventKind::ScrollDown => {
-                        *selected = selected
-                            .saturating_add(3)
-                            .min(entries.len().saturating_sub(1));
-                    }
-                    MouseEventKind::Down(_) => {
-                        let area = click_area.expect("mouse-down overlay area must exist");
-                        let visible = render::file_dialog_visible_rows(area);
-                        let start =
-                            render::file_dialog_view_start(*selected, entries.len(), visible);
-                        if let Some(offset) = mouse.row.checked_sub(area.y.saturating_add(3))
-                            && usize::from(offset) < visible
-                        {
-                            let index = start.saturating_add(usize::from(offset));
-                            if index < entries.len() {
-                                *selected = index;
-                                clicked_entry = true;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if clicked_entry && click_count.is_some_and(|count| count >= 2) {
-                return self.activate_file_dialog_selection();
-            }
-            return Ok(());
-        }
-        let Event::Key(key) = event else {
-            return Ok(());
-        };
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return Ok(());
-        }
-        if key.code == KeyCode::Esc {
-            self.overlay = None;
-            self.focus_owner = FocusOwner::Workspace;
-            return Ok(());
-        }
-        if key.code == KeyCode::Enter && matches!(self.overlay, Some(Overlay::FileDialog { .. })) {
-            let save_as = matches!(
-                self.overlay,
-                Some(Overlay::FileDialog { save_as: true, .. })
-            );
-            return if save_as || key.modifiers.contains(KeyModifiers::CONTROL) {
-                self.submit_file_dialog()
-            } else {
-                self.activate_file_dialog_selection()
-            };
-        }
-        if key.code == KeyCode::Enter
-            && let Some(Overlay::Settings { scope, .. }) = self.overlay.as_ref()
-        {
-            let path = self.config.ensure_raw_config(*scope)?;
-            self.open_path(&path, None)?;
-            self.overlay = None;
-            self.focus_owner = FocusOwner::Workspace;
-            return Ok(());
-        }
-        if key.modifiers == KeyModifiers::CONTROL
-            && key.code == KeyCode::Char('r')
-            && let Some(Overlay::Settings {
-                scope, selected, ..
-            }) = self.overlay.as_ref()
-        {
-            self.config
-                .reset_setting(*scope, SETTINGS_KEYS[*selected])?;
-            return Ok(());
-        }
-        match self.overlay.as_mut().expect("overlay must exist") {
-            Overlay::FileDialog {
-                directory,
-                input,
-                entries,
-                selected,
-                ..
-            } => match key.code {
-                KeyCode::Backspace if *input == directory.display().to_string() => {
-                    let parent = directory.parent().map(Path::to_owned);
-                    let save_as = matches!(
-                        self.overlay,
-                        Some(Overlay::FileDialog { save_as: true, .. })
-                    );
-                    if let Some(parent) = parent {
-                        self.overlay = Some(file_dialog(&parent, save_as));
-                    }
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Down => {
-                    *selected = selected
-                        .saturating_add(1)
-                        .min(entries.len().saturating_sub(1));
-                }
-                KeyCode::Tab => {
-                    if let Some(path) = entries.get(*selected) {
-                        *input = path.display().to_string();
-                    }
-                }
-                KeyCode::Right => return self.activate_file_dialog_selection(),
-                KeyCode::Left => {
-                    let parent = directory.parent().map(Path::to_owned);
-                    let save_as = matches!(
-                        self.overlay,
-                        Some(Overlay::FileDialog { save_as: true, .. })
-                    );
-                    if let Some(parent) = parent {
-                        self.overlay = Some(file_dialog(&parent, save_as));
-                    }
-                }
-                KeyCode::Char(character)
-                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
-                {
-                    input.push(character);
-                }
-                _ => {}
-            },
-            Overlay::Settings {
-                query,
-                scope,
-                selected,
-            } => match key.code {
-                KeyCode::Backspace => {
-                    query.pop();
-                }
-                KeyCode::Char(character)
-                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
-                {
-                    query.push(character);
-                }
-                KeyCode::Tab => {
-                    *scope = match scope {
-                        ConfigScope::User => ConfigScope::Workspace,
-                        ConfigScope::Workspace | ConfigScope::Default => ConfigScope::User,
-                    };
-                }
-                KeyCode::Up => move_settings_selection(query, selected, -1),
-                KeyCode::Down => move_settings_selection(query, selected, 1),
-                _ => {}
-            },
-            Overlay::ConfirmQuit
-                if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') =>
-            {
-                self.request_quit();
-            }
-            Overlay::ConfirmTerminateAll if key.code == KeyCode::Char('t') => {
-                for session in self.terminal_sessions.values_mut() {
-                    session.begin_termination();
-                }
-                self.running = false;
-            }
-            Overlay::ConfirmTerminalClose {
-                terminal_id,
-                bottom,
-            } if key.code == KeyCode::Char('t') => {
-                let terminal_id = *terminal_id;
-                let bottom = *bottom;
-                if let Some(session) = self.terminal_sessions.get_mut(&terminal_id) {
-                    session.begin_termination();
-                }
-                self.terminal_sessions.remove(&terminal_id);
-                if bottom {
-                    self.bottom_terminal = None;
-                    self.bottom_terminal_visible = false;
-                    self.focus_owner = FocusOwner::Workspace;
-                } else {
-                    self.workspace.close_focused();
-                }
-                self.overlay = None;
-            }
-            Overlay::ConfirmDocumentClose if key.code == KeyCode::Char('d') => {
-                self.discard_focused_document();
-                self.overlay = None;
-                self.focus_owner = FocusOwner::Workspace;
-            }
-            Overlay::ConfirmDocumentClose if key.code == KeyCode::Char('s') => {
-                self.save_focused()?;
-                if self.overlay == Some(Overlay::ConfirmDocumentClose) {
-                    self.close_focused_editor_view();
-                    self.overlay = None;
-                    self.focus_owner = FocusOwner::Workspace;
-                }
-            }
-            Overlay::SaveConflict if key.code == KeyCode::Char('o') => {
-                let document_id = self.focused_editor().map(|(id, _)| id);
-                if let Some(document_id) = document_id {
-                    self.documents.save(document_id, true)?;
-                }
-                self.overlay = None;
-                self.focus_owner = FocusOwner::Workspace;
-            }
-            Overlay::Message { .. }
-            | Overlay::ConfirmQuit
-            | Overlay::ConfirmTerminateAll
-            | Overlay::ConfirmTerminalClose { .. }
-            | Overlay::ConfirmDocumentClose
-            | Overlay::SaveConflict => {}
         }
         Ok(())
     }
@@ -568,11 +313,21 @@ impl Application {
                 height: rows,
             },
         );
+        self.title_control_hover = geometry.title_controls.action_at(mouse.column, mouse.row);
         if self.forward_terminal_mouse(&geometry, mouse)? {
+            return Ok(());
+        }
+        if self.route_mouse_scroll(&geometry, mouse) {
             return Ok(());
         }
         match mouse.kind {
             MouseEventKind::Down(_) => {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && let Some(action) = geometry.title_controls.action_at(mouse.column, mouse.row)
+                {
+                    self.apply(title_control_command(action))?;
+                    return Ok(());
+                }
                 let click_count = self.register_click(mouse.column, mouse.row);
                 if let Some(area) = geometry.explorer
                     && explorer_divider_contains(area, mouse.column, mouse.row)
@@ -580,7 +335,7 @@ impl Application {
                     self.workbench_drag = Some(WorkbenchDrag::Explorer);
                     return Ok(());
                 }
-                if let Some(area) = geometry.bottom_terminal
+                if let Some(area) = geometry.terminal
                     && bottom_divider_contains(area, mouse.column, mouse.row)
                 {
                     self.workbench_drag = Some(WorkbenchDrag::BottomTerminal);
@@ -595,27 +350,22 @@ impl Application {
                     self.drag_split = Some(*splitter);
                     return Ok(());
                 }
-                if let Some((terminal_id, area, focus_owner)) =
-                    self.terminal_at(&geometry, mouse.column, mouse.row)
+                if let Some(area) = self.terminal_at(&geometry, mouse.column, mouse.row)
                     && self
-                        .terminal_sessions
-                        .get(&terminal_id)
+                        .bottom_terminal
+                        .as_ref()
                         .is_some_and(|session| !session.mouse_reporting())
                 {
                     let rows = usize::from(area.height.saturating_sub(2));
-                    if let Some(session) = self.terminal_sessions.get_mut(&terminal_id) {
+                    if let Some(session) = self.bottom_terminal.as_mut() {
                         session.start_selection(
                             usize::from(mouse.row.saturating_sub(area.y.saturating_add(1))),
                             usize::from(mouse.column.saturating_sub(area.x.saturating_add(1))),
                             rows,
                         );
                     }
-                    self.terminal_selection_drag = Some(terminal_id);
-                    self.focus_owner = focus_owner;
-                    if focus_owner == FocusOwner::Workspace {
-                        self.workspace
-                            .focus_at(&geometry.pane_layout, mouse.column, mouse.row);
-                    }
+                    self.terminal_selection_drag = true;
+                    self.focus_owner = FocusOwner::BottomTerminal;
                     return Ok(());
                 }
                 if geometry
@@ -627,12 +377,14 @@ impl Application {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         && self.toggle_open_editors_at(mouse.row, explorer_area)
                     {
+                        self.explorer.open_editors_header_selected = true;
                         return Ok(());
                     }
                     if self.activate_open_editor_at(mouse.row, explorer_area) {
                         return Ok(());
                     }
                     if let Some(index) = self.explorer_entry_at(mouse.row, explorer_area) {
+                        self.explorer.open_editors_header_selected = false;
                         self.explorer.selected = index;
                         if click_count >= 2
                             && let Some(path) = self.explorer.toggle_selected()?
@@ -642,7 +394,7 @@ impl Application {
                         }
                     }
                 } else if geometry
-                    .bottom_terminal
+                    .terminal
                     .is_some_and(|area| area.contains(mouse.column, mouse.row))
                 {
                     self.focus_owner = FocusOwner::BottomTerminal;
@@ -651,6 +403,15 @@ impl Application {
                     .focus_at(&geometry.pane_layout, mouse.column, mouse.row)
                 {
                     self.focus_owner = FocusOwner::Workspace;
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        && self.start_horizontal_scrollbar_drag(
+                            &geometry.pane_layout,
+                            mouse.column,
+                            mouse.row,
+                        )
+                    {
+                        return Ok(());
+                    }
                     if self.start_scrollbar_drag(&geometry.pane_layout, mouse.column, mouse.row) {
                         return Ok(());
                     }
@@ -699,9 +460,9 @@ impl Application {
                     };
                     self.workspace.resize_split(splitter.id, ratio);
                     self.resize_terminals(columns, rows)?;
-                } else if let Some(terminal_id) = self.terminal_selection_drag
-                    && let Some((_, area, _)) = self.terminal_at(&geometry, mouse.column, mouse.row)
-                    && let Some(session) = self.terminal_sessions.get_mut(&terminal_id)
+                } else if self.terminal_selection_drag
+                    && let Some(area) = self.terminal_at(&geometry, mouse.column, mouse.row)
+                    && let Some(session) = self.bottom_terminal.as_mut()
                 {
                     session.update_selection(
                         usize::from(mouse.row.saturating_sub(area.y.saturating_add(1))),
@@ -709,6 +470,8 @@ impl Application {
                     );
                 } else if self.selection_drag {
                     self.place_editor_cursor(&geometry.pane_layout, mouse.column, mouse.row, false);
+                } else if self.horizontal_scrollbar_drag_offset.is_some() {
+                    self.update_horizontal_scrollbar_drag(&geometry.pane_layout, mouse.column);
                 } else if self.scrollbar_drag {
                     self.update_scrollbar_drag(&geometry.pane_layout, mouse.row);
                 }
@@ -716,7 +479,7 @@ impl Application {
             MouseEventKind::Up(_) => {
                 self.drag_split = None;
                 self.workbench_drag = None;
-                self.terminal_selection_drag = None;
+                self.terminal_selection_drag = false;
                 if self.selection_drag
                     && let Pane::Editor { view, .. } = self.workspace.focused_pane_mut()
                     && view.selection().is_none()
@@ -724,40 +487,41 @@ impl Application {
                     view.clear_selection();
                 }
                 self.selection_drag = false;
+                self.horizontal_scrollbar_drag_offset = None;
                 self.scrollbar_drag = false;
             }
-            MouseEventKind::ScrollUp => self.scroll_at(&geometry, mouse.column, mouse.row, -3),
-            MouseEventKind::ScrollDown => self.scroll_at(&geometry, mouse.column, mouse.row, 3),
             _ => {}
         }
         Ok(())
     }
 
-    fn terminal_at(
-        &self,
+    fn route_mouse_scroll(
+        &mut self,
         geometry: &render::WorkbenchGeometry,
-        column: u16,
-        row: u16,
-    ) -> Option<(TerminalId, Rect, FocusOwner)> {
-        if let (Some(terminal_id), Some(area)) = (self.bottom_terminal, geometry.bottom_terminal)
-            && terminal_content_contains(area, column, row)
-        {
-            return Some((terminal_id, area, FocusOwner::BottomTerminal));
+        mouse: crossterm::event::MouseEvent,
+    ) -> bool {
+        let horizontal_delta = match mouse.kind {
+            MouseEventKind::ScrollUp if mouse.modifiers.contains(KeyModifiers::SHIFT) => Some(-3),
+            MouseEventKind::ScrollDown if mouse.modifiers.contains(KeyModifiers::SHIFT) => Some(3),
+            MouseEventKind::ScrollLeft => Some(-3),
+            MouseEventKind::ScrollRight => Some(3),
+            _ => None,
+        };
+        if let Some(delta) = horizontal_delta {
+            self.scroll_horizontal_at(geometry, mouse.column, mouse.row, delta);
+            return true;
         }
-        geometry
-            .pane_layout
-            .panes
-            .iter()
-            .find_map(|(pane_id, area)| {
-                let Pane::Terminal { terminal_id } = self.workspace.panes.get(pane_id)? else {
-                    return None;
-                };
-                terminal_content_contains(*area, column, row).then_some((
-                    *terminal_id,
-                    *area,
-                    FocusOwner::Workspace,
-                ))
-            })
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_at(geometry, mouse.column, mouse.row, -3);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_at(geometry, mouse.column, mouse.row, 3);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn scroll_at(
@@ -774,37 +538,83 @@ impl Application {
             self.explorer.move_selection(delta);
             return;
         }
-        if let Some((terminal_id, _, _)) = self.terminal_at(geometry, column, row) {
-            if let Some(session) = self.terminal_sessions.get_mut(&terminal_id) {
+        if self.terminal_at(geometry, column, row).is_some() {
+            if let Some(session) = self.bottom_terminal.as_mut() {
                 session.scroll(-delta);
             }
             return;
         }
-        let pane_id = geometry
+        let pane = geometry
             .pane_layout
             .panes
             .iter()
-            .find_map(|(pane_id, area)| area.contains(column, row).then_some(*pane_id));
-        if let Some(Pane::Editor { view, .. }) =
-            pane_id.and_then(|pane_id| self.workspace.panes.get_mut(&pane_id))
-        {
-            view.viewport_line = view.viewport_line.saturating_add_signed(delta);
+            .find_map(|(pane_id, area)| area.contains(column, row).then_some((*pane_id, *area)));
+        let Some((pane_id, area)) = pane else {
+            return;
+        };
+        let Some(Pane::Editor { document_id, .. }) = self.workspace.panes.get(&pane_id) else {
+            return;
+        };
+        let document_id = *document_id;
+        let document = self.documents.get(document_id);
+        let content = render::editor_content_geometry(self, area, document);
+        let Some(Pane::Editor { view, .. }) = self.workspace.panes.get_mut(&pane_id) else {
+            return;
+        };
+        if self.config.effective.editor.soft_wrap {
+            view.scroll_vertical_wrapped(document, content.width, content.height, delta);
+        } else {
+            view.scroll_vertical(document, content.height, delta);
         }
     }
 
-    fn explorer_entry_at(&self, row: u16, area: Rect) -> Option<usize> {
-        let open_editor_rows = if self.explorer.open_editors_expanded {
-            u16::try_from(self.open_document_ids().len()).unwrap_or(u16::MAX)
-        } else {
-            0
+    fn scroll_horizontal_at(
+        &mut self,
+        geometry: &render::WorkbenchGeometry,
+        column: u16,
+        row: u16,
+        delta: isize,
+    ) {
+        if self.config.effective.editor.soft_wrap {
+            return;
+        }
+        let Some((pane_id, area)) = geometry
+            .pane_layout
+            .panes
+            .iter()
+            .find_map(|(pane_id, area)| area.contains(column, row).then_some((*pane_id, *area)))
+        else {
+            return;
         };
-        let first_entry_row = area.y.saturating_add(3).saturating_add(open_editor_rows);
-        let index = usize::from(row.checked_sub(first_entry_row)?);
+        let Some(Pane::Editor { document_id, .. }) = self.workspace.panes.get(&pane_id) else {
+            return;
+        };
+        let document_id = *document_id;
+        let document = self.documents.get(document_id);
+        let content = render::editor_content_geometry(self, area, document);
+        let Some(Pane::Editor { view, .. }) = self.workspace.panes.get_mut(&pane_id) else {
+            return;
+        };
+        view.scroll_horizontal(document, content.width, delta);
+    }
+
+    fn explorer_entry_at(&self, row: u16, area: Rect) -> Option<usize> {
+        let rows = render::explorer_rows(
+            area,
+            self.open_document_ids().len(),
+            self.explorer.open_editors_expanded,
+        );
+        let index = usize::from(row.checked_sub(rows.entries_start)?);
         (index < self.explorer.entries().len()).then_some(index)
     }
 
     fn toggle_open_editors_at(&mut self, row: u16, area: Rect) -> bool {
-        if row != area.y.saturating_add(1) {
+        let rows = render::explorer_rows(
+            area,
+            self.open_document_ids().len(),
+            self.explorer.open_editors_expanded,
+        );
+        if row != rows.header {
             return false;
         }
         self.explorer.open_editors_expanded = !self.explorer.open_editors_expanded;
@@ -815,7 +625,8 @@ impl Application {
         if !self.explorer.open_editors_expanded {
             return false;
         }
-        let Some(index) = row.checked_sub(area.y.saturating_add(2)).map(usize::from) else {
+        let rows = render::explorer_rows(area, self.open_document_ids().len(), true);
+        let Some(index) = row.checked_sub(rows.open_editors_start).map(usize::from) else {
             return false;
         };
         let Some(document_id) = self.open_document_ids().get(index).copied() else {
@@ -843,13 +654,7 @@ impl Application {
         let Some(pane_id) = pane_id else {
             return false;
         };
-        self.workspace.panes.insert(
-            pane_id,
-            Pane::Editor {
-                document_id,
-                view: crate::editor::EditorView::default(),
-            },
-        );
+        self.switch_editor_document(pane_id, document_id);
         self.workspace.focused = pane_id;
         self.focus_owner = FocusOwner::Workspace;
         true
@@ -865,80 +670,8 @@ impl Application {
     pub fn focused_document_id(&self) -> Option<crate::document::DocumentId> {
         match self.workspace.focused_pane() {
             Pane::Editor { document_id, .. } => Some(*document_id),
-            Pane::Empty | Pane::Terminal { .. } => None,
+            Pane::Empty => None,
         }
-    }
-
-    fn forward_terminal_mouse(
-        &mut self,
-        geometry: &render::WorkbenchGeometry,
-        mouse: MouseEvent,
-    ) -> Result<bool> {
-        let bottom = geometry.bottom_terminal.and_then(|area| {
-            self.bottom_terminal
-                .filter(|_| terminal_content_contains(area, mouse.column, mouse.row))
-                .map(|terminal_id| (terminal_id, area, FocusOwner::BottomTerminal))
-        });
-        let workspace = geometry
-            .pane_layout
-            .panes
-            .iter()
-            .find_map(|(pane_id, area)| {
-                let Pane::Terminal { terminal_id } = self.workspace.panes.get(pane_id)? else {
-                    return None;
-                };
-                terminal_content_contains(*area, mouse.column, mouse.row).then_some((
-                    *terminal_id,
-                    *area,
-                    FocusOwner::Workspace,
-                ))
-            });
-        let Some((terminal_id, area, focus_owner)) = bottom.or(workspace) else {
-            return Ok(false);
-        };
-        let Some(session) = self.terminal_sessions.get_mut(&terminal_id) else {
-            return Ok(false);
-        };
-        if !session.mouse_reporting() {
-            return Ok(false);
-        }
-        let modes = session.modes();
-        let mouse_tracking = modes.mouse_tracking();
-        if (matches!(mouse.kind, MouseEventKind::Drag(_))
-            && mouse_tracking == MouseTrackingMode::Normal)
-            || (matches!(mouse.kind, MouseEventKind::Moved)
-                && mouse_tracking != MouseTrackingMode::AnyEvent)
-        {
-            return Ok(false);
-        }
-        let Some((button, release)) = terminal_mouse_code(mouse.kind) else {
-            return Ok(false);
-        };
-        let mut code = button;
-        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-            code += 4;
-        }
-        if mouse.modifiers.contains(KeyModifiers::ALT) {
-            code += 8;
-        }
-        if mouse.modifiers.contains(KeyModifiers::CONTROL) {
-            code += 16;
-        }
-        let column = mouse.column.saturating_sub(area.x).max(1);
-        let row = mouse.row.saturating_sub(area.y).max(1);
-        session.write(&terminal_mouse_sequence(
-            modes.mouse_sgr,
-            code,
-            column,
-            row,
-            release,
-        ))?;
-        self.focus_owner = focus_owner;
-        if focus_owner == FocusOwner::Workspace {
-            self.workspace
-                .focus_at(&geometry.pane_layout, mouse.column, mouse.row);
-        }
-        Ok(true)
     }
 
     fn register_click(&mut self, column: u16, row: u16) -> u8 {
@@ -968,19 +701,28 @@ impl Application {
         let Some(area) = layout.panes.get(&focused) else {
             return;
         };
-        let Pane::Editor { document_id, view } = self.workspace.focused_pane_mut() else {
+        let Pane::Editor { document_id, .. } = self.workspace.focused_pane() else {
             return;
         };
-        let document = self.documents.get(*document_id);
-        let row = usize::from(y.saturating_sub(area.y.saturating_add(1)));
-        let line_number_width = if self.config.effective.editor.line_numbers {
-            document.len_lines().to_string().len().max(2) + 1
-        } else {
-            0
+        let document_id = *document_id;
+        let document = self.documents.get(document_id);
+        let content = render::editor_content_geometry(self, *area, document);
+        let Pane::Editor { view, .. } = self.workspace.focused_pane_mut() else {
+            return;
         };
+        if self.config.effective.editor.soft_wrap {
+            view.ensure_visible_wrapped(document, content.height, content.width);
+        } else {
+            view.clamp_viewport(document, content.height);
+        }
+        let row = usize::from(y.saturating_sub(area.y.saturating_add(1)));
         let column = usize::from(x.saturating_sub(area.x.saturating_add(1)))
-            .saturating_sub(line_number_width);
-        view.cursor = view.position_from_viewport(document, row, column);
+            .saturating_sub(content.line_number_width);
+        view.cursor = if self.config.effective.editor.soft_wrap {
+            view.position_from_wrapped_viewport(document, row, column, content.width)
+        } else {
+            view.position_from_viewport(document, row, column)
+        };
         if clear_selection {
             view.clear_selection();
         }
@@ -998,6 +740,14 @@ impl Application {
         let Some(area) = layout.panes.get(&self.workspace.focused) else {
             return false;
         };
+        let Pane::Editor { document_id, .. } = self.workspace.focused_pane() else {
+            return false;
+        };
+        if !render::editor_content_geometry(self, *area, self.documents.get(*document_id))
+            .scrollbar_visible
+        {
+            return false;
+        }
         if x != area.x.saturating_add(area.width.saturating_sub(2)) {
             return false;
         }
@@ -1006,17 +756,107 @@ impl Application {
         true
     }
 
+    fn start_horizontal_scrollbar_drag(
+        &mut self,
+        layout: &crate::layout::CalculatedLayout,
+        x: u16,
+        y: u16,
+    ) -> bool {
+        let Some(area) = layout.panes.get(&self.workspace.focused) else {
+            return false;
+        };
+        let Pane::Editor { document_id, view } = self.workspace.focused_pane() else {
+            return false;
+        };
+        let document = self.documents.get(*document_id);
+        let content = render::editor_content_geometry(self, *area, document);
+        let Some(scrollbar) =
+            render::horizontal_scrollbar_geometry(*area, content, document, view.viewport_column)
+        else {
+            return false;
+        };
+        if y != scrollbar.row
+            || x < scrollbar.track_x
+            || x >= scrollbar.track_x.saturating_add(scrollbar.track_width)
+        {
+            return false;
+        }
+        let thumb_end = scrollbar.thumb_x.saturating_add(scrollbar.thumb_width);
+        self.horizontal_scrollbar_drag_offset = Some(if x >= scrollbar.thumb_x && x < thumb_end {
+            x.saturating_sub(scrollbar.thumb_x)
+        } else {
+            scrollbar.thumb_width / 2
+        });
+        self.update_horizontal_scrollbar_drag(layout, x);
+        true
+    }
+
+    fn update_horizontal_scrollbar_drag(
+        &mut self,
+        layout: &crate::layout::CalculatedLayout,
+        x: u16,
+    ) {
+        let Some(grab_offset) = self.horizontal_scrollbar_drag_offset else {
+            return;
+        };
+        let Some(area) = layout.panes.get(&self.workspace.focused) else {
+            return;
+        };
+        let Pane::Editor { document_id, view } = self.workspace.focused_pane() else {
+            return;
+        };
+        let document_id = *document_id;
+        let document = self.documents.get(document_id);
+        let content = render::editor_content_geometry(self, *area, document);
+        let Some(scrollbar) =
+            render::horizontal_scrollbar_geometry(*area, content, document, view.viewport_column)
+        else {
+            return;
+        };
+        let travel = scrollbar.track_width.saturating_sub(scrollbar.thumb_width);
+        let thumb_column = x
+            .saturating_sub(scrollbar.track_x)
+            .saturating_sub(grab_offset)
+            .min(travel);
+        let viewport_column = usize::from(thumb_column).saturating_mul(scrollbar.maximum)
+            / usize::from(travel).max(1);
+        let Pane::Editor { view, .. } = self.workspace.focused_pane_mut() else {
+            return;
+        };
+        view.viewport_column = viewport_column;
+    }
+
     fn update_scrollbar_drag(&mut self, layout: &crate::layout::CalculatedLayout, y: u16) {
         let Some(area) = layout.panes.get(&self.workspace.focused) else {
             return;
         };
-        let Pane::Editor { document_id, view } = self.workspace.focused_pane_mut() else {
+        let Pane::Editor { document_id, .. } = self.workspace.focused_pane() else {
             return;
         };
-        let line_count = self.documents.get(*document_id).len_lines();
-        let track = usize::from(area.height.saturating_sub(2).max(1));
+        let document_id = *document_id;
+        let document = self.documents.get(document_id);
+        let content = render::editor_content_geometry(self, *area, document);
+        let track = content.height.max(1);
         let offset = usize::from(y.saturating_sub(area.y.saturating_add(1))).min(track - 1);
-        view.viewport_line = offset.saturating_mul(line_count.saturating_sub(1)) / track.max(1);
+        let Pane::Editor { view, .. } = self.workspace.focused_pane_mut() else {
+            return;
+        };
+        if self.config.effective.editor.soft_wrap {
+            let maximum = crate::editor::maximum_wrapped_viewport(document, content.width, track);
+            if document.len_lines() == 1 {
+                view.viewport_line = 0;
+                view.viewport_wrap_segment =
+                    offset.saturating_mul(maximum.segment) / track.saturating_sub(1).max(1);
+            } else {
+                view.viewport_line =
+                    offset.saturating_mul(maximum.line) / track.saturating_sub(1).max(1);
+                view.viewport_wrap_segment = 0;
+            }
+            view.viewport_column = 0;
+        } else {
+            let maximum = crate::editor::EditorView::maximum_viewport_line(document, track);
+            view.viewport_line = offset.saturating_mul(maximum) / track.saturating_sub(1).max(1);
+        }
     }
 
     pub fn apply(&mut self, command: Command) -> Result<()> {
@@ -1045,7 +885,7 @@ impl Application {
             Command::Save => self.save_focused()?,
             Command::SaveAs(path) => {
                 if let Some((document_id, _)) = self.focused_editor() {
-                    self.documents.save_as(document_id, &path)?;
+                    self.save_document_as(document_id, &path)?;
                 }
             }
             Command::OpenDialog => {
@@ -1056,9 +896,7 @@ impl Application {
             Command::OpenInSplit(path, direction) => self.open_path(&path, Some(direction))?,
             Command::ClosePane => self.request_close()?,
             Command::Split(direction) => {
-                if self.focus_owner == FocusOwner::Workspace
-                    && !matches!(self.workspace.focused_pane(), Pane::Terminal { .. })
-                {
+                if self.focus_owner == FocusOwner::Workspace {
                     self.workspace.split_contextual(direction);
                 }
             }
@@ -1139,10 +977,28 @@ impl Application {
                 self.view_focused(|document, view| view.move_right(document, selecting));
             }
             Command::MoveUp { selecting } => {
-                self.view_focused(|document, view| view.move_vertical(document, -1, selecting));
+                if self.config.effective.editor.soft_wrap {
+                    let width = self
+                        .focused_editor_content_geometry()?
+                        .map_or(1, |value| value.width);
+                    self.view_focused(|document, view| {
+                        view.move_vertical_wrapped(document, width, -1, selecting);
+                    });
+                } else {
+                    self.view_focused(|document, view| view.move_vertical(document, -1, selecting));
+                }
             }
             Command::MoveDown { selecting } => {
-                self.view_focused(|document, view| view.move_vertical(document, 1, selecting));
+                if self.config.effective.editor.soft_wrap {
+                    let width = self
+                        .focused_editor_content_geometry()?
+                        .map_or(1, |value| value.width);
+                    self.view_focused(|document, view| {
+                        view.move_vertical_wrapped(document, width, 1, selecting);
+                    });
+                } else {
+                    self.view_focused(|document, view| view.move_vertical(document, 1, selecting));
+                }
             }
             Command::Home { selecting } => {
                 self.view_focused(|document, view| view.move_home(document, selecting));
@@ -1151,29 +1007,101 @@ impl Application {
                 self.view_focused(|document, view| view.move_end(document, selecting));
             }
             Command::PageUp { selecting } => {
-                self.view_focused(|document, view| view.page(document, 10, false, selecting));
+                if self.config.effective.editor.soft_wrap {
+                    let content = self.focused_editor_content_geometry()?.unwrap_or(
+                        render::EditorContentGeometry {
+                            height: 10,
+                            horizontal_scrollbar_visible: false,
+                            line_number_width: 0,
+                            scrollbar_visible: false,
+                            width: 1,
+                        },
+                    );
+                    self.view_focused(|document, view| {
+                        view.page_wrapped(
+                            document,
+                            content.width,
+                            content.height,
+                            false,
+                            selecting,
+                        );
+                    });
+                } else {
+                    self.view_focused(|document, view| view.page(document, 10, false, selecting));
+                }
             }
             Command::PageDown { selecting } => {
-                self.view_focused(|document, view| view.page(document, 10, true, selecting));
+                if self.config.effective.editor.soft_wrap {
+                    let content = self.focused_editor_content_geometry()?.unwrap_or(
+                        render::EditorContentGeometry {
+                            height: 10,
+                            horizontal_scrollbar_visible: false,
+                            line_number_width: 0,
+                            scrollbar_visible: false,
+                            width: 1,
+                        },
+                    );
+                    self.view_focused(|document, view| {
+                        view.page_wrapped(document, content.width, content.height, true, selecting);
+                    });
+                } else {
+                    self.view_focused(|document, view| view.page(document, 10, true, selecting));
+                }
             }
             Command::Scroll(delta) => {
                 if self.focus_owner == FocusOwner::BottomTerminal {
-                    if let Some(session) = self
-                        .bottom_terminal
-                        .and_then(|id| self.terminal_sessions.get_mut(&id))
-                    {
+                    if let Some(session) = self.bottom_terminal.as_mut() {
                         session.scroll(-isize::from(delta));
                     }
                 } else {
+                    let (columns, rows) = crossterm::terminal::size()
+                        .map_err(|error| AppError::io("could not inspect terminal size", error))?;
+                    let geometry = render::geometry(
+                        self,
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            width: columns,
+                            height: rows,
+                        },
+                    );
+                    let height = geometry
+                        .pane_layout
+                        .panes
+                        .get(&self.workspace.focused)
+                        .map_or(1, |area| usize::from(area.height.saturating_sub(2)));
+                    let wrapped_width = if self.config.effective.editor.soft_wrap {
+                        let Pane::Editor { document_id, .. } = self.workspace.focused_pane() else {
+                            return Ok(());
+                        };
+                        geometry
+                            .pane_layout
+                            .panes
+                            .get(&self.workspace.focused)
+                            .map_or(1, |area| {
+                                render::editor_content_geometry(
+                                    self,
+                                    *area,
+                                    self.documents.get(*document_id),
+                                )
+                                .width
+                            })
+                    } else {
+                        1
+                    };
                     match self.workspace.focused_pane_mut() {
                         Pane::Empty => {}
-                        Pane::Editor { view, .. } => {
-                            view.viewport_line =
-                                view.viewport_line.saturating_add_signed(isize::from(delta));
-                        }
-                        Pane::Terminal { terminal_id } => {
-                            if let Some(session) = self.terminal_sessions.get_mut(terminal_id) {
-                                session.scroll(-isize::from(delta));
+                        Pane::Editor { document_id, view } => {
+                            let document = self.documents.get(*document_id);
+                            if self.config.effective.editor.soft_wrap {
+                                view.scroll_vertical_wrapped(
+                                    document,
+                                    wrapped_width,
+                                    height,
+                                    isize::from(delta),
+                                );
+                            } else {
+                                view.scroll_vertical(document, height, isize::from(delta));
                             }
                         }
                     }
@@ -1204,7 +1132,7 @@ impl Application {
     fn focused_editor(&self) -> Option<(crate::document::DocumentId, crate::layout::PaneId)> {
         match self.workspace.focused_pane() {
             Pane::Editor { document_id, .. } => Some((*document_id, self.workspace.focused)),
-            Pane::Empty | Pane::Terminal { .. } => None,
+            Pane::Empty => None,
         }
     }
 
@@ -1224,9 +1152,9 @@ impl Application {
 
     fn request_quit(&mut self) {
         let has_live_terminal = self
-            .terminal_sessions
-            .values_mut()
-            .any(|session| session.is_alive().unwrap_or(true));
+            .bottom_terminal
+            .as_mut()
+            .is_some_and(|session| session.is_alive().unwrap_or(true));
         if !has_live_terminal {
             self.running = false;
         } else {
@@ -1251,56 +1179,7 @@ impl Application {
     }
 
     fn request_close(&mut self) -> Result<()> {
-        if self.focus_owner == FocusOwner::BottomTerminal {
-            if let Some(terminal_id) = self.bottom_terminal {
-                self.overlay = Some(Overlay::ConfirmTerminalClose {
-                    terminal_id,
-                    bottom: true,
-                });
-                self.focus_owner = FocusOwner::Overlay;
-            }
-            return Ok(());
-        }
-        match self.workspace.focused_pane() {
-            Pane::Empty => {
-                self.workspace.close_focused();
-            }
-            Pane::Terminal { terminal_id } => {
-                let terminal_id = *terminal_id;
-                let is_alive = self
-                    .terminal_sessions
-                    .get_mut(&terminal_id)
-                    .is_some_and(|session| session.is_alive().unwrap_or(true));
-                if is_alive {
-                    self.overlay = Some(Overlay::ConfirmTerminalClose {
-                        terminal_id,
-                        bottom: false,
-                    });
-                    self.focus_owner = FocusOwner::Overlay;
-                } else {
-                    self.terminal_sessions.remove(&terminal_id);
-                    self.workspace.close_focused();
-                }
-            }
-            Pane::Editor { document_id, .. } => {
-                let document_id = *document_id;
-                let visible_views = self
-                    .workspace
-                    .panes
-                    .values()
-                    .filter(|pane| {
-                        matches!(pane, Pane::Editor { document_id: id, .. } if *id == document_id)
-                    })
-                    .count();
-                if visible_views == 1 && self.documents.get(document_id).is_modified() {
-                    self.overlay = Some(Overlay::ConfirmDocumentClose);
-                    self.focus_owner = FocusOwner::Overlay;
-                } else {
-                    self.close_focused_editor_view();
-                }
-            }
-        }
-        Ok(())
+        document_lifecycle::request_close(self)
     }
 
     fn discard_focused_document(&mut self) {
@@ -1308,25 +1187,7 @@ impl Application {
     }
 
     fn close_focused_editor_view(&mut self) {
-        let Some((document_id, pane_id)) = self.focused_editor() else {
-            return;
-        };
-        if self.workspace.panes.len() == 1 {
-            self.workspace.panes.insert(pane_id, Pane::Empty);
-            self.documents.remove(document_id);
-            if let Some((next_document, _)) = self.documents.iter().next() {
-                self.workspace.panes.insert(
-                    pane_id,
-                    Pane::Editor {
-                        document_id: next_document,
-                        view: crate::editor::EditorView::default(),
-                    },
-                );
-            }
-        } else {
-            self.workspace.close_focused();
-            self.unload_document_without_views(document_id);
-        }
+        document_lifecycle::close_focused_editor_view(self);
     }
 
     fn unload_document_without_views(&mut self, document_id: crate::document::DocumentId) {
@@ -1335,7 +1196,45 @@ impl Application {
         });
         if !still_visible {
             self.documents.remove(document_id);
+            self.saved_editor_views.remove(&document_id);
         }
+    }
+
+    fn switch_editor_document(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        document_id: crate::document::DocumentId,
+    ) {
+        let current = self
+            .workspace
+            .panes
+            .get(&pane_id)
+            .and_then(|pane| match pane {
+                Pane::Editor { document_id, view } => Some((*document_id, view.clone())),
+                Pane::Empty => None,
+            });
+        if current
+            .as_ref()
+            .is_some_and(|(current_id, _)| *current_id == document_id)
+        {
+            return;
+        }
+        if let Some((current_id, view)) = current {
+            let remains_visible = self.workspace.panes.iter().any(|(other_id, pane)| {
+                *other_id != pane_id
+                    && matches!(pane, Pane::Editor { document_id, .. } if *document_id == current_id)
+            });
+            if !remains_visible {
+                self.saved_editor_views.insert(current_id, view);
+            }
+        }
+        let view = self
+            .saved_editor_views
+            .remove(&document_id)
+            .unwrap_or_default();
+        self.workspace
+            .panes
+            .insert(pane_id, Pane::Editor { document_id, view });
     }
 
     fn unload_pristine_untitled_without_views(&mut self, document_id: crate::document::DocumentId) {
@@ -1379,6 +1278,12 @@ impl Application {
                         .map(|position| transform_position(position, change));
                 }
             }
+            if let Some(view) = self.saved_editor_views.get_mut(&document_id) {
+                view.cursor = transform_position(view.cursor, change);
+                view.selection_anchor = view
+                    .selection_anchor
+                    .map(|position| transform_position(position, change));
+            }
         }
     }
 
@@ -1395,15 +1300,7 @@ impl Application {
 
     fn insert_text(&mut self, text: &str) -> Result<()> {
         if self.focus_owner == FocusOwner::BottomTerminal {
-            if let Some(id) = self.bottom_terminal
-                && let Some(session) = self.terminal_sessions.get_mut(&id)
-            {
-                session.write(text.as_bytes())?;
-            }
-            return Ok(());
-        }
-        if let Pane::Terminal { terminal_id } = self.workspace.focused_pane() {
-            if let Some(session) = self.terminal_sessions.get_mut(terminal_id) {
+            if let Some(session) = self.bottom_terminal.as_mut() {
                 session.write(text.as_bytes())?;
             }
             return Ok(());
@@ -1413,9 +1310,7 @@ impl Application {
     }
 
     fn insert_typed_text(&mut self, text: &str) -> Result<()> {
-        if self.focus_owner == FocusOwner::BottomTerminal
-            || matches!(self.workspace.focused_pane(), Pane::Terminal { .. })
-        {
+        if self.focus_owner == FocusOwner::BottomTerminal {
             return self.insert_text(text);
         }
         self.edit_focused(|document, view| view.insert_typed(document, text));
@@ -1425,11 +1320,7 @@ impl Application {
     fn copy_selection(&mut self, cut: bool) {
         let terminal_selection = if self.focus_owner == FocusOwner::BottomTerminal {
             self.bottom_terminal
-                .and_then(|id| self.terminal_sessions.get(&id))
-                .and_then(TerminalSession::selected_text)
-        } else if let Pane::Terminal { terminal_id } = self.workspace.focused_pane() {
-            self.terminal_sessions
-                .get(terminal_id)
+                .as_ref()
                 .and_then(TerminalSession::selected_text)
         } else {
             None
@@ -1470,72 +1361,23 @@ impl Application {
     }
 
     fn save_focused(&mut self) -> Result<()> {
-        let Some((document_id, _)) = self.focused_editor() else {
-            return Ok(());
-        };
-        if self.documents.get(document_id).path.is_none() {
-            self.overlay = Some(file_dialog(&self.explorer.root, true));
-            self.focus_owner = FocusOwner::Overlay;
-            return Ok(());
-        }
-        if matches!(
-            self.documents.save(document_id, false)?,
-            SaveOutcome::ExternalChange
-        ) {
-            self.overlay = Some(Overlay::SaveConflict);
-            self.focus_owner = FocusOwner::Overlay;
-        }
-        Ok(())
+        document_lifecycle::save_focused(self)
+    }
+
+    fn save_document_as(
+        &mut self,
+        document_id: crate::document::DocumentId,
+        path: &Path,
+    ) -> Result<()> {
+        document_lifecycle::save_document_as(self, document_id, path)
+    }
+
+    fn finish_successful_save(&mut self, document_id: crate::document::DocumentId) -> Result<()> {
+        document_lifecycle::finish_successful_save(self, document_id)
     }
 
     fn open_path(&mut self, path: &Path, split: Option<SplitDirection>) -> Result<()> {
-        let (document_id, _) = self.documents.open(path)?;
-        if let Some(direction) = split {
-            self.workspace.split_with_editor(document_id, direction);
-            return Ok(());
-        }
-        if let Some((pane_id, _)) = self.workspace.panes.iter().find(|(_, pane)| {
-            matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
-        }) {
-            self.workspace.focused = *pane_id;
-        } else if matches!(self.workspace.focused_pane(), Pane::Terminal { .. }) {
-            if let Some(pane_id) = self.workspace.panes.iter().find_map(|(pane_id, pane)| {
-                matches!(pane, Pane::Editor { .. }).then_some(*pane_id)
-            }) {
-                let replaced_document = match self.workspace.panes.get(&pane_id) {
-                    Some(Pane::Editor { document_id, .. }) => Some(*document_id),
-                    _ => None,
-                };
-                self.workspace.panes.insert(
-                    pane_id,
-                    Pane::Editor {
-                        document_id,
-                        view: crate::editor::EditorView::default(),
-                    },
-                );
-                self.workspace.focused = pane_id;
-                if let Some(replaced_document) = replaced_document {
-                    self.unload_pristine_untitled_without_views(replaced_document);
-                }
-            } else {
-                self.workspace
-                    .split_with_editor(document_id, SplitDirection::Vertical);
-            }
-        } else {
-            let focused = self.workspace.focused;
-            let replaced_document = match self.workspace.panes.get(&focused) {
-                Some(Pane::Editor { document_id, .. }) => Some(*document_id),
-                _ => None,
-            };
-            self.workspace.panes.insert(
-                focused,
-                Pane::Editor { document_id, view: crate::editor::EditorView::default() },
-            );
-            if let Some(replaced_document) = replaced_document {
-                self.unload_pristine_untitled_without_views(replaced_document);
-            }
-        }
-        Ok(())
+        document_lifecycle::open_path(self, path, split)
     }
 
     fn submit_file_dialog(&mut self) -> Result<()> {
@@ -1550,14 +1392,16 @@ impl Application {
         }
         let result = if save_as {
             let document_id = self.focused_editor().map(|(id, _)| id);
-            document_id.map_or(Ok(()), |id| self.documents.save_as(id, &path))
+            document_id.map_or(Ok(()), |id| self.save_document_as(id, &path))
         } else {
             self.open_path(&path, None)
         };
         match result {
             Ok(()) => {
-                self.overlay = None;
-                self.focus_owner = FocusOwner::Workspace;
+                if !matches!(self.overlay, Some(Overlay::ConfirmSaveAsOverwrite { .. })) {
+                    self.overlay = None;
+                    self.focus_owner = FocusOwner::Workspace;
+                }
             }
             Err(open_error) => {
                 if let Some(Overlay::FileDialog { error, .. }) = self.overlay.as_mut() {
@@ -1583,79 +1427,214 @@ impl Application {
         self.submit_file_dialog()
     }
 
-    fn toggle_bottom_terminal(&mut self) -> Result<()> {
-        if self.bottom_terminal.is_none() {
-            let id = TerminalId(0);
-            self.spawn_terminal(id, None)?;
-            self.bottom_terminal = Some(id);
-        }
-        self.bottom_terminal_visible = !self.bottom_terminal_visible;
-        self.focus_owner = if self.bottom_terminal_visible {
-            FocusOwner::BottomTerminal
-        } else {
-            FocusOwner::Workspace
-        };
-        if self.bottom_terminal_visible {
-            let (columns, rows) = crossterm::terminal::size()
-                .map_err(|error| AppError::io("could not inspect terminal size", error))?;
-            self.resize_terminals(columns, rows)?;
-        }
-        Ok(())
-    }
-
-    fn spawn_terminal(&mut self, id: TerminalId, directory: Option<&Path>) -> Result<()> {
-        let shell = self
-            .config
-            .effective
-            .terminal
-            .shell
-            .clone()
-            .or_else(|| env::var_os("SHELL").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("/bin/sh"));
-        let working_directory =
-            directory.map_or_else(|| self.explorer.root.clone(), Path::to_owned);
-        let session = TerminalSession::spawn(
-            &shell,
-            &self.config.effective.terminal.arguments,
-            &working_directory,
-            PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            self.config.effective.terminal.scrollback_lines,
-            self.config.effective.terminal.allow_child_osc52_write,
-        )?;
-        self.terminal_sessions.insert(id, session);
-        Ok(())
-    }
-
     pub fn status_text(&self) -> String {
         if let Some(message) = &self.message {
             return message.clone();
         }
+        if self.input.leader_pending() {
+            return format!("Leader {} pending", self.config.effective.terminal.leader);
+        }
+        if let Some(action) = self.title_control_hover {
+            return action.status_hint().to_owned();
+        }
+        if self.focus_owner == FocusOwner::BottomTerminal {
+            return format!("Terminal  {} leader", self.config.effective.terminal.leader);
+        }
         match self.workspace.focused_pane() {
-            Pane::Empty => "NO EDITOR  Type to create a new file".to_owned(),
+            Pane::Empty => "No editor  Type to create a new file".to_owned(),
             Pane::Editor { document_id, view } => {
                 let document = self.documents.get(*document_id);
                 let line = document.char_to_line(view.cursor) + 1;
                 let column = crate::editor::display_column(document, line - 1, view.cursor) + 1;
-                format!(
-                    "EDIT  Ln {line}, Col {column}  UTF-8  {:?}",
-                    document.line_ending
-                )
+                let line_ending = match document.line_ending {
+                    crate::config::LineEnding::Lf => "LF",
+                    crate::config::LineEnding::Crlf => "CRLF",
+                };
+                let horizontal_offset =
+                    if !self.config.effective.editor.soft_wrap && view.viewport_column > 0 {
+                        format!("  HScroll {}", view.viewport_column)
+                    } else {
+                        String::new()
+                    };
+                format!("Edit  Ln {line}, Col {column}  UTF-8  {line_ending}{horizontal_offset}")
             }
-            Pane::Terminal { .. } => "TERMINAL  Ctrl+B leader".to_owned(),
         }
     }
-}
 
-fn terminal_content_contains(area: Rect, column: u16, row: u16) -> bool {
-    column > area.x
-        && column < area.x.saturating_add(area.width.saturating_sub(1))
-        && row > area.y
-        && row < area.y.saturating_add(area.height.saturating_sub(1))
+    fn ensure_focused_editor_visible(&mut self, columns: u16, rows: u16) {
+        if self.focus_owner != FocusOwner::Workspace {
+            return;
+        }
+        let geometry = render::geometry(
+            self,
+            Rect {
+                x: 0,
+                y: 0,
+                width: columns,
+                height: rows,
+            },
+        );
+        let focused = self.workspace.focused;
+        let Some(area) = geometry.pane_layout.panes.get(&focused).copied() else {
+            return;
+        };
+        let Pane::Editor { document_id, .. } = self.workspace.focused_pane() else {
+            return;
+        };
+        let document_id = *document_id;
+        let document = self.documents.get(document_id);
+        let content = render::editor_content_geometry(self, area, document);
+        let (documents, workspace) = (&self.documents, &mut self.workspace);
+        let Pane::Editor { document_id, view } = workspace.focused_pane_mut() else {
+            return;
+        };
+        if self.config.effective.editor.soft_wrap {
+            view.ensure_visible_wrapped(documents.get(*document_id), content.height, content.width);
+        } else {
+            view.viewport_wrap_segment = 0;
+            view.ensure_visible(
+                documents.get(*document_id),
+                content.height,
+                content.width.saturating_sub(1).max(1),
+            );
+            view.clamp_horizontal(documents.get(*document_id), content.width);
+        }
+    }
+
+    fn focused_editor_content_geometry(&self) -> Result<Option<render::EditorContentGeometry>> {
+        let Pane::Editor { document_id, .. } = self.workspace.focused_pane() else {
+            return Ok(None);
+        };
+        let (columns, rows) = crossterm::terminal::size()
+            .map_err(|error| AppError::io("could not inspect terminal size", error))?;
+        let geometry = render::geometry(
+            self,
+            Rect {
+                x: 0,
+                y: 0,
+                width: columns,
+                height: rows,
+            },
+        );
+        Ok(geometry
+            .pane_layout
+            .panes
+            .get(&self.workspace.focused)
+            .map(|area| {
+                render::editor_content_geometry(self, *area, self.documents.get(*document_id))
+            }))
+    }
+
+    fn handle_event_and_sync_editor_viewport(
+        &mut self,
+        event: Event,
+        columns: u16,
+        rows: u16,
+    ) -> Result<()> {
+        let before = self.editor_visibility_anchor(columns, rows);
+        let resized = matches!(event, Event::Resize(_, _));
+        let preserves_viewport = self.event_preserves_editor_viewport(&event);
+        self.handle_event(event)?;
+        let preserves_viewport = preserves_viewport
+            || self.scrollbar_drag
+            || self.horizontal_scrollbar_drag_offset.is_some();
+        self.sync_editor_viewport_after_event(before, columns, rows, resized, preserves_viewport);
+        self.clamp_editor_horizontal_offsets(columns, rows);
+        Ok(())
+    }
+
+    fn clamp_editor_horizontal_offsets(&mut self, columns: u16, rows: u16) {
+        let geometry = render::geometry(
+            self,
+            Rect {
+                x: 0,
+                y: 0,
+                width: columns,
+                height: rows,
+            },
+        );
+        let panes = geometry
+            .pane_layout
+            .panes
+            .iter()
+            .filter_map(|(pane_id, area)| {
+                let Pane::Editor { document_id, .. } = self.workspace.panes.get(pane_id)? else {
+                    return None;
+                };
+                let content =
+                    render::editor_content_geometry(self, *area, self.documents.get(*document_id));
+                Some((*pane_id, *document_id, content.width))
+            })
+            .collect::<Vec<_>>();
+        for (pane_id, document_id, width) in panes {
+            let Some(Pane::Editor { view, .. }) = self.workspace.panes.get_mut(&pane_id) else {
+                continue;
+            };
+            if self.config.effective.editor.soft_wrap {
+                view.viewport_column = 0;
+            } else {
+                view.clamp_horizontal(self.documents.get(document_id), width);
+            }
+        }
+    }
+
+    fn event_preserves_editor_viewport(&self, event: &Event) -> bool {
+        self.scrollbar_drag
+            || self.horizontal_scrollbar_drag_offset.is_some()
+            || matches!(
+                event,
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::ScrollLeft
+                            | MouseEventKind::ScrollRight
+                    )
+            )
+    }
+
+    fn sync_editor_viewport_after_event(
+        &mut self,
+        before: Option<EditorVisibilityAnchor>,
+        columns: u16,
+        rows: u16,
+        resized: bool,
+        preserves_viewport: bool,
+    ) {
+        if !preserves_viewport
+            && (resized || before != self.editor_visibility_anchor(columns, rows))
+        {
+            self.ensure_focused_editor_visible(columns, rows);
+        }
+    }
+
+    fn editor_visibility_anchor(&self, columns: u16, rows: u16) -> Option<EditorVisibilityAnchor> {
+        if self.focus_owner != FocusOwner::Workspace {
+            return None;
+        }
+        let pane_id = self.workspace.focused;
+        let Pane::Editor { document_id, view } = self.workspace.focused_pane() else {
+            return None;
+        };
+        let geometry = render::geometry(
+            self,
+            Rect {
+                x: 0,
+                y: 0,
+                width: columns,
+                height: rows,
+            },
+        );
+        let area = geometry.pane_layout.panes.get(&pane_id).copied()?;
+        Some(EditorVisibilityAnchor {
+            pane_id,
+            document_id: *document_id,
+            revision: self.documents.get(*document_id).revision(),
+            cursor: view.cursor,
+            area,
+        })
+    }
 }
 
 fn explorer_divider_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -1671,6 +1650,14 @@ fn bottom_divider_contains(area: Rect, column: u16, row: u16) -> bool {
         && (row == area.y || row.saturating_add(1) == area.y)
 }
 
+fn title_control_command(action: render::TitleControlAction) -> Command {
+    match action {
+        render::TitleControlAction::ToggleLeftPanel => Command::ToggleExplorer,
+        render::TitleControlAction::ToggleBottomPanel => Command::ToggleBottomTerminal,
+        render::TitleControlAction::OpenSettings => Command::OpenSettings,
+    }
+}
+
 fn global_command(command: &Command) -> bool {
     matches!(
         command,
@@ -1684,42 +1671,6 @@ fn global_command(command: &Command) -> bool {
             | Command::ToggleBottomTerminal
             | Command::OpenSettings
     )
-}
-
-fn terminal_mouse_code(kind: MouseEventKind) -> Option<(u16, bool)> {
-    let button = |button| match button {
-        MouseButton::Left => 0,
-        MouseButton::Middle => 1,
-        MouseButton::Right => 2,
-    };
-    match kind {
-        MouseEventKind::Down(value) => Some((button(value), false)),
-        MouseEventKind::Up(_) => Some((3, true)),
-        MouseEventKind::Drag(value) => Some((button(value) + 32, false)),
-        MouseEventKind::Moved => Some((35, false)),
-        MouseEventKind::ScrollUp => Some((64, false)),
-        MouseEventKind::ScrollDown => Some((65, false)),
-        _ => None,
-    }
-}
-
-fn terminal_mouse_sequence(sgr: bool, code: u16, column: u16, row: u16, release: bool) -> Vec<u8> {
-    if sgr {
-        return format!(
-            "\x1b[<{code};{column};{row}{}",
-            if release { 'm' } else { 'M' }
-        )
-        .into_bytes();
-    }
-    [
-        0x1b,
-        b'[',
-        b'M',
-        u8::try_from(code.saturating_add(32).min(255)).unwrap_or(255),
-        u8::try_from(column.saturating_add(32).min(255)).unwrap_or(255),
-        u8::try_from(row.saturating_add(32).min(255)).unwrap_or(255),
-    ]
-    .to_vec()
 }
 
 fn file_dialog(directory: &Path, save_as: bool) -> Overlay {
@@ -1747,13 +1698,14 @@ fn file_dialog(directory: &Path, save_as: bool) -> Overlay {
     }
 }
 
-pub(crate) const SETTINGS_KEYS: [&str; 30] = [
+pub(crate) const SETTINGS_KEYS: [&str; 32] = [
     "editor.indent_width",
     "editor.insert_spaces",
     "editor.default_line_ending",
     "editor.undo_limit_mib",
     "editor.line_numbers",
     "editor.scrollbar",
+    "editor.soft_wrap",
     "workspace.minimum_pane_width",
     "workspace.minimum_pane_height",
     "workspace.initial_split_ratio",
@@ -1770,6 +1722,7 @@ pub(crate) const SETTINGS_KEYS: [&str; 30] = [
     "terminal.leader",
     "ui.bottom_terminal_visible",
     "ui.bottom_terminal_height",
+    "theme.active",
     "keybindings.ctrl+q",
     "keybindings.ctrl+s",
     "keybindings.ctrl+o",
@@ -1875,29 +1828,6 @@ mod tests {
     }
 
     #[test]
-    fn opening_from_terminal_focus_preserves_the_terminal_pane() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("opened.txt");
-        fs::write(&path, "text").unwrap();
-        let mut application = Application::new_for_test();
-        let (terminal_pane, _) = application
-            .workspace
-            .split_with_terminal(SplitDirection::Vertical);
-        application.open_path(&path, None).unwrap();
-        assert!(matches!(
-            application.workspace.panes[&terminal_pane],
-            Pane::Terminal { .. }
-        ));
-        assert_eq!(
-            application
-                .documents
-                .get(application.focused_document_id().unwrap())
-                .text(),
-            "text"
-        );
-    }
-
-    #[test]
     fn opening_a_file_replaces_and_unloads_a_pristine_untitled_document() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("opened.txt");
@@ -1924,6 +1854,48 @@ mod tests {
             .unwrap();
         assert_eq!(application.workspace.panes.len(), pane_count);
         assert_eq!(application.focus_owner, FocusOwner::BottomTerminal);
+    }
+
+    #[test]
+    fn hiding_the_bottom_terminal_preserves_the_single_session() {
+        let mut application = Application::new_for_test();
+        application.bottom_terminal = Some(application.spawn_terminal(None).unwrap());
+        application.bottom_terminal_visible = true;
+        application.focus_owner = FocusOwner::BottomTerminal;
+        let session = application.bottom_terminal.as_ref().unwrap() as *const TerminalSession;
+
+        application.toggle_bottom_terminal().unwrap();
+
+        assert!(!application.bottom_terminal_visible);
+        assert_eq!(application.focus_owner, FocusOwner::Workspace);
+        assert_eq!(
+            application.bottom_terminal.as_ref().unwrap() as *const TerminalSession,
+            session
+        );
+        assert_eq!(application.workspace.panes.len(), 1);
+    }
+
+    #[test]
+    fn confirmed_terminal_close_removes_the_only_session_without_changing_editors() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        application.bottom_terminal = Some(application.spawn_terminal(None).unwrap());
+        application.bottom_terminal_visible = true;
+        application.focus_owner = FocusOwner::BottomTerminal;
+
+        application.request_close().unwrap();
+        assert_eq!(application.overlay, Some(Overlay::ConfirmTerminalClose));
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert!(application.bottom_terminal.is_none());
+        assert!(!application.bottom_terminal_visible);
+        assert_eq!(application.focused_document_id(), Some(document_id));
+        assert_eq!(application.workspace.panes.len(), 1);
     }
 
     #[test]
@@ -1999,6 +1971,58 @@ mod tests {
     }
 
     #[test]
+    fn raw_configuration_reload_updates_runtime_input_and_explorer_settings() {
+        let mut application = Application::new_for_test();
+        fs::write(
+            &application.config.user_path,
+            "[terminal]\nleader = \"ctrl+a\"\n[explorer]\nrefresh_interval_seconds = 9\n[editor]\nsoft_wrap = true\n",
+        )
+        .unwrap();
+        application.reload_config_after_raw_save().unwrap();
+        assert_eq!(
+            application
+                .config
+                .effective
+                .explorer
+                .refresh_interval_seconds,
+            9
+        );
+        assert!(application.config.effective.editor.soft_wrap);
+
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(application.workspace.panes.len(), 2);
+    }
+
+    #[test]
+    fn invalid_raw_configuration_keeps_the_last_valid_runtime_settings() {
+        let mut application = Application::new_for_test();
+        fs::write(
+            &application.config.user_path,
+            "[terminal]\nleader = \"ctrl+a\"\n",
+        )
+        .unwrap();
+        application.reload_config_after_raw_save().unwrap();
+        fs::write(&application.config.user_path, "[terminal\n").unwrap();
+        application.reload_config_after_raw_save().unwrap();
+
+        assert_eq!(application.config.effective.terminal.leader, "ctrl+a");
+        assert!(application.message.as_deref().is_some_and(|message| {
+            message.contains("previous runtime settings remain active")
+        }));
+    }
+
+    #[test]
     fn terminal_mouse_events_use_sgr_codes() {
         assert_eq!(
             terminal_mouse_code(MouseEventKind::Down(MouseButton::Left)),
@@ -2037,7 +2061,7 @@ mod tests {
             .position(|entry| entry.path.ends_with("README.md"))
             .unwrap();
         let readme_row =
-            area.y + 3 + application.documents.iter().count() as u16 + readme_index as u16;
+            area.y + 4 + application.documents.iter().count() as u16 + readme_index as u16;
         assert_eq!(
             application.explorer_entry_at(readme_row, area),
             Some(readme_index)
@@ -2066,7 +2090,7 @@ mod tests {
         assert!(!application.explorer.open_editors_expanded);
         assert!(!application.activate_open_editor_at(area.y + 2, area));
         assert_eq!(
-            application.explorer_entry_at(area.y + 3 + readme_index as u16, area),
+            application.explorer_entry_at(area.y + 4 + readme_index as u16, area),
             Some(readme_index)
         );
         assert!(!application.toggle_open_editors_at(area.y + 2, area));
@@ -2090,6 +2114,577 @@ mod tests {
         assert_eq!(application.focused_document_id(), Some(second_document));
         assert!(application.activate_open_editor_at(area.y + 2, area));
         assert_eq!(application.focused_document_id(), Some(first_document));
+    }
+
+    #[test]
+    fn open_editor_switching_preserves_cursor_selection_and_viewport() {
+        let mut application = Application::new_for_test();
+        let first_document = application.focused_document_id().unwrap();
+        application
+            .documents
+            .get_mut(first_document)
+            .insert(0, "first\nsecond");
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("expected editor pane");
+        };
+        view.cursor = 8;
+        view.selection_anchor = Some(2);
+        view.viewport_line = 1;
+        view.viewport_column = 3;
+        let second_document = application.documents.new_untitled();
+        let area = Rect {
+            x: 0,
+            y: 1,
+            width: 24,
+            height: 20,
+        };
+
+        assert!(application.activate_open_editor_at(area.y + 3, area));
+        assert_eq!(application.focused_document_id(), Some(second_document));
+        assert!(application.activate_open_editor_at(area.y + 2, area));
+
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.cursor, 8);
+        assert_eq!(view.selection_anchor, Some(2));
+        assert_eq!(view.viewport_line, 1);
+        assert_eq!(view.viewport_column, 3);
+    }
+
+    #[test]
+    fn mouse_scroll_and_scrollbar_share_the_last_full_viewport_bound() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        let text = (0..100)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        application.documents.get_mut(document_id).insert(0, &text);
+        let geometry = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        );
+        let area = geometry.pane_layout.panes[&application.workspace.focused];
+        let height = usize::from(area.height.saturating_sub(2));
+        let maximum = crate::editor::EditorView::maximum_viewport_line(
+            application.documents.get(document_id),
+            height,
+        );
+        let cursor = 3;
+        let selection_anchor = Some(1);
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("expected editor pane");
+        };
+        view.cursor = cursor;
+        view.selection_anchor = selection_anchor;
+
+        application.scroll_at(
+            &geometry,
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            isize::MAX,
+        );
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.viewport_line, maximum);
+        assert_eq!(view.cursor, cursor);
+        assert_eq!(view.selection_anchor, selection_anchor);
+
+        application.update_scrollbar_drag(
+            &geometry.pane_layout,
+            area.y.saturating_add(area.height.saturating_sub(2)),
+        );
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.viewport_line, maximum);
+    }
+
+    #[test]
+    fn horizontal_mouse_routes_native_and_shift_modified_wheel_events() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        application
+            .documents
+            .get_mut(document_id)
+            .insert(0, &format!("short\n{}", "x".repeat(200)));
+        let geometry = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        );
+        let area = geometry.pane_layout.panes[&application.workspace.focused];
+        let column = area.x.saturating_add(1);
+        let row = area.y.saturating_add(1);
+
+        for (kind, modifiers, expected) in [
+            (MouseEventKind::ScrollRight, KeyModifiers::NONE, 3),
+            (MouseEventKind::ScrollLeft, KeyModifiers::NONE, 0),
+            (MouseEventKind::ScrollDown, KeyModifiers::SHIFT, 3),
+            (MouseEventKind::ScrollUp, KeyModifiers::SHIFT, 0),
+        ] {
+            assert!(application.route_mouse_scroll(
+                &geometry,
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers,
+                },
+            ));
+            let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+                panic!("expected editor pane");
+            };
+            assert_eq!(view.viewport_column, expected);
+            assert_eq!(view.cursor, 0);
+        }
+
+        assert!(application.route_mouse_scroll(
+            &geometry,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        ));
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.viewport_column, 0);
+        assert_eq!(view.cursor, 0);
+        assert!(
+            application.event_preserves_editor_viewport(&Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollRight,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+        );
+
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("expected editor pane");
+        };
+        view.viewport_column = 0;
+        application.config.effective.editor.soft_wrap = true;
+        application.route_mouse_scroll(
+            &geometry,
+            MouseEvent {
+                kind: MouseEventKind::ScrollRight,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.viewport_column, 0);
+    }
+
+    #[test]
+    fn horizontal_scrollbar_clicks_and_drags_across_the_document_extent() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        application
+            .documents
+            .get_mut(document_id)
+            .insert(0, &format!("short\n{}", "x".repeat(200)));
+        let geometry = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        );
+        let area = geometry.pane_layout.panes[&application.workspace.focused];
+        let content = render::editor_content_geometry(
+            &application,
+            area,
+            application.documents.get(document_id),
+        );
+        let scrollbar = render::horizontal_scrollbar_geometry(
+            area,
+            content,
+            application.documents.get(document_id),
+            0,
+        )
+        .unwrap();
+
+        assert!(
+            application.start_horizontal_scrollbar_drag(
+                &geometry.pane_layout,
+                scrollbar
+                    .track_x
+                    .saturating_add(scrollbar.track_width.saturating_sub(1)),
+                scrollbar.row,
+            )
+        );
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.viewport_column, scrollbar.maximum);
+        assert_eq!(view.cursor, 0);
+
+        application.update_horizontal_scrollbar_drag(&geometry.pane_layout, scrollbar.track_x);
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.viewport_column, 0);
+        assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn document_shrink_clamps_stale_horizontal_offsets() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        application
+            .documents
+            .get_mut(document_id)
+            .insert(0, &"x".repeat(200));
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("expected editor pane");
+        };
+        view.viewport_column = 100;
+        application
+            .documents
+            .get_mut(document_id)
+            .replace(0, 200, "short");
+
+        application.clamp_editor_horizontal_offsets(100, 30);
+
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.viewport_column, 0);
+    }
+
+    #[test]
+    fn post_event_visibility_preserves_viewport_only_scrolling() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        let text = (0..100)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        application.documents.get_mut(document_id).insert(0, &text);
+        let columns = 100;
+        let rows = 30;
+        let geometry = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: columns,
+                height: rows,
+            },
+        );
+        let area = geometry.pane_layout.panes[&application.workspace.focused];
+        let before = application.editor_visibility_anchor(columns, rows);
+
+        application.scroll_at(
+            &geometry,
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            3,
+        );
+        application.sync_editor_viewport_after_event(before, columns, rows, false, true);
+
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.viewport_line, 3);
+        assert_eq!(view.cursor, 0);
+        assert!(
+            application.event_preserves_editor_viewport(&Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: area.x.saturating_add(1),
+                row: area.y.saturating_add(1),
+                modifiers: KeyModifiers::NONE,
+            }))
+        );
+    }
+
+    #[test]
+    fn post_event_visibility_follows_keyboard_cursor_movement() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        let text = (0..100)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        application.documents.get_mut(document_id).insert(0, &text);
+        let columns = 100;
+        let rows = 30;
+        let geometry = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: columns,
+                height: rows,
+            },
+        );
+        let area = geometry.pane_layout.panes[&application.workspace.focused];
+        let visible_rows = usize::from(area.height.saturating_sub(2));
+        let cursor = application
+            .documents
+            .get(document_id)
+            .line_to_char(visible_rows.saturating_sub(1));
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("expected editor pane");
+        };
+        view.cursor = cursor;
+
+        application
+            .handle_event_and_sync_editor_viewport(
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Down,
+                    KeyModifiers::NONE,
+                )),
+                columns,
+                rows,
+            )
+            .unwrap();
+
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(
+            application
+                .documents
+                .get(document_id)
+                .char_to_line(view.cursor),
+            visible_rows
+        );
+        assert_eq!(view.viewport_line, 1);
+    }
+
+    #[test]
+    fn post_event_visibility_reanchors_the_cursor_after_resize() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        let text = (0..100)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        application.documents.get_mut(document_id).insert(0, &text);
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("expected editor pane");
+        };
+        view.viewport_line = 50;
+
+        application
+            .handle_event_and_sync_editor_viewport(Event::Resize(100, 30), 100, 30)
+            .unwrap();
+
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.cursor, 0);
+        assert_eq!(view.viewport_line, 0);
+    }
+
+    #[test]
+    fn cursor_navigation_updates_horizontal_viewport_and_status() {
+        let mut application = Application::new_for_test();
+        application.apply(Command::Insert("x".repeat(200))).unwrap();
+
+        application.ensure_focused_editor_visible(80, 24);
+
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert!(view.viewport_column > 0);
+        assert!(application.status_text().contains("HScroll"));
+    }
+
+    #[test]
+    fn title_control_hover_exposes_only_available_action_hints() {
+        let mut application = Application::new_for_test();
+        let controls = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        )
+        .title_controls;
+        let explorer = controls.left_panel_toggle.unwrap();
+        application.title_control_hover = controls.action_at(explorer.x + 1, explorer.y);
+        assert_eq!(application.status_text(), "Toggle Explorer");
+
+        let right = controls.right_panel_toggle.unwrap();
+        application.title_control_hover = controls.action_at(right.x + 1, right.y);
+        assert_ne!(application.status_text(), "Toggle right panel");
+        assert!(application.title_control_hover.is_none());
+    }
+
+    #[test]
+    fn resize_to_a_taller_pane_clamps_the_editor_viewport() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        let text = (0..100)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        application.documents.get_mut(document_id).insert(0, &text);
+        let short_geometry = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 15,
+            },
+        );
+        let short_area = short_geometry.pane_layout.panes[&application.workspace.focused];
+        let short_maximum = crate::editor::EditorView::maximum_viewport_line(
+            application.documents.get(document_id),
+            usize::from(short_area.height.saturating_sub(2)),
+        );
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("expected editor pane");
+        };
+        view.viewport_line = short_maximum;
+
+        application.resize_terminals(100, 30).unwrap();
+
+        let tall_geometry = render::geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        );
+        let tall_area = tall_geometry.pane_layout.panes[&application.workspace.focused];
+        let tall_maximum = crate::editor::EditorView::maximum_viewport_line(
+            application.documents.get(document_id),
+            usize::from(tall_area.height.saturating_sub(2)),
+        );
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert!(tall_maximum < short_maximum);
+        assert_eq!(view.viewport_line, tall_maximum);
+    }
+
+    #[test]
+    fn saving_a_modified_untitled_document_completes_pending_close() {
+        let mut application = Application::new_for_test();
+        application
+            .apply(Command::Insert("saved".to_owned()))
+            .unwrap();
+        let document_id = application.focused_document_id().unwrap();
+        let path = application.explorer.root.join("saved.txt");
+        application.request_close().unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let Some(Overlay::FileDialog { input, .. }) = application.overlay.as_mut() else {
+            panic!("expected Save As dialog");
+        };
+        *input = path.display().to_string();
+        application.submit_file_dialog().unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "saved");
+        assert!(
+            application
+                .documents
+                .iter()
+                .all(|(id, _)| id != document_id)
+        );
+        assert!(matches!(application.workspace.focused_pane(), Pane::Empty));
+    }
+
+    #[test]
+    fn save_as_existing_file_waits_for_overwrite_and_escape_preserves_both() {
+        let mut application = Application::new_for_test();
+        application
+            .apply(Command::Insert("replacement".to_owned()))
+            .unwrap();
+        let document_id = application.focused_document_id().unwrap();
+        let path = application.explorer.root.join("existing.txt");
+        fs::write(&path, "existing").unwrap();
+
+        application.apply(Command::SaveAs(path.clone())).unwrap();
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmSaveAsOverwrite { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing");
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "existing");
+        assert!(application.documents.get(document_id).is_modified());
+        assert!(application.documents.get(document_id).path.is_none());
+    }
+
+    #[test]
+    fn confirmed_save_as_overwrite_completes_pending_document_close() {
+        let mut application = Application::new_for_test();
+        application
+            .apply(Command::Insert("replacement".to_owned()))
+            .unwrap();
+        let document_id = application.focused_document_id().unwrap();
+        let path = application.explorer.root.join("existing.txt");
+        fs::write(&path, "existing").unwrap();
+        application.request_close().unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let Some(Overlay::FileDialog { input, .. }) = application.overlay.as_mut() else {
+            panic!("expected Save As dialog");
+        };
+        *input = path.display().to_string();
+        application.submit_file_dialog().unwrap();
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmSaveAsOverwrite { .. })
+        ));
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "replacement");
+        assert!(
+            application
+                .documents
+                .iter()
+                .all(|(id, _)| id != document_id)
+        );
+        assert!(matches!(application.workspace.focused_pane(), Pane::Empty));
     }
 
     #[test]
@@ -2132,6 +2727,22 @@ mod tests {
             .unwrap();
         assert!(!application.explorer.visible);
         assert_eq!(application.focus_owner, FocusOwner::Workspace);
+    }
+
+    #[test]
+    fn title_control_actions_route_to_existing_semantic_commands() {
+        assert_eq!(
+            title_control_command(render::TitleControlAction::ToggleLeftPanel),
+            Command::ToggleExplorer
+        );
+        assert_eq!(
+            title_control_command(render::TitleControlAction::ToggleBottomPanel),
+            Command::ToggleBottomTerminal
+        );
+        assert_eq!(
+            title_control_command(render::TitleControlAction::OpenSettings),
+            Command::OpenSettings
+        );
     }
 
     #[test]
@@ -2295,7 +2906,10 @@ mod tests {
             .apply(Command::Insert("saved".to_owned()))
             .unwrap();
         let document_id = application.focused_document_id().unwrap();
-        application.documents.save_as(document_id, &path).unwrap();
+        application
+            .documents
+            .save_as(document_id, &path, false)
+            .unwrap();
 
         application
             .handle_event(Event::Key(crossterm::event::KeyEvent::new(
@@ -2307,5 +2921,142 @@ mod tests {
         assert!(matches!(application.workspace.focused_pane(), Pane::Empty));
         assert!(application.open_document_ids().is_empty());
         assert_eq!(application.documents.iter().count(), 0);
+    }
+
+    #[test]
+    fn theme_setting_opens_picker_and_applies_the_selected_theme() {
+        let mut application = Application::new_for_test();
+        fs::create_dir_all(application.theme_registry.directory()).unwrap();
+        fs::write(
+            application.theme_registry.directory().join("ocean.toml"),
+            "[meta]\nname = \"Ocean\"\n[colors]\naccent = \"#123456\"\n",
+        )
+        .unwrap();
+        application.overlay = Some(Overlay::Settings {
+            query: String::new(),
+            scope: ConfigScope::User,
+            selected: 0,
+        });
+        application.focus_owner = FocusOwner::Overlay;
+        for character in "theme.active".chars() {
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+        }
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let ocean_index = application
+            .theme_registry
+            .entries()
+            .position(|(id, _)| id == "ocean")
+            .unwrap();
+        let Some(Overlay::ThemePicker { selected, .. }) = application.overlay.as_mut() else {
+            panic!("expected theme picker");
+        };
+        *selected = ocean_index;
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert_eq!(application.theme.id, "ocean");
+        assert_eq!(
+            application.theme.colors.accent,
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
+        );
+        assert!(
+            fs::read_to_string(&application.config.user_path)
+                .unwrap()
+                .contains("active = \"ocean\"")
+        );
+    }
+
+    #[test]
+    fn cancelling_the_theme_picker_does_not_change_the_active_theme() {
+        let mut application = Application::new_for_test();
+        application.overlay = Some(Overlay::ThemePicker {
+            scope: ConfigScope::User,
+            selected: 0,
+        });
+        application.focus_owner = FocusOwner::Overlay;
+
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert_eq!(application.theme.id, "default");
+        assert!(application.overlay.is_none());
+        assert!(!application.config.user_path.exists());
+    }
+
+    #[test]
+    fn invalid_live_theme_reload_retains_the_previous_valid_theme() {
+        let mut application = Application::new_for_test();
+        fs::create_dir_all(application.theme_registry.directory()).unwrap();
+        let path = application.theme_registry.directory().join("ocean.toml");
+        fs::write(
+            &path,
+            "[meta]\nname = \"Ocean\"\n[colors]\naccent = \"#123456\"\n",
+        )
+        .unwrap();
+        application.rescan_themes(false).unwrap();
+        application
+            .select_theme(ConfigScope::User, "ocean")
+            .unwrap();
+        fs::write(path, "[meta").unwrap();
+
+        application.rescan_themes(true).unwrap();
+
+        assert_eq!(application.theme.id, "ocean");
+        assert!(
+            application
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("previous valid version"))
+        );
+    }
+
+    #[test]
+    fn saving_a_user_theme_in_the_editor_reloads_it_immediately() {
+        let mut application = Application::new_for_test();
+        fs::create_dir_all(application.theme_registry.directory()).unwrap();
+        let path = application.theme_registry.directory().join("ocean.toml");
+        fs::write(
+            &path,
+            "[meta]\nname = \"Ocean\"\n[colors]\naccent = \"#123456\"\n",
+        )
+        .unwrap();
+        application.rescan_themes(false).unwrap();
+        application
+            .select_theme(ConfigScope::User, "ocean")
+            .unwrap();
+        application.open_path(&path, None).unwrap();
+        let document_id = application.focused_document_id().unwrap();
+        let document = application.documents.get_mut(document_id);
+        document.replace(
+            0,
+            document.len_chars(),
+            "[meta]\nname = \"Ocean\"\n[colors]\naccent = \"#654321\"\n",
+        );
+        application.documents.save(document_id, false).unwrap();
+
+        application.finish_successful_save(document_id).unwrap();
+
+        assert_eq!(
+            application.theme.colors.accent,
+            ratatui::style::Color::Rgb(0x65, 0x43, 0x21)
+        );
     }
 }

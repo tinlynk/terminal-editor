@@ -29,6 +29,12 @@ pub enum SaveOutcome {
     ExternalChange,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum SaveAsOutcome {
+    Saved,
+    ExistingTarget,
+}
+
 #[derive(Debug)]
 pub struct DocumentRegistry {
     documents: BTreeMap<DocumentId, Document>,
@@ -120,6 +126,14 @@ impl DocumentRegistry {
         self.documents.iter().map(|(id, document)| (*id, document))
     }
 
+    pub fn apply_editor_defaults(&mut self, default_line_ending: LineEnding, history_limit: usize) {
+        self.default_line_ending = default_line_ending;
+        self.history_limit = history_limit;
+        for document in self.documents.values_mut() {
+            document.set_history_limit(history_limit);
+        }
+    }
+
     pub fn remove(&mut self, id: DocumentId) -> Option<Document> {
         let document = self.documents.remove(&id)?;
         if let Some(path) = &document.path {
@@ -147,7 +161,12 @@ impl DocumentRegistry {
         Ok(SaveOutcome::Saved)
     }
 
-    pub fn save_as(&mut self, id: DocumentId, path: &Path) -> Result<()> {
+    pub fn save_as(
+        &mut self,
+        id: DocumentId,
+        path: &Path,
+        overwrite_existing: bool,
+    ) -> Result<SaveAsOutcome> {
         let absolute = absolute_path(path)?;
         let existing_canonical = fs::canonicalize(&absolute).ok();
         if let Some(owner) = existing_canonical
@@ -161,6 +180,12 @@ impl DocumentRegistry {
             )));
         }
         let previous = self.documents[&id].path.clone();
+        let targets_current_document = existing_canonical
+            .as_ref()
+            .is_some_and(|canonical| previous.as_ref() == Some(canonical));
+        if existing_canonical.is_some() && !targets_current_document && !overwrite_existing {
+            return Ok(SaveAsOutcome::ExistingTarget);
+        }
         let text = self.documents[&id].text();
         atomic_write(&absolute, text.as_bytes())?;
         let canonical = fs::canonicalize(&absolute).map_err(|error| {
@@ -174,7 +199,7 @@ impl DocumentRegistry {
         let document = self.documents.get_mut(&id).expect("document must exist");
         document.path = Some(canonical);
         document.mark_saved();
-        Ok(())
+        Ok(SaveAsOutcome::Saved)
     }
 
     pub fn reload(&mut self, id: DocumentId, discard_changes: bool) -> Result<()> {
@@ -323,6 +348,19 @@ mod tests {
     }
 
     #[test]
+    fn opening_invalid_utf8_returns_an_error_without_registering_a_document() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("binary.dat");
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+
+        let error = registry.open(&path).unwrap_err();
+
+        assert!(error.to_string().contains("not valid UTF-8"));
+        assert_eq!(registry.iter().count(), 0);
+    }
+
+    #[test]
     fn external_change_requires_explicit_overwrite() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("file.txt");
@@ -372,9 +410,32 @@ mod tests {
         let (first, _) = registry.open(&first_path).unwrap();
         registry.open(&second_path).unwrap();
         registry.get_mut(first).insert(5, " edit");
-        let error = registry.save_as(first, &second_path).unwrap_err();
+        let error = registry.save_as(first, &second_path, false).unwrap_err();
         assert!(error.to_string().contains("already open"));
         assert_eq!(fs::read_to_string(second_path).unwrap(), "second");
+    }
+
+    #[test]
+    fn save_as_requires_confirmation_before_overwriting_an_unopened_file() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("existing.txt");
+        fs::write(&target, "existing").unwrap();
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        let document = registry.new_untitled();
+        registry.get_mut(document).insert(0, "replacement");
+
+        assert_eq!(
+            registry.save_as(document, &target, false).unwrap(),
+            SaveAsOutcome::ExistingTarget
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
+        assert!(registry.get(document).path.is_none());
+
+        assert_eq!(
+            registry.save_as(document, &target, true).unwrap(),
+            SaveAsOutcome::Saved
+        );
+        assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
     }
 
     #[cfg(unix)]

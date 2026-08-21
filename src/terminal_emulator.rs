@@ -170,6 +170,14 @@ impl TerminalEmulator {
     pub fn scrollback_len(&self) -> usize {
         self.screen.scrollback.len()
     }
+
+    pub fn apply_runtime_config(&mut self, scrollback_limit: usize, allow_child_osc52: bool) {
+        self.screen.scrollback_limit = scrollback_limit;
+        while self.screen.scrollback.len() > scrollback_limit {
+            self.screen.scrollback.pop_front();
+        }
+        self.screen.allow_child_osc52 = allow_child_osc52;
+    }
 }
 
 #[derive(Debug)]

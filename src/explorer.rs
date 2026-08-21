@@ -23,6 +23,7 @@ pub struct Explorer {
     pub visible: bool,
     pub selected: usize,
     pub open_editors_expanded: bool,
+    pub open_editors_header_selected: bool,
     expanded: BTreeSet<PathBuf>,
     exclusions: GlobSet,
     entries: Vec<ExplorerEntry>,
@@ -36,6 +37,7 @@ impl Explorer {
             visible,
             selected: 0,
             open_editors_expanded: true,
+            open_editors_header_selected: false,
             expanded: BTreeSet::new(),
             exclusions,
             entries: Vec::new(),
@@ -53,6 +55,17 @@ impl Explorer {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        if self.open_editors_header_selected {
+            if delta > 0 {
+                self.open_editors_header_selected = false;
+                self.selected = 0;
+            }
+            return;
+        }
+        if delta < 0 && self.selected == 0 {
+            self.open_editors_header_selected = true;
+            return;
+        }
         self.selected = self
             .selected
             .saturating_add_signed(delta)
@@ -60,6 +73,10 @@ impl Explorer {
     }
 
     pub fn toggle_selected(&mut self) -> Result<Option<PathBuf>> {
+        if self.open_editors_header_selected {
+            self.open_editors_expanded = !self.open_editors_expanded;
+            return Ok(None);
+        }
         let Some(entry) = self.selected_entry().cloned() else {
             return Ok(None);
         };
@@ -74,11 +91,20 @@ impl Explorer {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        let previous_index = self.selected;
         let mut entries = Vec::new();
         self.walk(&self.root, 0, &mut entries)?;
         self.entries = entries;
-        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        self.selected = selected_path
+            .and_then(|path| self.entries.iter().position(|entry| entry.path == path))
+            .unwrap_or_else(|| previous_index.min(self.entries.len().saturating_sub(1)));
         Ok(())
+    }
+
+    pub fn set_exclusions(&mut self, exclusions: &[String]) -> Result<()> {
+        self.exclusions = compile_exclusions(exclusions)?;
+        self.refresh()
     }
 
     fn walk(&self, directory: &Path, depth: usize, output: &mut Vec<ExplorerEntry>) -> Result<()> {
@@ -189,6 +215,38 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path.ends_with(".git"))
         );
+    }
+
+    #[test]
+    fn refresh_preserves_selection_by_path_when_an_earlier_entry_is_added() {
+        let directory = tempdir().unwrap();
+        let selected_path = directory.path().join("middle.txt");
+        fs::write(&selected_path, "middle").unwrap();
+        fs::write(directory.path().join("z-last.txt"), "last").unwrap();
+        let mut explorer = Explorer::new(directory.path().to_owned(), true, &[]).unwrap();
+        explorer.selected = explorer
+            .entries()
+            .iter()
+            .position(|entry| entry.path == selected_path)
+            .unwrap();
+
+        fs::write(directory.path().join("a-first.txt"), "first").unwrap();
+        explorer.refresh().unwrap();
+
+        assert_eq!(explorer.selected_entry().unwrap().path, selected_path);
+    }
+
+    #[test]
+    fn keyboard_navigation_reaches_and_toggles_open_editors_header() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("file.txt"), "text").unwrap();
+        let mut explorer = Explorer::new(directory.path().to_owned(), true, &[]).unwrap();
+        explorer.move_selection(-1);
+        assert!(explorer.open_editors_header_selected);
+        explorer.toggle_selected().unwrap();
+        assert!(!explorer.open_editors_expanded);
+        explorer.move_selection(1);
+        assert!(!explorer.open_editors_header_selected);
     }
 
     #[cfg(unix)]

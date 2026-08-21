@@ -13,6 +13,7 @@ pub mod render;
 pub mod terminal;
 pub mod terminal_emulator;
 pub mod terminal_session;
+pub mod theme;
 pub mod workspace;
 
 pub use app::Application;

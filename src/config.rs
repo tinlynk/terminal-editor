@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use toml_edit::DocumentMut;
+use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::{AppError, Result};
 
@@ -30,6 +30,7 @@ pub struct EditorConfig {
     pub undo_limit_mib: usize,
     pub line_numbers: bool,
     pub scrollbar: bool,
+    pub soft_wrap: bool,
 }
 
 impl Default for EditorConfig {
@@ -41,6 +42,7 @@ impl Default for EditorConfig {
             undo_limit_mib: DEFAULT_UNDO_LIMIT_MIB,
             line_numbers: true,
             scrollbar: true,
+            soft_wrap: false,
         }
     }
 }
@@ -136,11 +138,25 @@ pub struct UiConfig {
     pub bottom_terminal_height: u16,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub active: String,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            active: "default".to_owned(),
+        }
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             bottom_terminal_visible: false,
-            bottom_terminal_height: 8,
+            bottom_terminal_height: 6,
         }
     }
 }
@@ -155,6 +171,7 @@ pub struct Config {
     pub clipboard: ClipboardConfig,
     pub terminal: TerminalConfig,
     pub ui: UiConfig,
+    pub theme: ThemeConfig,
     pub keybindings: BTreeMap<String, String>,
 }
 
@@ -168,6 +185,7 @@ impl Default for Config {
             clipboard: ClipboardConfig::default(),
             terminal: TerminalConfig::default(),
             ui: UiConfig::default(),
+            theme: ThemeConfig::default(),
             keybindings: default_keybindings(),
         }
     }
@@ -221,6 +239,7 @@ struct PartialConfig {
     clipboard: Option<PartialClipboardConfig>,
     terminal: Option<PartialTerminalConfig>,
     ui: Option<PartialUiConfig>,
+    theme: Option<PartialThemeConfig>,
     keybindings: Option<BTreeMap<String, String>>,
 }
 
@@ -233,6 +252,7 @@ struct PartialEditorConfig {
     undo_limit_mib: Option<usize>,
     line_numbers: Option<bool>,
     scrollbar: Option<bool>,
+    soft_wrap: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -279,6 +299,12 @@ struct PartialTerminalConfig {
 struct PartialUiConfig {
     bottom_terminal_visible: Option<bool>,
     bottom_terminal_height: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialThemeConfig {
+    active: Option<String>,
 }
 
 impl LoadedConfig {
@@ -347,6 +373,11 @@ impl LoadedConfig {
         Ok(path.clone())
     }
 
+    pub fn reload(&mut self) -> Result<()> {
+        *self = Self::load_paths(self.user_path.clone(), self.workspace_path.clone())?;
+        Ok(())
+    }
+
     pub fn reset_setting(&mut self, scope: ConfigScope, dotted_key: &str) -> Result<()> {
         let path = match scope {
             ConfigScope::User => self.user_path.clone(),
@@ -379,6 +410,55 @@ impl LoadedConfig {
                 message: error.to_string(),
             })?;
         remove_dotted_key(&mut document, dotted_key)?;
+        atomic_config_write(&path, document.to_string().as_bytes())?;
+        *self = Self::load_paths(self.user_path.clone(), self.workspace_path.clone())?;
+        Ok(())
+    }
+
+    pub fn set_theme_active(&mut self, scope: ConfigScope, theme_id: &str) -> Result<()> {
+        if scope == ConfigScope::Default {
+            return Err(AppError::Arguments(
+                "the default theme selection is not writable".to_owned(),
+            ));
+        }
+        if theme_id.trim().is_empty() {
+            return Err(AppError::Arguments(
+                "theme identifier must not be empty".to_owned(),
+            ));
+        }
+        let path = match scope {
+            ConfigScope::User => self.user_path.clone(),
+            ConfigScope::Workspace => self.workspace_path.clone(),
+            ConfigScope::Default => unreachable!("default scope returned above"),
+        };
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(AppError::io(
+                    format!("could not read {}", path.display()),
+                    error,
+                ));
+            }
+        };
+        let mut document = if text.is_empty() {
+            DocumentMut::new()
+        } else {
+            text.parse::<DocumentMut>()
+                .map_err(|error| AppError::Config {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?
+        };
+        let theme = document
+            .as_table_mut()
+            .entry("theme")
+            .or_insert_with(|| Item::Table(Table::new()));
+        let table = theme.as_table_mut().ok_or_else(|| AppError::Config {
+            path: path.clone(),
+            message: "theme must be a table".to_owned(),
+        })?;
+        table["active"] = value(theme_id);
         atomic_config_write(&path, document.to_string().as_bytes())?;
         *self = Self::load_paths(self.user_path.clone(), self.workspace_path.clone())?;
         Ok(())
@@ -517,6 +597,7 @@ fn parse_partial_config(
                     diagnostics,
                 ),
                 scrollbar: config_value(table, "scrollbar", "editor", path, scope, diagnostics),
+                soft_wrap: config_value(table, "soft_wrap", "editor", path, scope, diagnostics),
             }
         }),
         workspace: config_table(root, "workspace", path, scope, diagnostics).map(|table| {
@@ -612,6 +693,11 @@ fn parse_partial_config(
                 scope,
                 diagnostics,
             ),
+        }),
+        theme: config_table(root, "theme", path, scope, diagnostics).map(|table| {
+            PartialThemeConfig {
+                active: config_value(table, "active", "theme", path, scope, diagnostics),
+            }
         }),
         keybindings: config_table(root, "keybindings", path, scope, diagnostics).map(|table| {
             table
@@ -720,6 +806,7 @@ fn warn_unknown_keys(
         "clipboard",
         "terminal",
         "ui",
+        "theme",
         "keybindings",
     ];
     let Some(table) = value.as_table() else {
@@ -750,6 +837,7 @@ fn apply_scope(
         assign(&mut config.editor.undo_limit_mib, editor.undo_limit_mib);
         assign(&mut config.editor.line_numbers, editor.line_numbers);
         assign(&mut config.editor.scrollbar, editor.scrollbar);
+        assign(&mut config.editor.soft_wrap, editor.soft_wrap);
         provenance.insert("editor".to_owned(), scope);
     }
     if let Some(workspace) = partial.workspace {
@@ -795,6 +883,12 @@ fn apply_scope(
             ui.bottom_terminal_height,
         );
         provenance.insert("ui".to_owned(), scope);
+    }
+    if let Some(theme) = partial.theme
+        && let Some(active) = theme.active
+    {
+        config.theme.active = active;
+        provenance.insert("theme".to_owned(), scope);
     }
     if let Some(bindings) = partial.keybindings {
         config.keybindings.extend(bindings);
@@ -859,10 +953,41 @@ fn validate(config: &mut Config, diagnostics: &mut Vec<ConfigDiagnostic>) {
         config.workspace.initial_split_ratio = defaults.workspace.initial_split_ratio;
     }
     if fallback(
+        config
+            .explorer
+            .exclusions
+            .iter()
+            .any(|pattern| globset::Glob::new(pattern).is_err()),
+        "explorer.exclusions contains an invalid glob; the defaults were used",
+    ) {
+        config.explorer.exclusions = defaults.explorer.exclusions;
+    }
+    if fallback(
         config.terminal.scrollback_lines == 0,
         "terminal.scrollback_lines must be greater than zero; the default was used",
     ) {
         config.terminal.scrollback_lines = defaults.terminal.scrollback_lines;
+    }
+    if fallback(
+        config.theme.active.trim().is_empty(),
+        "theme.active must not be empty; the default was used",
+    ) {
+        config.theme.active = defaults.theme.active;
+    }
+    let normalized_leader = crate::input::normalize_key_sequence(&config.terminal.leader);
+    if fallback(
+        normalized_leader.as_deref().is_none_or(|leader| {
+            !leader
+                .strip_prefix("ctrl+")
+                .is_some_and(|key| key.len() == 1 && key.as_bytes()[0].is_ascii_lowercase())
+                || matches!(leader, "ctrl+t" | "ctrl+g")
+                || config.keybindings.contains_key(leader)
+        }),
+        "terminal.leader must be a non-conflicting Ctrl plus letter sequence; the default was used",
+    ) {
+        config.terminal.leader = defaults.terminal.leader;
+    } else if let Some(normalized_leader) = normalized_leader {
+        config.terminal.leader = normalized_leader;
     }
 }
 
@@ -892,6 +1017,7 @@ fn default_provenance() -> BTreeMap<String, ConfigScope> {
         "clipboard",
         "terminal",
         "ui",
+        "theme",
         "keybindings",
     ]
     .into_iter()
@@ -911,9 +1037,23 @@ mod tests {
     fn defaults_are_safe() {
         let config = Config::default();
         assert_eq!(config.editor.undo_limit_mib, 32);
+        assert!(!config.editor.soft_wrap);
         assert_eq!(config.explorer.refresh_interval_seconds, 5);
         assert_eq!(config.terminal.scrollback_lines, 10_000);
         assert!(!config.terminal.allow_child_osc52_write);
+    }
+
+    #[test]
+    fn soft_wrap_can_be_enabled_in_editor_configuration() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(&user_path, "[editor]\nsoft_wrap = true\n").unwrap();
+
+        let loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+
+        assert!(loaded.effective.editor.soft_wrap);
+        assert_eq!(loaded.provenance["editor"], ConfigScope::User);
     }
 
     #[test]
@@ -1021,6 +1161,25 @@ mod tests {
     }
 
     #[test]
+    fn terminal_leader_is_normalized_and_conflicts_fall_back_to_default() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(&user_path, "[terminal]\nleader = \"CTRL+A\"\n").unwrap();
+        let loaded = LoadedConfig::load_paths(user_path.clone(), workspace_path.clone()).unwrap();
+        assert_eq!(loaded.effective.terminal.leader, "ctrl+a");
+
+        fs::write(&user_path, "[terminal]\nleader = \"ctrl+t\"\n").unwrap();
+        let loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+        assert_eq!(loaded.effective.terminal.leader, "ctrl+b");
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("terminal.leader must be a non-conflicting Ctrl plus letter sequence")
+        }));
+    }
+
+    #[test]
     fn reset_preserves_comments_and_unrelated_values() {
         let directory = tempdir().unwrap();
         let user_path = directory.path().join("user.toml");
@@ -1039,5 +1198,60 @@ mod tests {
         assert!(text.contains("line_numbers = false"));
         assert!(!text.contains("indent_width"));
         assert_eq!(loaded.effective.editor.indent_width, 4);
+    }
+
+    #[test]
+    fn workspace_theme_selection_overrides_user_and_preserves_comments_when_changed() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(
+            &user_path,
+            "# retained comment\n[theme]\nactive = \"ocean\"\n",
+        )
+        .unwrap();
+        fs::write(&workspace_path, "[theme]\nactive = \"forest\"\n").unwrap();
+        let mut loaded =
+            LoadedConfig::load_paths(user_path.clone(), workspace_path.clone()).unwrap();
+        assert_eq!(loaded.effective.theme.active, "forest");
+        assert_eq!(loaded.provenance["theme"], ConfigScope::Workspace);
+
+        loaded
+            .set_theme_active(ConfigScope::User, "midnight")
+            .unwrap();
+        let text = fs::read_to_string(user_path).unwrap();
+        assert!(text.contains("# retained comment"));
+        assert!(text.contains("active = \"midnight\""));
+        assert_eq!(loaded.effective.theme.active, "forest");
+    }
+
+    #[test]
+    fn empty_theme_selection_falls_back_to_default() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(&user_path, "[theme]\nactive = \"   \"\n").unwrap();
+        let loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+        assert_eq!(loaded.effective.theme.active, "default");
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("theme.active"))
+        );
+    }
+
+    #[test]
+    fn resetting_theme_selection_restores_default() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(&user_path, "[theme]\nactive = \"ocean\"\n").unwrap();
+        let mut loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+        loaded
+            .reset_setting(ConfigScope::User, "theme.active")
+            .unwrap();
+        assert_eq!(loaded.effective.theme.active, "default");
+        assert_eq!(loaded.provenance["theme"], ConfigScope::Default);
     }
 }

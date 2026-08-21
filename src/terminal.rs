@@ -31,12 +31,20 @@ impl TerminalGuard {
             execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
         };
         if let Err(error) = setup {
-            let _ = disable_raw_mode();
+            restore_terminal_state();
             return Err(AppError::io("could not enter the alternate screen", error));
         }
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)
-            .map_err(|error| AppError::io("could not initialize terminal rendering", error))?;
+        let terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                restore_terminal_state();
+                return Err(AppError::io(
+                    "could not initialize terminal rendering",
+                    error,
+                ));
+            }
+        };
         Ok(Self { terminal })
     }
 
@@ -51,11 +59,19 @@ impl TerminalGuard {
             .and_then(|()| self.terminal.backend_mut().flush())
             .map_err(|error| AppError::io("could not write terminal control sequence", error))
     }
+
+    pub fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+        let result = if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)
+        };
+        result.map_err(|error| AppError::io("could not update terminal mouse capture", error))
+    }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
@@ -63,19 +79,44 @@ impl Drop for TerminalGuard {
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
+        let _ = disable_raw_mode();
     }
+}
+
+fn restore_terminal_state() {
+    let mut stdout = io::stdout();
+    restore_terminal_modes(&mut stdout);
+    let _ = disable_raw_mode();
+}
+
+fn restore_terminal_modes(writer: &mut impl Write) {
+    let _ = execute!(
+        writer,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
 }
 
 pub fn install_panic_restoration_hook() {
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |information| {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        restore_terminal_state();
         previous(information);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restoration_disables_every_mode_enabled_during_setup() {
+        let mut output = Vec::new();
+        restore_terminal_modes(&mut output);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[?2004l"));
+        assert!(output.contains("\x1b[?1000l"));
+        assert!(output.contains("\x1b[?1049l"));
+    }
 }

@@ -3,7 +3,7 @@ name = "tinlynk-terminal-editor"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A lightweight terminal-native editor and multiplexer."
+description = "A lightweight terminal-native editor with one integrated terminal."
 license = "MIT"
 
 [[bin]]

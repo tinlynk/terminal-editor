@@ -1,6 +1,11 @@
-use std::{collections::VecDeque, path::PathBuf};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+};
 
 use ropey::Rope;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::LineEnding;
 
@@ -41,6 +46,7 @@ impl Edit {
 #[derive(Clone, Debug)]
 pub struct Document {
     text: Rope,
+    line_width_frequencies: BTreeMap<usize, usize>,
     pub path: Option<PathBuf>,
     pub line_ending: LineEnding,
     revision: u64,
@@ -63,6 +69,7 @@ impl Document {
         let line_ending = detect_line_ending(text).unwrap_or(default_line_ending);
         Self {
             text: Rope::from_str(text),
+            line_width_frequencies: initial_line_width_frequencies(text),
             path,
             line_ending,
             revision: 0,
@@ -88,8 +95,17 @@ impl Document {
         self.text.len_chars() == 0
     }
 
+    pub fn set_history_limit(&mut self, history_limit: usize) {
+        self.history_limit = history_limit;
+        self.enforce_history_limit();
+    }
+
     pub fn is_modified(&self) -> bool {
         self.revision != self.saved_revision
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn mark_saved(&mut self) {
@@ -131,6 +147,16 @@ impl Document {
             }
         }
         end
+    }
+
+    pub fn line_display_width(&self, line: usize) -> usize {
+        display_width(&self.slice(self.line_to_char(line), self.line_content_end(line)))
+    }
+
+    pub fn maximum_line_display_width(&self) -> usize {
+        self.line_width_frequencies
+            .last_key_value()
+            .map_or(0, |(width, _)| *width)
     }
 
     pub fn char_to_line(&self, char_index: usize) -> usize {
@@ -175,8 +201,7 @@ impl Document {
             self.last_change = None;
             return start + inserted.chars().count();
         }
-        self.text.remove(start..end);
-        self.text.insert(start, inserted);
+        self.replace_text(start, end, inserted);
         let after_revision = self.next_revision;
         self.next_revision = self.next_revision.saturating_add(1);
         let removed_chars = removed.chars().count();
@@ -205,8 +230,7 @@ impl Document {
         let edit = self.undo.pop_back()?;
         self.history_bytes = self.history_bytes.saturating_sub(edit.bytes());
         let inserted_end = edit.start + edit.inserted.chars().count();
-        self.text.remove(edit.start..inserted_end);
-        self.text.insert(edit.start, &edit.removed);
+        self.replace_text(edit.start, inserted_end, &edit.removed);
         self.revision = edit.before_revision;
         self.last_change = Some(TextChange {
             start: edit.start,
@@ -222,8 +246,7 @@ impl Document {
     pub fn redo(&mut self) -> Option<usize> {
         let edit = self.redo.pop()?;
         let removed_end = edit.start + edit.removed.chars().count();
-        self.text.remove(edit.start..removed_end);
-        self.text.insert(edit.start, &edit.inserted);
+        self.replace_text(edit.start, removed_end, &edit.inserted);
         self.revision = edit.after_revision;
         self.last_change = Some(TextChange {
             start: edit.start,
@@ -299,6 +322,59 @@ impl Document {
             }
         }
     }
+
+    fn replace_text(&mut self, start: usize, end: usize, inserted: &str) {
+        let first_line = self.char_to_line(start);
+        let old_last_line = self.char_to_line(end);
+        let old_widths = (first_line..=old_last_line)
+            .map(|line| self.line_display_width(line))
+            .collect::<Vec<_>>();
+        for width in old_widths {
+            self.remove_line_width(width);
+        }
+
+        self.text.remove(start..end);
+        self.text.insert(start, inserted);
+
+        let inserted_end = start.saturating_add(inserted.chars().count());
+        let new_last_line = self.char_to_line(inserted_end);
+        let new_widths = (first_line..=new_last_line)
+            .map(|line| self.line_display_width(line))
+            .collect::<Vec<_>>();
+        for width in new_widths {
+            *self.line_width_frequencies.entry(width).or_default() += 1;
+        }
+    }
+
+    fn remove_line_width(&mut self, width: usize) {
+        let remove = {
+            let count = self
+                .line_width_frequencies
+                .get_mut(&width)
+                .expect("line width index must contain every document line");
+            *count -= 1;
+            *count == 0
+        };
+        if remove {
+            self.line_width_frequencies.remove(&width);
+        }
+    }
+}
+
+fn initial_line_width_frequencies(text: &str) -> BTreeMap<usize, usize> {
+    let mut frequencies = BTreeMap::new();
+    for line in text.split('\n') {
+        let width = display_width(line.strip_suffix('\r').unwrap_or(line));
+        *frequencies.entry(width).or_default() += 1;
+    }
+    frequencies
+}
+
+fn display_width(text: &str) -> usize {
+    if text.is_ascii() {
+        return text.bytes().filter(|byte| !byte.is_ascii_control()).count();
+    }
+    text.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
 
 fn detect_line_ending(text: &str) -> Option<LineEnding> {
@@ -324,6 +400,45 @@ mod tests {
         document.replace(1, 3, "e\u{301}");
         assert_eq!(document.text(), "ae\u{301}z");
         assert!(document.is_modified());
+    }
+
+    #[test]
+    fn maximum_line_width_is_indexed_across_the_complete_document() {
+        let document = document("short\n界界界\ne\u{301}\noffscreen-longest");
+
+        assert_eq!(document.line_display_width(1), 6);
+        assert_eq!(document.line_display_width(2), 1);
+        assert_eq!(document.maximum_line_display_width(), 17);
+    }
+
+    #[test]
+    fn line_width_index_tracks_multiline_edits_and_maximum_shrinkage() {
+        let mut document = document("short\nabcdefghij\nmedium");
+        assert_eq!(document.maximum_line_display_width(), 10);
+
+        document.insert(5, "-now-longest");
+        assert_eq!(document.maximum_line_display_width(), 17);
+
+        document.replace(0, document.line_to_char(1), "x\nyy\n");
+        assert_eq!(document.maximum_line_display_width(), 10);
+
+        let longest_start = document.line_to_char(2);
+        document.delete(longest_start, document.line_to_char(3));
+        assert_eq!(document.maximum_line_display_width(), 6);
+    }
+
+    #[test]
+    fn undo_and_redo_update_the_index_after_coalesced_typing() {
+        let mut document = document("base\nother");
+        for character in "-extended".chars() {
+            document.insert_typed(document.line_content_end(0), &character.to_string());
+        }
+        assert_eq!(document.maximum_line_display_width(), 13);
+
+        document.undo();
+        assert_eq!(document.maximum_line_display_width(), 5);
+        document.redo();
+        assert_eq!(document.maximum_line_display_width(), 13);
     }
 
     #[test]
