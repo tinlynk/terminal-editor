@@ -50,10 +50,11 @@ impl Application {
                 }
             }
             KeyCode::Left => {
-                if self
-                    .explorer
-                    .selected_entry()
-                    .is_some_and(|entry| entry.is_directory && entry.expanded)
+                if (self.explorer.root_header_selected && self.explorer.root_expanded)
+                    || self
+                        .explorer
+                        .selected_entry()
+                        .is_some_and(|entry| entry.is_directory && entry.expanded)
                 {
                     self.explorer.toggle_selected()?;
                 }

@@ -1,0 +1,21 @@
+[meta]
+name = "TinLynk Terminal Editor - Nerd Font"
+schema_version = 1
+
+[icons]
+left_panel_visible = "\uebf3"
+left_panel_hidden = "\uec02"
+bottom_panel_visible = "\uebf2"
+bottom_panel_hidden = "\uec01"
+right_panel_visible = "\uebf4"
+right_panel_hidden = "\uec00"
+settings = "\uf013"
+folder_closed = "\uf07b"
+folder_open = "\uf07c"
+file_default = "\uf016"
+search = "\uf002"
+git_branch = "\ue0a0"
+modified = "\uf111"
+explorer_new_file = "\uea7f"
+explorer_new_folder = "\uea80"
+explorer_refresh = "\uf021"

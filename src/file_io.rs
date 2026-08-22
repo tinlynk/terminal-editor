@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
@@ -15,6 +15,52 @@ use crate::{
 };
 
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
+const OPEN_WARNING_PROBE_BYTES: usize = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenFileWarning {
+    Archive(&'static str),
+    Binary,
+}
+
+impl OpenFileWarning {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Archive(format) => format,
+            Self::Binary => "binary data",
+        }
+    }
+}
+
+pub fn open_file_warning(path: &Path) -> Result<Option<OpenFileWarning>> {
+    let mut file = File::open(path)
+        .map_err(|error| AppError::io(format!("could not inspect {}", path.display()), error))?;
+    let mut bytes = vec![0; OPEN_WARNING_PROBE_BYTES];
+    let length = file
+        .read(&mut bytes)
+        .map_err(|error| AppError::io(format!("could not inspect {}", path.display()), error))?;
+    bytes.truncate(length);
+
+    let warning = if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+    {
+        Some(OpenFileWarning::Archive("a ZIP archive"))
+    } else if bytes.starts_with(b"\x1f\x8b") {
+        Some(OpenFileWarning::Archive("a gzip archive"))
+    } else if bytes.starts_with(b"Rar!\x1a\x07") {
+        Some(OpenFileWarning::Archive("a RAR archive"))
+    } else if bytes.starts_with(b"7z\xbc\xaf\x27\x1c") {
+        Some(OpenFileWarning::Archive("a 7z archive"))
+    } else if bytes.get(257..262) == Some(b"ustar") {
+        Some(OpenFileWarning::Archive("a tar archive"))
+    } else if bytes.contains(&0) {
+        Some(OpenFileWarning::Binary)
+    } else {
+        None
+    };
+    Ok(warning)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileSnapshot {
@@ -440,6 +486,27 @@ mod tests {
             SaveAsOutcome::Saved
         );
         assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
+    }
+
+    #[test]
+    fn open_file_warning_detects_archives_binary_data_and_text() {
+        let directory = tempdir().unwrap();
+        let zip = directory.path().join("archive.zip");
+        let binary = directory.path().join("binary.dat");
+        let text = directory.path().join("text.txt");
+        fs::write(&zip, b"PK\x03\x04payload").unwrap();
+        fs::write(&binary, b"text\0data").unwrap();
+        fs::write(&text, b"plain text").unwrap();
+
+        assert_eq!(
+            open_file_warning(&zip).unwrap(),
+            Some(OpenFileWarning::Archive("a ZIP archive"))
+        );
+        assert_eq!(
+            open_file_warning(&binary).unwrap(),
+            Some(OpenFileWarning::Binary)
+        );
+        assert_eq!(open_file_warning(&text).unwrap(), None);
     }
 
     #[cfg(unix)]

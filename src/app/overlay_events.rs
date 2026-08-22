@@ -10,6 +10,21 @@ use super::{
 };
 
 impl Application {
+    fn help_maximum_scroll(&self) -> Result<usize> {
+        let (columns, rows) = crossterm::terminal::size()
+            .map_err(|error| AppError::io("could not inspect terminal size", error))?;
+        let area = render::overlay_area(
+            Rect {
+                x: 0,
+                y: 0,
+                width: columns,
+                height: rows,
+            },
+            self.overlay.as_ref().expect("help overlay exists"),
+        );
+        Ok(render::help_line_count(self).saturating_sub(usize::from(area.height.saturating_sub(2))))
+    }
+
     pub(super) fn handle_overlay_event(&mut self, event: Event) -> Result<()> {
         if let Event::Mouse(mouse) = event {
             let click_count = matches!(mouse.kind, MouseEventKind::Down(_))
@@ -32,19 +47,7 @@ impl Application {
                 None
             };
             if matches!(self.overlay, Some(Overlay::Help { .. })) {
-                let (columns, rows) = crossterm::terminal::size()
-                    .map_err(|error| AppError::io("could not inspect terminal size", error))?;
-                let area = render::overlay_area(
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: columns,
-                        height: rows,
-                    },
-                    self.overlay.as_ref().expect("help overlay exists"),
-                );
-                let visible_rows = usize::from(area.height.saturating_sub(2));
-                let maximum = render::help_line_count(self).saturating_sub(visible_rows);
+                let maximum = self.help_maximum_scroll()?;
                 if let Some(Overlay::Help { scroll }) = self.overlay.as_mut() {
                     match mouse.kind {
                         MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
@@ -181,6 +184,32 @@ impl Application {
         }
         if key.code == KeyCode::Enter && matches!(self.overlay, Some(Overlay::ExplorerCreate { .. })) {
             return self.submit_explorer_create();
+        }
+        if key.code == KeyCode::Char('o')
+            && let Some((path, split)) = self.overlay.as_ref().and_then(|overlay| {
+                let Overlay::ConfirmUnsafeOpen { path, split, .. } = overlay else {
+                    return None;
+                };
+                Some((path.clone(), *split))
+            })
+        {
+            super::document_lifecycle::open_confirmed_path(self, &path, split)?;
+            self.overlay = None;
+            self.focus_owner = FocusOwner::Workspace;
+            return Ok(());
+        }
+        if matches!(self.overlay, Some(Overlay::Help { .. })) {
+            let maximum = self.help_maximum_scroll()?;
+            if let Some(Overlay::Help { scroll }) = self.overlay.as_mut() {
+                match key.code {
+                    KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => *scroll = scroll.saturating_add(1).min(maximum),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => *scroll = scroll.saturating_add(10).min(maximum),
+                    _ => {}
+                }
+            }
+            return Ok(());
         }
         if key.code == KeyCode::Enter
             && let Some(Overlay::Settings {
@@ -452,6 +481,7 @@ impl Application {
                 self.pending_close_document = self.focused_editor().map(|(id, _)| id);
                 self.save_focused()?;
             }
+            Overlay::ConfirmUnsafeOpen { .. } => {}
             Overlay::SaveConflict if key.code == KeyCode::Char('o') => {
                 let document_id = self.focused_editor().map(|(id, _)| id);
                 if let Some(document_id) = document_id {

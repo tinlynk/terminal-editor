@@ -349,6 +349,29 @@ fn explorer_actions(application: &Application) -> String {
     )
 }
 
+fn explorer_file_icon<'a>(
+    application: &'a Application,
+    file_name: &str,
+) -> (&'a str, Option<Color>) {
+    if application.theme.id != "nerd-font" {
+        return (application.theme.icons.file_default.as_str(), None);
+    }
+    let icon = kamon::get_icon(file_name).expect("Kamon provides a fallback file icon");
+    (icon.glyph, parse_hex_color(icon.color))
+}
+
+fn parse_hex_color(value: &str) -> Option<Color> {
+    let value = value.strip_prefix('#')?;
+    if value.len() != 6 {
+        return None;
+    }
+    Some(Color::Rgb(
+        u8::from_str_radix(&value[0..2], 16).ok()?,
+        u8::from_str_radix(&value[2..4], 16).ok()?,
+        u8::from_str_radix(&value[4..6], 16).ok()?,
+    ))
+}
+
 fn explorer_root_label(application: &Application) -> String {
     let root_name = application
         .explorer
@@ -356,7 +379,12 @@ fn explorer_root_label(application: &Application) -> String {
         .file_name()
         .unwrap_or(application.explorer.root.as_os_str())
         .to_string_lossy();
-    format!("{} {root_name}", application.theme.icons.folder_open)
+    let marker = if application.explorer.root_expanded {
+        application.theme.icons.tree_expanded.as_str()
+    } else {
+        application.theme.icons.tree_collapsed.as_str()
+    };
+    format!("{marker} {root_name}")
 }
 
 fn explorer_required_width(application: &Application) -> u16 {
@@ -530,7 +558,7 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
     };
     let mut lines = vec![Line::styled(
         format!(
-            "{} Open Editors  Ctrl+W closes",
+            "{} Open Editors",
             if application.explorer.open_editors_expanded {
                 application.theme.icons.tree_expanded.as_str()
             } else {
@@ -548,9 +576,9 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
                 .and_then(|path| path.file_name())
                 .map_or_else(|| "Untitled".into(), |name| name.to_string_lossy());
             let modified = if document.is_modified() {
-                format!(" {}", application.theme.icons.modified)
+                " *"
             } else {
-                String::new()
+                ""
             };
             let style = if application.focused_document_id() == Some(document_id) {
                 Style::default().bg(application.theme.colors.selected_row_background)
@@ -572,11 +600,21 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
         ),
         application.theme.icons.overflow.as_str(),
     );
-    lines.push(Line::styled(
-        format!("{root_label}{:>padding$}", actions, padding = root_width.saturating_sub(root_label.width())),
+    let root_style = if application.explorer.root_header_selected
+        && application.focus_owner == FocusOwner::Explorer
+    {
+        Style::default()
+            .bg(application.theme.colors.selected_row_background)
+            .fg(application.theme.colors.foreground)
+            .add_modifier(Modifier::BOLD)
+    } else {
         Style::default()
             .fg(application.theme.colors.muted)
-            .add_modifier(Modifier::BOLD),
+            .add_modifier(Modifier::BOLD)
+    };
+    lines.push(Line::styled(
+        format!("{root_label}{:>padding$}", actions, padding = root_width.saturating_sub(root_label.width())),
+        root_style,
     ));
     let entry_capacity = usize::from(
         area.height
@@ -591,6 +629,9 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
         .skip(application.explorer.viewport_row)
         .take(entry_capacity)
     {
+        if !application.explorer.root_expanded {
+            break;
+        }
         let (prefix, is_dir) = if entry.is_directory && !entry.is_symlink {
             if entry.expanded {
                 (application.theme.icons.folder_open.as_str(), true)
@@ -612,12 +653,19 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
             Style::default()
         };
         let indent = "  ".repeat(entry.depth + 1);
-        let line_text = if is_dir {
-            format!("{indent}{prefix} {name}")
+        let line = if is_dir {
+            Line::styled(format!("{indent}{prefix} {name}"), style)
         } else {
-            format!("{indent}  {name}")
+            let (icon, icon_color) = explorer_file_icon(application, &name);
+            let icon_style = icon_color.map_or_else(Style::default, |color| Style::default().fg(color));
+            Line::from(vec![
+                Span::raw(format!("{indent}  ")),
+                Span::styled(icon, icon_style),
+                Span::raw(format!(" {name}")),
+            ])
+            .style(style)
         };
-        lines.push(Line::styled(line_text, style));
+        lines.push(line);
     }
     let border = if application.focus_owner == FocusOwner::Explorer {
         application.theme.colors.active_border
@@ -1438,6 +1486,13 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
             " Unsaved Document ",
             Text::from("Press S to save, D to discard, or Esc to cancel."),
         ),
+        Overlay::ConfirmUnsafeOpen { path, warning, .. } => (
+            " Confirm File Open ",
+            Text::from(format!(
+                "{} appears to contain {warning}. Press O to open it as text, or Esc to cancel.",
+                path.display()
+            )),
+        ),
         Overlay::SaveConflict => (
             " File Changed Externally ",
             Text::from("Press O to overwrite the file, or Esc to cancel. Save As is available from the file dialog."),
@@ -1487,6 +1542,7 @@ pub fn help_line_count(application: &Application) -> usize {
 }
 
 fn help_text(application: &Application) -> String {
+    let leader = display_key_sequence(&application.config.effective.terminal.leader);
     let bindings = application
         .config
         .effective
@@ -1495,12 +1551,26 @@ fn help_text(application: &Application) -> String {
         .filter(|(shortcut, _)| {
             !matches!(shortcut.as_str(), "ctrl+c" | "ctrl+x" | "ctrl+v" | "ctrl+g")
         })
-        .map(|(shortcut, command)| format!("  {shortcut:<16} {command}"))
+        .map(|(shortcut, command)| format!("  {:<16} {command}", display_key_sequence(shortcut)))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Keybindings\n\n{bindings}\n\nNavigation\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Esc              Close dialog\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent"
+        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, W      Close terminal (terminal focus)\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
     )
+}
+
+fn display_key_sequence(sequence: &str) -> String {
+    sequence
+        .split('+')
+        .map(|part| {
+            if part.eq_ignore_ascii_case("ctrl") {
+                "Ctrl".to_owned()
+            } else {
+                part.to_ascii_uppercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 fn explorer_create_path_label(workspace_root: &Path, directory: &Path) -> String {
@@ -1597,6 +1667,53 @@ mod tests {
             explorer_create_path_label(root, &root.join("src/app")),
             "terminal-editor/src/app/"
         );
+    }
+
+    #[test]
+    fn help_text_lists_global_contextual_and_scroll_controls() {
+        let application = Application::new_for_test();
+        let text = help_text(&application);
+
+        for expected in [
+            "Ctrl+T           Toggle bottom terminal",
+            "Explorer",
+            "Enter / Right    Open file or expand folder",
+            "Leader (Ctrl+B)",
+            "Page Up / Down   Scroll by page",
+        ] {
+            assert!(text.contains(expected), "missing Help entry: {expected}");
+        }
+    }
+
+    #[test]
+    fn help_text_formats_configured_shortcuts_for_display() {
+        let mut application = Application::new_for_test();
+        application
+            .config
+            .effective
+            .keybindings
+            .insert("ctrl+k".to_owned(), "save".to_owned());
+        application.config.effective.terminal.leader = "ctrl+k".to_owned();
+
+        let text = help_text(&application);
+
+        assert!(text.contains("Ctrl+K           save"));
+        assert!(text.contains("Leader (Ctrl+K)"));
+        assert!(!text.contains("ctrl+k"));
+    }
+
+    #[test]
+    fn explorer_file_icons_use_kamon_only_for_the_nerd_font_theme() {
+        let mut application = Application::new_for_test();
+        let (glyph, color) = explorer_file_icon(&application, "main.rs");
+        assert_eq!(glyph, application.theme.icons.file_default);
+        assert_eq!(color, None);
+
+        application.theme.id = "nerd-font".to_owned();
+        let expected = kamon::get_icon("main.rs").unwrap();
+        let (glyph, color) = explorer_file_icon(&application, "main.rs");
+        assert_eq!(glyph, expected.glyph);
+        assert_eq!(color, parse_hex_color(expected.color));
     }
 
     #[test]
@@ -2046,6 +2163,63 @@ mod tests {
         assert!(!row_text(area.y + 1).contains("Untitled"));
         let root_cell = buffer.cell((area.x + 1, area.y + 3)).unwrap();
         assert!(root_cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn open_editors_marks_modified_documents_with_an_asterisk() {
+        let mut application = Application::new_for_test();
+        application
+            .apply(crate::command::Command::Insert("changed".to_owned()))
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &application)).unwrap();
+        let area = geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        )
+        .explorer
+        .unwrap();
+        let row_text = (area.x.saturating_add(1)..area.x.saturating_add(area.width.saturating_sub(1)))
+            .map(|column| terminal.backend().buffer().cell((column, area.y + 2)).unwrap().symbol())
+            .collect::<String>();
+
+        assert!(row_text.contains("Untitled *"));
+    }
+
+    #[test]
+    fn collapsed_workspace_root_hides_entries_and_uses_the_tree_marker() {
+        let mut application = Application::new_for_test();
+        application.explorer.root_expanded = false;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &application)).unwrap();
+        let area = geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        )
+        .explorer
+        .unwrap();
+        let rows = explorer_rows(area, application.open_document_ids().len(), true);
+        let row_text = |row| {
+            (area.x.saturating_add(1)..area.x.saturating_add(area.width.saturating_sub(1)))
+                .map(|column| terminal.backend().buffer().cell((column, row)).unwrap().symbol())
+                .collect::<String>()
+        };
+
+        assert!(row_text(rows.root).trim().starts_with(&format!(
+            "{} ",
+            application.theme.icons.tree_collapsed
+        )));
+        assert!(row_text(rows.entries_start).trim().is_empty());
     }
 
     #[test]

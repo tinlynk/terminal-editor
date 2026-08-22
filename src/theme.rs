@@ -11,7 +11,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::{AppError, Result};
 
 const DEFAULT_THEME: &str = include_str!("../themes/default.toml");
+const NERD_FONT_THEME: &str = include_str!("../themes/nerd-font.toml");
 const DEFAULT_THEME_ID: &str = "default";
+const NERD_FONT_THEME_ID: &str = "nerd-font";
 const MAX_THEME_BYTES: u64 = 256 * 1024;
 const SCHEMA_VERSION: i64 = 1;
 
@@ -160,16 +162,42 @@ impl ThemeRegistry {
                 message: default_diagnostics.join("; "),
             });
         }
+        let (nerd_font, nerd_font_diagnostics) = parse_theme(
+            NERD_FONT_THEME_ID,
+            NERD_FONT_THEME,
+            Some(&default),
+            ParseMode::Partial,
+        )
+        .ok_or_else(|| AppError::Config {
+            path: PathBuf::from("themes/nerd-font.toml"),
+            message: "the embedded Nerd Font theme is invalid".to_owned(),
+        })?;
+        if !nerd_font_diagnostics.is_empty() {
+            return Err(AppError::Config {
+                path: PathBuf::from("themes/nerd-font.toml"),
+                message: nerd_font_diagnostics.join("; "),
+            });
+        }
         let mut registry = Self {
             directory,
-            entries: BTreeMap::from([(
-                DEFAULT_THEME_ID.to_owned(),
-                ThemeEntry {
-                    theme: default,
-                    source: ThemeSource::Embedded,
-                    diagnostics: Vec::new(),
-                },
-            )]),
+            entries: BTreeMap::from([
+                (
+                    DEFAULT_THEME_ID.to_owned(),
+                    ThemeEntry {
+                        theme: default,
+                        source: ThemeSource::Embedded,
+                        diagnostics: Vec::new(),
+                    },
+                ),
+                (
+                    NERD_FONT_THEME_ID.to_owned(),
+                    ThemeEntry {
+                        theme: nerd_font,
+                        source: ThemeSource::Embedded,
+                        diagnostics: Vec::new(),
+                    },
+                ),
+            ]),
             diagnostics: Vec::new(),
         };
         registry.discover();
@@ -248,10 +276,10 @@ impl ThemeRegistry {
             });
             return;
         };
-        if id == DEFAULT_THEME_ID {
+        if id == DEFAULT_THEME_ID || id == NERD_FONT_THEME_ID {
             self.diagnostics.push(ThemeDiagnostic {
                 path: Some(path),
-                message: "Theme identifier `default` is reserved".to_owned(),
+                message: format!("Theme identifier `{id}` is reserved"),
             });
             return;
         }
@@ -885,10 +913,36 @@ mod tests {
         assert_eq!(default.theme.icons.file_default, "•");
         assert_eq!(default.theme.icons.git_branch, "⎇");
         assert_eq!(default.theme.icons.scrollbar_horizontal, "▀");
-        assert_eq!(default.theme.icons.explorer_new_file, "+");
-        assert_eq!(default.theme.icons.explorer_new_folder, "+");
+        assert_eq!(default.theme.icons.explorer_new_file, "F");
+        assert_eq!(default.theme.icons.explorer_new_folder, "D");
         assert_eq!(default.theme.icons.explorer_refresh, "R");
         assert!(default.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn embedded_nerd_font_theme_overrides_icons_and_inherits_defaults() {
+        let registry = ThemeRegistry::load(tempdir().unwrap().path().join("missing")).unwrap();
+        let default = registry.get(DEFAULT_THEME_ID).unwrap();
+        let nerd_font = registry.get(NERD_FONT_THEME_ID).unwrap();
+
+        assert_eq!(nerd_font.source, ThemeSource::Embedded);
+        assert_eq!(nerd_font.theme.meta.name, "TinLynk Terminal Editor - Nerd Font");
+        assert_eq!(nerd_font.theme.icons.left_panel_visible, "\u{ebf3}");
+        assert_eq!(nerd_font.theme.icons.left_panel_hidden, "\u{ec02}");
+        assert_eq!(nerd_font.theme.icons.bottom_panel_visible, "\u{ebf2}");
+        assert_eq!(nerd_font.theme.icons.bottom_panel_hidden, "\u{ec01}");
+        assert_eq!(nerd_font.theme.icons.right_panel_visible, "\u{ebf4}");
+        assert_eq!(nerd_font.theme.icons.right_panel_hidden, "\u{ec00}");
+        assert_eq!(nerd_font.theme.icons.folder_open, "\u{f07c}");
+        assert_eq!(nerd_font.theme.icons.explorer_new_file, "\u{ea7f}");
+        assert_eq!(nerd_font.theme.icons.explorer_new_folder, "\u{ea80}");
+        assert_eq!(nerd_font.theme.icons.explorer_refresh, "\u{f021}");
+        assert_eq!(nerd_font.theme.colors, default.theme.colors);
+        assert_eq!(
+            nerd_font.theme.icons.tree_expanded,
+            default.theme.icons.tree_expanded
+        );
+        assert!(nerd_font.diagnostics.is_empty());
     }
 
     #[test]
@@ -940,11 +994,16 @@ mod tests {
             "[meta]\nname = \"Override\"\n",
         )
         .unwrap();
+        fs::write(
+            directory.path().join("nerd-font.toml"),
+            "[meta]\nname = \"Override\"\n",
+        )
+        .unwrap();
         fs::write(directory.path().join("ignored.txt"), "ignored").unwrap();
         let registry = ThemeRegistry::load(directory.path().to_owned()).unwrap();
         assert_eq!(
             registry.entries().map(|(id, _)| id).collect::<Vec<_>>(),
-            vec!["a", "default", "z"]
+            vec!["a", "default", "nerd-font", "z"]
         );
         assert!(
             registry

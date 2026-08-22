@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use crate::{
     Result,
     document::DocumentId,
-    file_io::{SaveAsOutcome, SaveOutcome},
+    file_io::{SaveAsOutcome, SaveOutcome, open_file_warning},
     layout::SplitDirection,
     workspace::Pane,
 };
@@ -138,6 +138,23 @@ pub(super) fn finish_successful_save(
 }
 
 pub(super) fn open_path(
+    application: &mut Application,
+    path: &Path,
+    split: Option<SplitDirection>,
+) -> Result<()> {
+    if let Some(warning) = open_file_warning(path)? {
+        application.overlay = Some(Overlay::ConfirmUnsafeOpen {
+            path: path.to_owned(),
+            split,
+            warning: warning.description(),
+        });
+        application.focus_owner = FocusOwner::Overlay;
+        return Ok(());
+    }
+    open_confirmed_path(application, path, split)
+}
+
+pub(super) fn open_confirmed_path(
     application: &mut Application,
     path: &Path,
     split: Option<SplitDirection>,

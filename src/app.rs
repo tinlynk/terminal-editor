@@ -103,6 +103,11 @@ pub enum Overlay {
     ConfirmTerminateAll,
     ConfirmTerminalClose,
     ConfirmDocumentClose,
+    ConfirmUnsafeOpen {
+        path: PathBuf,
+        split: Option<SplitDirection>,
+        warning: &'static str,
+    },
     SaveConflict,
     ConfirmSaveAsOverwrite {
         document_id: crate::document::DocumentId,
@@ -411,6 +416,14 @@ impl Application {
                         && self.toggle_open_editors_at(mouse.row, explorer_area)
                     {
                         self.explorer.open_editors_header_selected = true;
+                        self.explorer.root_header_selected = false;
+                        return Ok(());
+                    }
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        && self.toggle_workspace_root_at(mouse.row, explorer_area)
+                    {
+                        self.explorer.open_editors_header_selected = false;
+                        self.explorer.root_header_selected = true;
                         return Ok(());
                     }
                     if self.activate_open_editor_at(mouse.row, explorer_area) {
@@ -418,6 +431,7 @@ impl Application {
                     }
                     if let Some(index) = self.explorer_entry_at(mouse.row, explorer_area) {
                         self.explorer.open_editors_header_selected = false;
+                        self.explorer.root_header_selected = false;
                         self.explorer.selected = index;
                         let entry = self.explorer.entries().get(index).cloned();
                         if let Some(entry) = entry {
@@ -667,6 +681,9 @@ impl Application {
     }
 
     fn explorer_entry_at(&self, row: u16, area: Rect) -> Option<usize> {
+        if !self.explorer.root_expanded {
+            return None;
+        }
         let rows = render::explorer_rows(
             area,
             self.open_document_ids().len(),
@@ -689,6 +706,20 @@ impl Application {
             return false;
         }
         self.explorer.open_editors_expanded = !self.explorer.open_editors_expanded;
+        true
+    }
+
+    fn toggle_workspace_root_at(&mut self, row: u16, area: Rect) -> bool {
+        let rows = render::explorer_rows(
+            area,
+            self.open_document_ids().len(),
+            self.explorer.open_editors_expanded,
+        );
+        if row != rows.root {
+            return false;
+        }
+        self.explorer.root_expanded = !self.explorer.root_expanded;
+        self.explorer.viewport_row = 0;
         true
     }
 
@@ -1475,7 +1506,10 @@ impl Application {
         };
         match result {
             Ok(()) => {
-                if !matches!(self.overlay, Some(Overlay::ConfirmSaveAsOverwrite { .. })) {
+                if !matches!(
+                    self.overlay,
+                    Some(Overlay::ConfirmSaveAsOverwrite { .. } | Overlay::ConfirmUnsafeOpen { .. })
+                ) {
                     self.overlay = None;
                     self.focus_owner = FocusOwner::Workspace;
                 }
@@ -2056,6 +2090,56 @@ mod tests {
             application.documents.get(document_id).path.as_deref(),
             Some(fs::canonicalize(path).unwrap().as_path())
         );
+    }
+
+    #[test]
+    fn opening_text_files_does_not_require_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opened.txt");
+        fs::write(&path, "text").unwrap();
+        let mut application = Application::new_for_test();
+
+        application.open_path(&path, None).unwrap();
+
+        assert!(application.overlay.is_none());
+        assert_eq!(application.open_document_ids().len(), 1);
+    }
+
+    #[test]
+    fn unsafe_file_open_can_be_cancelled_or_confirmed_in_a_split() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("binary.dat");
+        fs::write(&path, b"binary\0data").unwrap();
+        let mut application = Application::new_for_test();
+
+        application
+            .open_path(&path, Some(SplitDirection::Vertical))
+            .unwrap();
+        assert!(matches!(application.overlay, Some(Overlay::ConfirmUnsafeOpen { .. })));
+        assert_eq!(application.open_document_ids().len(), 1);
+
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert!(application.overlay.is_none());
+        assert_eq!(application.open_document_ids().len(), 1);
+
+        application
+            .open_path(&path, Some(SplitDirection::Vertical))
+            .unwrap();
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert!(application.overlay.is_none());
+        assert_eq!(application.open_document_ids().len(), 2);
+        assert_eq!(application.workspace.panes.len(), 2);
     }
 
     #[test]
@@ -3094,6 +3178,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(application.overlay, Some(Overlay::Help { scroll: 3 }));
+    }
+
+    #[test]
+    fn help_window_scrolls_with_keyboard_navigation() {
+        let mut application = Application::new_for_test();
+        application.overlay = Some(Overlay::Help { scroll: 0 });
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::PageDown,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert!(matches!(application.overlay, Some(Overlay::Help { scroll }) if scroll > 0));
     }
 
     #[test]

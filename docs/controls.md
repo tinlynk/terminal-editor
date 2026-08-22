@@ -1,0 +1,61 @@
+# Controls
+
+Open the in-app Help view with `Ctrl+H` to see the active configurable keybindings. The controls below describe the built-in navigation and default interaction model.
+
+## Global
+
+| Control | Action |
+| --- | --- |
+| `Ctrl+H` | Open Help. |
+| `Ctrl+G` | Open Settings. |
+| `Ctrl+T` | Toggle the bottom terminal. |
+| Escape | Close the active dialog. |
+| `Ctrl+O` | Open the file dialog. |
+| `Ctrl+S` | Save the focused document. |
+| `Ctrl+W` | Close the focused document. |
+| `Ctrl+Q` | Exit with required confirmations. |
+
+`Ctrl+T` and `Ctrl+G` remain application shortcuts while the terminal is focused.
+
+## Editor
+
+Arrow keys move the cursor. Home and End move to the start and end of the line, while Page Up and Page Down move by a page. Use Shift with arrows, Home, End, Page Up, or Page Down to extend a selection when the terminal reports those modified keys.
+
+`Ctrl+C`, `Ctrl+X`, and `Ctrl+V` copy, cut, and paste through the internal clipboard. Enter inserts a line, Backspace and Delete remove text, Tab indents, and Shift+Tab unindents.
+
+When soft wrap is disabled, Shift plus the vertical mouse wheel pans long lines horizontally. Horizontal terminal-wheel events can also pan long lines when the terminal forwards them. Click or drag the bottom-border scrollbar to navigate the document width.
+
+## Explorer
+
+Use Up and Down to select an entry. Enter or Right opens a file or expands a folder. Left collapses an expanded folder, and `R` refreshes the tree. Escape returns focus to the workspace.
+
+Select the workspace root or Open Editors header and press Enter or Right to collapse or expand it. The Explorer root action icons create a file, create a folder, or refresh the tree. `Ctrl+W` closes the active open editor.
+
+## File dialogs
+
+In Open, Up and Down select an item, Enter or Right opens the selected file or folder, and Left moves to the parent folder. Tab copies the selected path. Use `Ctrl+Enter` to submit a manually edited path and Escape to cancel.
+
+In Save As, type a filename after the initial directory and press Enter to save. Use Right to enter the selected folder.
+
+## Terminal and leader
+
+Ordinary keyboard and paste input is sent to the terminal child process. The default configurable leader is `Ctrl+B`. A pending leader cancels after 1.5 seconds, Escape, paste, mouse input, or a focus change.
+
+| Control | Action |
+| --- | --- |
+| `Ctrl+B`, then `V` | Split the editor vertically. |
+| `Ctrl+B`, then `H` | Split the editor horizontally. |
+| `Ctrl+B`, then Arrow | Focus the nearest editor pane. |
+| `Ctrl+B`, then `Q` | Exit when the terminal is focused. |
+| `Ctrl+B`, then `W` | Terminate the terminal with confirmation. |
+| `Ctrl+B`, then Page Up or Page Down | Navigate application terminal scrollback. |
+| `Ctrl+B`, then `C` | Copy the application-owned terminal selection. |
+| `Ctrl+B` twice | Send a literal `Ctrl+B` to the child. |
+
+Editor split and focus chords are inactive while the terminal owns focus. ``Ctrl+` `` and `Ctrl+,` are accepted only when the outer terminal can report those modified punctuation keys distinctly.
+
+## Help
+
+Use Up and Down, Page Up and Page Down, or the mouse wheel to scroll Help. Escape closes it.
+
+Return to the [README](../README.md).

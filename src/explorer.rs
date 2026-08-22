@@ -27,6 +27,8 @@ pub struct Explorer {
     pub viewport_column: usize,
     pub open_editors_expanded: bool,
     pub open_editors_header_selected: bool,
+    pub root_expanded: bool,
+    pub root_header_selected: bool,
     expanded: BTreeSet<PathBuf>,
     exclusions: GlobSet,
     entries: Vec<ExplorerEntry>,
@@ -43,6 +45,8 @@ impl Explorer {
             viewport_column: 0,
             open_editors_expanded: true,
             open_editors_header_selected: false,
+            root_expanded: true,
+            root_header_selected: false,
             expanded: BTreeSet::new(),
             exclusions,
             entries: Vec::new(),
@@ -63,12 +67,22 @@ impl Explorer {
         if self.open_editors_header_selected {
             if delta > 0 {
                 self.open_editors_header_selected = false;
+                self.root_header_selected = true;
+            }
+            return;
+        }
+        if self.root_header_selected {
+            if delta > 0 && self.root_expanded && !self.entries.is_empty() {
+                self.root_header_selected = false;
                 self.selected = 0;
+            } else if delta < 0 {
+                self.root_header_selected = false;
+                self.open_editors_header_selected = true;
             }
             return;
         }
         if delta < 0 && self.selected == 0 {
-            self.open_editors_header_selected = true;
+            self.root_header_selected = true;
             return;
         }
         self.selected = self
@@ -94,6 +108,11 @@ impl Explorer {
     pub fn toggle_selected(&mut self) -> Result<Option<PathBuf>> {
         if self.open_editors_header_selected {
             self.open_editors_expanded = !self.open_editors_expanded;
+            return Ok(None);
+        }
+        if self.root_header_selected {
+            self.root_expanded = !self.root_expanded;
+            self.viewport_row = 0;
             return Ok(None);
         }
         let Some(entry) = self.selected_entry().cloned() else {
@@ -296,16 +315,20 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_navigation_reaches_and_toggles_open_editors_header() {
+    fn keyboard_navigation_reaches_and_toggles_explorer_headers() {
         let directory = tempdir().unwrap();
         fs::write(directory.path().join("file.txt"), "text").unwrap();
         let mut explorer = Explorer::new(directory.path().to_owned(), true, &[]).unwrap();
+        explorer.move_selection(-1);
+        assert!(explorer.root_header_selected);
+        explorer.toggle_selected().unwrap();
+        assert!(!explorer.root_expanded);
         explorer.move_selection(-1);
         assert!(explorer.open_editors_header_selected);
         explorer.toggle_selected().unwrap();
         assert!(!explorer.open_editors_expanded);
         explorer.move_selection(1);
-        assert!(!explorer.open_editors_header_selected);
+        assert!(explorer.root_header_selected);
     }
 
     #[test]
