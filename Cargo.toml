@@ -20,6 +20,7 @@ portable-pty = "=0.9.0"
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 ropey = "=1.6.1"
 serde = { version = "=1.0.229", features = ["derive"] }
+syntect = "=5.3.0"
 toml = "=1.1.4"
 toml_edit = "=0.25.13"
 unicode-segmentation = "=1.13.3"

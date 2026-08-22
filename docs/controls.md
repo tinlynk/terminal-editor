@@ -57,5 +57,3 @@ Editor split and focus chords are inactive while the terminal owns focus. ``Ctrl
 ## Help
 
 Use Up and Down, Page Up and Page Down, or the mouse wheel to scroll Help. Escape closes it.
-
-Return to the [README](../README.md).

@@ -19,5 +19,3 @@ The internal clipboard is always available for editor operations. Bracketed past
 Child OSC 52 clipboard writes are ignored by default. They can be enabled only in user configuration with `terminal.allow_child_osc52_write = true`. Child clipboard reads are never serviced.
 
 OSC 52 support depends on the terminal emulator, so external clipboard interoperability is not guaranteed.
-
-Return to the [README](../README.md).

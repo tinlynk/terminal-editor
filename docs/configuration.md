@@ -54,4 +54,4 @@ active = "default"
 
 `editor.default_line_ending` accepts `lf` or `crlf`. `editor.header_style` accepts `tabs` or `breadcrumbs`. Set `editor.soft_wrap = true` to wrap long lines and disable horizontal panning and its scrollbar.
 
-Use [theme authoring](themes.md) for `theme.active` and custom theme behavior. Return to the [README](../README.md).
+Use [theme authoring](themes.md) for `theme.active` and custom theme behavior.

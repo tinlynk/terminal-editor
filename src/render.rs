@@ -14,6 +14,7 @@ use crate::{
     app::{Application, FocusOwner, Overlay},
     document::Document,
     layout::{CalculatedLayout, PaneId, Rect},
+    syntax::{SyntaxHighlighter, SyntaxSpan},
     terminal_emulator::{TerminalCell, TerminalColor},
     workspace::Pane,
 };
@@ -862,9 +863,26 @@ fn draw_editor(
     } else {
         crate::editor::WrappedPosition::default()
     };
+    let mut syntax = document
+        .path
+        .as_deref()
+        .and_then(SyntaxHighlighter::for_path);
+    if let Some(highlighter) = syntax.as_mut() {
+        for line_index in 0..viewport_line {
+            highlighter.highlight_line(&document.line(line_index));
+        }
+    }
+    let mut highlighted_line = None;
+    let mut syntax_spans = Vec::new();
     if soft_wrap {
         for row in &visible_wrapped_rows {
             let position = row.position;
+            if highlighted_line != Some(position.line) {
+                syntax_spans = syntax.as_mut().map_or_else(Vec::new, |highlighter| {
+                    highlighter.highlight_line(&document.line(position.line))
+                });
+                highlighted_line = Some(position.line);
+            }
             let mut spans = Vec::new();
             if line_number_width > 0 {
                 let number = if position.segment == 0 {
@@ -888,11 +906,17 @@ fn draw_editor(
             }
             spans.extend(styled_editor_text(
                 &document.slice(row.start, row.end),
-                row.start,
-                selection.as_ref(),
-                0,
-                application.theme.colors.editor_selection,
-                wrap_width,
+                EditorTextStyle {
+                    line_start: row.start,
+                    selection: selection.as_ref(),
+                    viewport_column: 0,
+                    selection_color: application.theme.colors.editor_selection,
+                    maximum_width: wrap_width,
+                    syntax_spans: &syntax_spans,
+                    syntax_byte_offset: document
+                        .slice(document.line_to_char(position.line), row.start)
+                        .len(),
+                },
             ));
             lines.push(Line::from(spans));
         }
@@ -908,6 +932,9 @@ fn draw_editor(
             let maximum_chars = usize::from(area.width).saturating_mul(4).max(1);
             let segment_end = segment_start.saturating_add(maximum_chars).min(end);
             let text = document.slice(segment_start, segment_end);
+            syntax_spans = syntax.as_mut().map_or_else(Vec::new, |highlighter| {
+                highlighter.highlight_line(&document.line(line_index))
+            });
             let overflow = segment_end < end || text.width() > available_text_width;
             let text_width = available_text_width.saturating_sub(usize::from(overflow));
             let mut spans = Vec::new();
@@ -927,11 +954,17 @@ fn draw_editor(
             }
             spans.extend(styled_editor_text(
                 &text,
-                segment_start,
-                selection.as_ref(),
-                0,
-                application.theme.colors.editor_selection,
-                text_width,
+                EditorTextStyle {
+                    line_start: segment_start,
+                    selection: selection.as_ref(),
+                    viewport_column: 0,
+                    selection_color: application.theme.colors.editor_selection,
+                    maximum_width: text_width,
+                    syntax_spans: &syntax_spans,
+                    syntax_byte_offset: document
+                        .slice(document.line_to_char(line_index), segment_start)
+                        .len(),
+                },
             ));
             if overflow && available_text_width > 0 {
                 let rendered_width = spans
@@ -1053,41 +1086,52 @@ fn draw_editor(
     }
 }
 
-fn styled_editor_text(
-    text: &str,
+struct EditorTextStyle<'a> {
     line_start: usize,
-    selection: Option<&std::ops::Range<usize>>,
+    selection: Option<&'a std::ops::Range<usize>>,
     viewport_column: usize,
     selection_color: Color,
     maximum_width: usize,
-) -> Vec<Span<'static>> {
+    syntax_spans: &'a [SyntaxSpan],
+    syntax_byte_offset: usize,
+}
+
+fn styled_editor_text(text: &str, style: EditorTextStyle<'_>) -> Vec<Span<'static>> {
     let mut display_column: usize = 0;
     let mut char_offset: usize = 0;
     let mut rendered_width: usize = 0;
+    let mut byte_offset = style.syntax_byte_offset;
     let mut spans = Vec::new();
     for grapheme in text.graphemes(true) {
         let width = grapheme.width();
-        let grapheme_start = line_start + char_offset;
+        let grapheme_start = style.line_start + char_offset;
         char_offset += grapheme.chars().count();
-        let grapheme_end = line_start + char_offset;
-        let visible = display_column.saturating_add(width) > viewport_column;
+        let grapheme_end = style.line_start + char_offset;
+        let visible = display_column.saturating_add(width) > style.viewport_column;
         display_column = display_column.saturating_add(width);
         if !visible {
             continue;
         }
-        if rendered_width.saturating_add(width) > maximum_width {
+        if rendered_width.saturating_add(width) > style.maximum_width {
             break;
         }
-        let selected =
-            selection.is_some_and(|range| range.start < grapheme_end && range.end > grapheme_start);
+        let selected = style
+            .selection
+            .is_some_and(|range| range.start < grapheme_end && range.end > grapheme_start);
+        let syntax_color = style
+            .syntax_spans
+            .iter()
+            .find(|span| span.range.start <= byte_offset && span.range.end > byte_offset)
+            .map(|span| span.color);
         spans.push(Span::styled(
             grapheme.to_owned(),
             if selected {
-                Style::default().bg(selection_color)
+                Style::default().bg(style.selection_color)
             } else {
-                Style::default()
+                syntax_color.map_or_else(Style::default, |color| Style::default().fg(color))
             },
         ));
+        byte_offset = byte_offset.saturating_add(grapheme.len());
         rendered_width = rendered_width.saturating_add(width);
     }
     spans
@@ -2281,16 +2325,45 @@ mod tests {
     fn editor_selection_marks_only_intersecting_graphemes() {
         let spans = styled_editor_text(
             "a界b",
-            10,
-            Some(&(11..12)),
-            0,
-            Color::Rgb(38, 79, 120),
-            usize::MAX,
+            EditorTextStyle {
+                line_start: 10,
+                selection: Some(&(11..12)),
+                viewport_column: 0,
+                selection_color: Color::Rgb(38, 79, 120),
+                maximum_width: usize::MAX,
+                syntax_spans: &[],
+                syntax_byte_offset: 0,
+            },
         );
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].style.bg, None);
         assert_eq!(spans[1].style.bg, Some(Color::Rgb(38, 79, 120)));
         assert_eq!(spans[2].style.bg, None);
+    }
+
+    #[test]
+    fn syntax_foreground_is_preserved_outside_the_selection() {
+        let color = Color::Rgb(128, 203, 196);
+        let spans = styled_editor_text(
+            "fn",
+            EditorTextStyle {
+                line_start: 0,
+                selection: Some(&(1..2)),
+                viewport_column: 0,
+                selection_color: Color::Rgb(38, 79, 120),
+                maximum_width: usize::MAX,
+                syntax_spans: &[SyntaxSpan {
+                    range: 0..2,
+                    color,
+                }],
+                syntax_byte_offset: 0,
+            },
+        );
+
+        assert_eq!(spans[0].style.fg, Some(color));
+        assert_eq!(spans[0].style.bg, None);
+        assert_eq!(spans[1].style.fg, None);
+        assert_eq!(spans[1].style.bg, Some(Color::Rgb(38, 79, 120)));
     }
 
     #[test]

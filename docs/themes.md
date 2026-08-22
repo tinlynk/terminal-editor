@@ -41,4 +41,6 @@ Colors accept `default`, the sixteen ANSI color names, or `#RRGGBB` without alph
 
 Panel controls use `_visible` and `_hidden` icon keys. Explorer root actions use `explorer_new_file`, `explorer_new_folder`, and `explorer_refresh`. Themes cannot alter child-process ANSI, indexed, RGB, inverse, or default terminal color behavior.
 
-Return to the [README](../README.md).
+## Syntax highlighting
+
+Editor syntax highlighting uses Syntect's bundled syntax definitions and detects a language from the opened file path. Files with no matching syntax, including untitled and plain-text documents, retain the editor's normal foreground color. The initial implementation uses Syntect's bundled `base16-ocean.dark` palette; custom TinLynk theme files do not yet override syntax token colors.
