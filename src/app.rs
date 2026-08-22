@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    env,
+    env, fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -77,10 +77,23 @@ pub enum Overlay {
         query: String,
         scope: ConfigScope,
         selected: usize,
+        editing: Option<usize>,
+        new_value: String,
     },
     ThemePicker {
         scope: ConfigScope,
         selected: usize,
+    },
+    Help {
+        scroll: usize,
+    },
+    ExplorerCreate {
+        directory: PathBuf,
+        name: String,
+        entries: Vec<PathBuf>,
+        selected: usize,
+        create_directory: bool,
+        error: Option<String>,
     },
     Message {
         title: String,
@@ -376,6 +389,25 @@ impl Application {
                     self.focus_owner = FocusOwner::Explorer;
                     let explorer_area = geometry.explorer.unwrap();
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        && let Some(action) = render::explorer_root_action_at(
+                            explorer_area,
+                            self.open_document_ids().len(),
+                            self.explorer.open_editors_expanded,
+                            mouse.column,
+                            mouse.row,
+                        )
+                    {
+                        match action {
+                            render::ExplorerRootAction::NewFile => self.open_explorer_create(false),
+                            render::ExplorerRootAction::NewFolder => self.open_explorer_create(true),
+                            render::ExplorerRootAction::Refresh => {
+                                self.explorer.refresh()?;
+                                self.last_explorer_refresh = Instant::now();
+                            }
+                        }
+                        return Ok(());
+                    }
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         && self.toggle_open_editors_at(mouse.row, explorer_area)
                     {
                         self.explorer.open_editors_header_selected = true;
@@ -537,6 +569,13 @@ impl Application {
             _ => None,
         };
         if let Some(delta) = horizontal_delta {
+            if geometry
+                .explorer
+                .is_some_and(|area| area.contains(mouse.column, mouse.row))
+            {
+                self.explorer.scroll_horizontal(delta);
+                return true;
+            }
             self.scroll_horizontal_at(geometry, mouse.column, mouse.row, delta);
             return true;
         }
@@ -564,7 +603,7 @@ impl Application {
             .explorer
             .is_some_and(|area| area.contains(column, row))
         {
-            self.explorer.move_selection(delta);
+            self.explorer.scroll_vertical(delta);
             return;
         }
         if self.terminal_at(geometry, column, row).is_some() {
@@ -633,7 +672,10 @@ impl Application {
             self.open_document_ids().len(),
             self.explorer.open_editors_expanded,
         );
-        let index = usize::from(row.checked_sub(rows.entries_start)?);
+        let index = self
+            .explorer
+            .viewport_row
+            .saturating_add(usize::from(row.checked_sub(rows.entries_start)?));
         (index < self.explorer.entries().len()).then_some(index)
     }
 
@@ -945,7 +987,13 @@ impl Application {
                     query: String::new(),
                     scope: ConfigScope::User,
                     selected: 0,
+                    editing: None,
+                    new_value: String::new(),
                 });
+                self.focus_owner = FocusOwner::Overlay;
+            }
+            Command::OpenHelp => {
+                self.overlay = Some(Overlay::Help { scroll: 0 });
                 self.focus_owner = FocusOwner::Overlay;
             }
             Command::Copy => self.copy_selection(false),
@@ -1441,6 +1489,51 @@ impl Application {
         Ok(())
     }
 
+    fn open_explorer_create(&mut self, create_directory: bool) {
+        let directory = self
+            .explorer
+            .selected_entry()
+            .map(|entry| {
+                if entry.is_directory { entry.path.clone() } else { entry.path.parent().unwrap_or(&self.explorer.root).to_owned() }
+            })
+            .unwrap_or_else(|| self.explorer.root.clone());
+        self.overlay = Some(explorer_create_dialog(&directory, create_directory));
+        self.focus_owner = FocusOwner::Overlay;
+    }
+
+    fn submit_explorer_create(&mut self) -> Result<()> {
+        let Some(Overlay::ExplorerCreate { directory, name, create_directory, .. }) = self.overlay.as_ref() else {
+            return Ok(());
+        };
+        let directory = directory.clone();
+        let name = name.trim();
+        if name.is_empty() || Path::new(name).components().count() != 1 {
+            if let Some(Overlay::ExplorerCreate { error, .. }) = self.overlay.as_mut() {
+                *error = Some("Enter a single file or folder name".to_owned());
+            }
+            return Ok(());
+        }
+        let path = directory.join(name);
+        if !path.starts_with(&self.explorer.root) || path.exists() {
+            if let Some(Overlay::ExplorerCreate { error, .. }) = self.overlay.as_mut() {
+                *error = Some("The destination is unavailable".to_owned());
+            }
+            return Ok(());
+        }
+        let result = if *create_directory { fs::create_dir(&path) } else { fs::File::create(&path).map(|_| ()) };
+        if let Err(error) = result {
+            if let Some(Overlay::ExplorerCreate { error: message, .. }) = self.overlay.as_mut() {
+                *message = Some(error.to_string());
+            }
+            return Ok(());
+        }
+        self.explorer.refresh()?;
+        self.explorer.selected = self.explorer.entries().iter().position(|entry| entry.path == path).unwrap_or(self.explorer.selected);
+        self.overlay = None;
+        self.focus_owner = FocusOwner::Explorer;
+        Ok(())
+    }
+
     fn activate_file_dialog_selection(&mut self) -> Result<()> {
         let selected_path = match self.overlay.as_ref() {
             Some(Overlay::FileDialog {
@@ -1454,6 +1547,10 @@ impl Application {
             *input = path.display().to_string();
         }
         self.submit_file_dialog()
+    }
+
+    pub fn git_branch(&self) -> Option<String> {
+        detect_git_branch(&self.explorer.root)
     }
 
     pub fn status_text(&self) -> String {
@@ -1479,13 +1576,14 @@ impl Application {
                     crate::config::LineEnding::Lf => "LF",
                     crate::config::LineEnding::Crlf => "CRLF",
                 };
+                let encoding = document.encoding;
                 let horizontal_offset =
                     if !self.config.effective.editor.soft_wrap && view.viewport_column > 0 {
                         format!("  HScroll {}", view.viewport_column)
                     } else {
                         String::new()
                     };
-                format!("Edit  Ln {line}, Col {column}  UTF-8  {line_ending}{horizontal_offset}")
+                format!("Edit  Ln {line}, Col {column}  {encoding}  {line_ending}{horizontal_offset}")
             }
         }
     }
@@ -1699,11 +1797,13 @@ fn global_command(command: &Command) -> bool {
             | Command::ToggleExplorer
             | Command::ToggleBottomTerminal
             | Command::OpenSettings
+            | Command::OpenHelp
     )
 }
 
 fn file_dialog(directory: &Path, save_as: bool) -> Overlay {
-    let mut entries = std::fs::read_dir(directory)
+    let directory = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_owned());
+    let mut entries = std::fs::read_dir(&directory)
         .map(|entries| {
             entries
                 .filter_map(std::result::Result::ok)
@@ -1718,11 +1818,26 @@ fn file_dialog(directory: &Path, save_as: bool) -> Overlay {
         directory.display().to_string()
     };
     Overlay::FileDialog {
-        directory: directory.to_owned(),
+        directory,
         input,
         entries,
         selected: 0,
         save_as,
+        error: None,
+    }
+}
+
+pub(super) fn explorer_create_dialog(directory: &Path, create_directory: bool) -> Overlay {
+    let mut entries = fs::read_dir(directory)
+        .map(|entries| entries.filter_map(std::result::Result::ok).filter_map(|entry| entry.file_type().ok()?.is_dir().then_some(entry.path())).collect::<Vec<_>>())
+        .unwrap_or_default();
+    entries.sort();
+    Overlay::ExplorerCreate {
+        directory: directory.to_owned(),
+        name: String::new(),
+        entries,
+        selected: 0,
+        create_directory,
         error: None,
     }
 }
@@ -1794,11 +1909,80 @@ fn transform_position(position: usize, change: crate::document::TextChange) -> u
     }
 }
 
+pub fn detect_git_branch(start_path: &Path) -> Option<String> {
+    let git_path = start_path.join(".git");
+    if git_path.is_dir() {
+        read_git_head(&git_path.join("HEAD"))
+    } else if git_path.is_file()
+        && let Ok(content) = fs::read_to_string(&git_path)
+        && let Some(gitdir_str) = content.trim().strip_prefix("gitdir:")
+    {
+        let gitdir = gitdir_str.trim();
+        read_git_head(&start_path.join(gitdir).join("HEAD"))
+    } else {
+        None
+    }
+}
+
+fn read_git_head(head_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(head_path).ok()?;
+    let trimmed = text.trim();
+    if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+        Some(branch.to_owned())
+    } else if let Some(branch) = trimmed.strip_prefix("ref: ") {
+        Some(branch.to_owned())
+    } else if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(trimmed[..7.min(trimmed.len())].to_owned())
+    } else if !trimmed.is_empty() {
+        Some(trimmed.to_owned())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn git_branch_detection_reads_head_branch_and_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let git_dir = directory.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature-modern-ui\n").unwrap();
+
+        let branch = detect_git_branch(directory.path());
+        assert_eq!(branch, Some("feature-modern-ui".to_owned()));
+
+        fs::write(
+            git_dir.join("HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        let detached = detect_git_branch(directory.path());
+        assert_eq!(detached, Some("0123456".to_owned()));
+    }
+
+    #[test]
+    fn status_bar_omits_git_branch_outside_a_repository() {
+        let application = Application::new_for_test();
+
+        assert_eq!(application.git_branch(), None);
+    }
+
+    #[test]
+    fn git_branch_detection_ignores_a_parent_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let git_dir = directory.path().join(".git");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir(&git_dir).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        assert_eq!(detect_git_branch(&workspace), None);
+    }
 
     #[test]
     fn semantic_commands_edit_and_undo_document() {
@@ -2854,6 +3038,65 @@ mod tests {
     }
 
     #[test]
+    fn left_arrow_keeps_explorer_focus_and_collapses_the_selected_folder() {
+        let mut application = Application::new_for_test();
+        let directory = application.explorer.root.join("nested");
+        fs::create_dir(&directory).unwrap();
+        application.explorer.refresh().unwrap();
+        application.explorer.selected = application
+            .explorer
+            .entries()
+            .iter()
+            .position(|entry| entry.path == directory)
+            .unwrap();
+        application.explorer.toggle_selected().unwrap();
+        application.focus_owner = FocusOwner::Explorer;
+
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert_eq!(application.focus_owner, FocusOwner::Explorer);
+        assert!(!application.explorer.selected_entry().unwrap().expanded);
+    }
+
+    #[test]
+    fn control_h_opens_help_from_workspace_and_terminal_focus() {
+        for focus_owner in [FocusOwner::Workspace, FocusOwner::BottomTerminal] {
+            let mut application = Application::new_for_test();
+            application.focus_owner = focus_owner;
+            application
+                .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('h'),
+                    KeyModifiers::CONTROL,
+                )))
+                .unwrap();
+
+            assert_eq!(application.overlay, Some(Overlay::Help { scroll: 0 }));
+            assert_eq!(application.focus_owner, FocusOwner::Overlay);
+        }
+    }
+
+    #[test]
+    fn help_window_scrolls_with_the_mouse_wheel() {
+        let mut application = Application::new_for_test();
+        application.overlay = Some(Overlay::Help { scroll: 0 });
+        application
+            .handle_overlay_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+
+        assert_eq!(application.overlay, Some(Overlay::Help { scroll: 3 }));
+    }
+
+    #[test]
     fn title_control_actions_route_to_existing_semantic_commands() {
         assert_eq!(
             title_control_command(render::TitleControlAction::ToggleLeftPanel),
@@ -2982,6 +3225,64 @@ mod tests {
     }
 
     #[test]
+    fn file_dialog_uses_an_absolute_path_for_relative_directories() {
+        let current_directory = env::current_dir().unwrap();
+        let Overlay::FileDialog { directory, input, .. } = file_dialog(Path::new("."), false) else {
+            panic!("expected file dialog");
+        };
+
+        assert_eq!(directory, current_directory);
+        assert_eq!(input, current_directory.display().to_string());
+    }
+
+    #[test]
+    fn explorer_create_uses_a_selected_files_parent_directory() {
+        let mut application = Application::new_for_test();
+        let directory = application.explorer.root.join("nested");
+        let file = directory.join("note.txt");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&file, "text").unwrap();
+        application.explorer.refresh().unwrap();
+        application.explorer.selected = application
+            .explorer
+            .entries()
+            .iter()
+            .position(|entry| entry.path == directory)
+            .unwrap();
+        application.explorer.toggle_selected().unwrap();
+        application.explorer.selected = application
+            .explorer
+            .entries()
+            .iter()
+            .position(|entry| entry.path == file)
+            .unwrap();
+
+        application.open_explorer_create(false);
+
+        let Some(Overlay::ExplorerCreate { directory: destination, .. }) = application.overlay else {
+            panic!("expected creation dialog");
+        };
+        assert_eq!(destination, directory);
+    }
+
+    #[test]
+    fn explorer_create_rejects_names_that_escape_the_workspace() {
+        let mut application = Application::new_for_test();
+        application.open_explorer_create(false);
+        let Some(Overlay::ExplorerCreate { name, .. }) = application.overlay.as_mut() else {
+            panic!("expected creation dialog");
+        };
+        *name = "../outside.txt".to_owned();
+
+        application.submit_explorer_create().unwrap();
+
+        let Some(Overlay::ExplorerCreate { error, .. }) = application.overlay.as_ref() else {
+            panic!("creation dialog should remain open");
+        };
+        assert_eq!(error.as_deref(), Some("Enter a single file or folder name"));
+    }
+
+    #[test]
     fn save_as_enter_submits_the_typed_filename() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("saved.txt");
@@ -3060,6 +3361,8 @@ mod tests {
             query: String::new(),
             scope: ConfigScope::User,
             selected: 0,
+            editing: None,
+            new_value: String::new(),
         });
         application.focus_owner = FocusOwner::Overlay;
         for character in "theme.active".chars() {

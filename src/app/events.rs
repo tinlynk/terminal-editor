@@ -49,7 +49,16 @@ impl Application {
                     self.focus_owner = FocusOwner::Workspace;
                 }
             }
-            KeyCode::Esc | KeyCode::Left => self.focus_owner = FocusOwner::Workspace,
+            KeyCode::Left => {
+                if self
+                    .explorer
+                    .selected_entry()
+                    .is_some_and(|entry| entry.is_directory && entry.expanded)
+                {
+                    self.explorer.toggle_selected()?;
+                }
+            }
+            KeyCode::Esc => self.focus_owner = FocusOwner::Workspace,
             KeyCode::Char('r') => {
                 self.explorer.refresh()?;
                 self.last_explorer_refresh = Instant::now();

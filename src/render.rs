@@ -1,8 +1,10 @@
+use std::path::Path;
+
 use ratatui::{
     Frame,
     layout::{Alignment, Rect as TuiRect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -22,6 +24,10 @@ const TITLE_CONTROL_HEIGHT: u16 = 1;
 const TITLE_CONTROL_GAP: u16 = 1;
 const TITLE_CONTROLS_WIDTH: u16 = TITLE_CONTROL_WIDTH * 4 + TITLE_CONTROL_GAP * 3;
 const TITLE_CONTROLS_RIGHT_INSET: u16 = 1;
+const EXPLORER_BORDER_WIDTH: u16 = 2;
+const EXPLORER_SEPARATOR_WIDTH: u16 = 1;
+const EXPLORER_ROOT_ACTION_GAP: usize = 1;
+const MINIMUM_WORKSPACE_WIDTH: u16 = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TitleControlAction {
@@ -77,6 +83,19 @@ pub struct WorkbenchGeometry {
     pub terminal: Option<Rect>,
     pub status: Rect,
     pub pane_layout: CalculatedLayout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExplorerRootAction { NewFile, NewFolder, Refresh }
+
+pub fn explorer_root_action_at(area: Rect, open_editor_count: usize, expanded: bool, column: u16, row: u16) -> Option<ExplorerRootAction> {
+    let root_row = explorer_rows(area, open_editor_count, expanded).root;
+    if row != root_row { return None; }
+    let right = area.x.saturating_add(area.width.saturating_sub(2));
+    if column == right { Some(ExplorerRootAction::Refresh) }
+    else if column == right.saturating_sub(2) { Some(ExplorerRootAction::NewFolder) }
+    else if column == right.saturating_sub(4) { Some(ExplorerRootAction::NewFile) }
+    else { None }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,15 +291,19 @@ pub fn geometry(application: &Application, screen: Rect) -> WorkbenchGeometry {
         height: status_height,
     };
     let explorer = (application.explorer.visible && screen.width >= 80).then(|| {
+        let maximum_width = content.width.saturating_sub(
+            MINIMUM_WORKSPACE_WIDTH.saturating_add(EXPLORER_SEPARATOR_WIDTH),
+        );
         let width = application
             .config
             .effective
             .explorer
             .width
-            .min(content.width.saturating_sub(20));
+            .max(explorer_required_width(application))
+            .min(maximum_width);
         let area = Rect { width, ..content };
-        content.x = content.x.saturating_add(width.saturating_add(1));
-        content.width = content.width.saturating_sub(width.saturating_add(1));
+        content.x = content.x.saturating_add(width.saturating_add(EXPLORER_SEPARATOR_WIDTH));
+        content.width = content.width.saturating_sub(width.saturating_add(EXPLORER_SEPARATOR_WIDTH));
         area
     });
     let bottom_terminal = (application.bottom_terminal_visible && screen.height >= 24).then(|| {
@@ -315,6 +338,53 @@ pub fn geometry(application: &Application, screen: Rect) -> WorkbenchGeometry {
         status,
         pane_layout,
     }
+}
+
+fn explorer_actions(application: &Application) -> String {
+    format!(
+        "{} {} {}",
+        application.theme.icons.explorer_new_file,
+        application.theme.icons.explorer_new_folder,
+        application.theme.icons.explorer_refresh,
+    )
+}
+
+fn explorer_root_label(application: &Application) -> String {
+    let root_name = application
+        .explorer
+        .root
+        .file_name()
+        .unwrap_or(application.explorer.root.as_os_str())
+        .to_string_lossy();
+    format!("{} {root_name}", application.theme.icons.folder_open)
+}
+
+fn explorer_required_width(application: &Application) -> u16 {
+    let inner_width = explorer_root_label(application)
+        .width()
+        .saturating_add(EXPLORER_ROOT_ACTION_GAP)
+        .saturating_add(explorer_actions(application).width());
+    u16::try_from(inner_width)
+        .unwrap_or(u16::MAX)
+        .saturating_add(EXPLORER_BORDER_WIDTH)
+}
+
+fn truncate_display_width(value: &str, maximum_width: usize, overflow: &str) -> String {
+    if value.width() <= maximum_width {
+        return value.to_owned();
+    }
+    let available_width = maximum_width.saturating_sub(overflow.width());
+    let mut width: usize = 0;
+    let mut end: usize = 0;
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if width.saturating_add(grapheme_width) > available_width {
+            break;
+        }
+        width = width.saturating_add(grapheme_width);
+        end = end.saturating_add(grapheme.len());
+    }
+    format!("{}{overflow}", &value[..end])
 }
 
 fn title_controls(area: Rect) -> TitleControls {
@@ -491,19 +561,36 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
         }
     }
     lines.push(Line::raw(""));
-    let root_name = application
-        .explorer
-        .root
-        .file_name()
-        .unwrap_or(application.explorer.root.as_os_str())
-        .to_string_lossy();
+    let actions = explorer_actions(application);
+    let root_width = usize::from(area.width.saturating_sub(2));
+    let root_label = truncate_display_width(
+        &explorer_root_label(application),
+        root_width.saturating_sub(
+            actions
+                .width()
+                .saturating_add(EXPLORER_ROOT_ACTION_GAP),
+        ),
+        application.theme.icons.overflow.as_str(),
+    );
     lines.push(Line::styled(
-        format!("{} {root_name}", application.theme.icons.folder_open),
+        format!("{root_label}{:>padding$}", actions, padding = root_width.saturating_sub(root_label.width())),
         Style::default()
             .fg(application.theme.colors.muted)
             .add_modifier(Modifier::BOLD),
     ));
-    for (index, entry) in application.explorer.entries().iter().enumerate() {
+    let entry_capacity = usize::from(
+        area.height
+            .saturating_sub(u16::try_from(lines.len().saturating_add(2)).unwrap_or(u16::MAX)),
+    )
+    .max(1);
+    for (index, entry) in application
+        .explorer
+        .entries()
+        .iter()
+        .enumerate()
+        .skip(application.explorer.viewport_row)
+        .take(entry_capacity)
+    {
         let (prefix, is_dir) = if entry.is_directory && !entry.is_symlink {
             if entry.expanded {
                 (application.theme.icons.folder_open.as_str(), true)
@@ -538,7 +625,9 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
         application.theme.colors.inactive_border
     };
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines)
+            .scroll((0, u16::try_from(application.explorer.viewport_column).unwrap_or(u16::MAX)))
+            .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(application.theme.border_type())
@@ -549,7 +638,7 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
                         .fg(application.theme.colors.foreground),
                 )
                 .title(" Explorer "),
-        ),
+            ),
         to_tui(area),
     );
 }
@@ -1100,6 +1189,21 @@ fn draw_status(frame: &mut Frame<'_>, application: &Application, area: Rect) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    if let Some(branch) = application.git_branch() {
+        let icon = &application.theme.icons.git_branch;
+        let branch_label = if icon.is_empty() {
+            format!(" {branch} ")
+        } else {
+            format!(" {icon} {branch} ")
+        };
+        spans.push(Span::styled(
+            branch_label,
+            Style::default()
+                .bg(application.theme.colors.status_segment_background)
+                .fg(application.theme.colors.status_segment_foreground),
+        ));
+    }
+
     let status = application.status_text();
     spans.push(Span::styled(
         format!(" {status} "),
@@ -1126,12 +1230,12 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
     let area = overlay_area(screen, overlay);
     let (title, body) = match overlay {
         Overlay::FileDialog {
-            directory,
             input,
             entries,
             selected,
             save_as,
             error,
+            ..
         } => {
             let visible_entries = file_dialog_visible_rows(area);
             let start = file_dialog_view_start(*selected, entries.len(), visible_entries);
@@ -1156,21 +1260,46 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
                 } else {
                     " Open File "
                 },
-                format!(
-                    "Folder: {}\nPath: {input}\n{listing}\n{}",
-                    directory.display(),
+                Text::from(format!(
+                    "Path: {input}\n{listing}\n{}",
                     error.as_deref().unwrap_or(if *save_as {
                         "Type a filename and press Enter to save, Right opens the selected folder, Left goes up, and Esc cancels."
                     } else {
                         "Up/Down selects, Enter/Right opens, Left goes up, Ctrl+Enter submits the path, and Esc cancels."
                     })
-                ),
+                )),
+            )
+        }
+        Overlay::ExplorerCreate {
+            directory,
+            name,
+            entries,
+            selected,
+            create_directory,
+            error,
+        } => {
+            let path = explorer_create_path_label(&application.explorer.root, directory);
+            let listing = entries
+                .iter()
+                .enumerate()
+                .take(8)
+                .map(|(index, entry)| format!("{} {}/", if index == *selected { ">" } else { " " }, entry.file_name().unwrap_or_default().to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (
+                if *create_directory { " New Folder " } else { " New File " },
+                Text::from(format!(
+                    "Path: {path}\nName: {name}\n\n{listing}\n\nEnter creates, Right enters a folder, Left goes up, and Esc cancels.{}",
+                    error.as_deref().map_or(String::new(), |message| format!("\n{message}"))
+                )),
             )
         }
         Overlay::Settings {
             query,
             scope,
             selected,
+            editing,
+            new_value,
         } => {
             let normalized_query = query.to_lowercase();
             let defaults = crate::config::Config::default();
@@ -1195,22 +1324,52 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
                         .get(key.split('.').next().unwrap_or(key))
                         .copied()
                         .unwrap_or(crate::config::ConfigScope::Default);
+                    let value = if *editing == Some(index) {
+                        let choices = setting_choice_hint(key);
+                        if choices.is_empty() {
+                            new_value.clone()
+                        } else {
+                            format!("{new_value} [{choices}]")
+                        }
+                    } else {
+                        application.config.effective.get_setting_value(key)
+                    };
                     format!(
                         "{} {key} = {} (default {}, {source:?})",
                         if *selected == index { ">" } else { " " },
-                        setting_value(&application.config.effective, key),
-                        setting_value(&defaults, key),
+                        value,
+                        defaults.get_setting_value(key),
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
-            (
-                " Settings ",
-                format!(
-                    "Scope: {scope:?}  {} Search: {query}\n\n{listing}\n\nUp/Down selects, Ctrl+R resets, Tab changes scope, Enter opens configuration or the theme picker, and Esc closes.",
+                .collect::<Vec<_>>();
+            let search = if query.is_empty() {
+                Line::from(vec![
+                    Span::raw(format!(
+                        "Scope: {scope:?}  {} Search: ",
+                        application.theme.icons.search
+                    )),
+                    Span::styled(
+                        "type to search",
+                        Style::default()
+                            .fg(application.theme.colors.muted)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ])
+            } else {
+                Line::raw(format!(
+                    "Scope: {scope:?}  {} Search: {query}",
                     application.theme.icons.search
+                ))
+            };
+            let mut lines = vec![search, Line::raw("")];
+            lines.extend(listing.into_iter().map(Line::raw));
+            lines.extend([
+                Line::raw(""),
+                Line::raw(
+                    "Up/Down selects, Ctrl+R resets, Tab changes scope, Enter to edit, Ctrl+Enter saves, Esc cancels or closes.",
                 ),
-            )
+            ]);
+            (" Settings ", Text::from(lines))
         }
         Overlay::ThemePicker { scope, selected } => {
             let entries = application.theme_registry.entries().collect::<Vec<_>>();
@@ -1250,40 +1409,45 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
                 });
             (
                 " Themes ",
-                format!(
+                Text::from(format!(
                     "Scope: {scope:?}  Active: {}\n\n{listing}{discovery}\n\nUp/Down selects, Enter applies, R rescans, and Esc cancels.",
                     application.theme.id
-                ),
+                )),
             )
         }
-        Overlay::Message { title, message } => (title.as_str(), message.clone()),
+        Overlay::Help { .. } => {
+            (
+                " Help ",
+                Text::from(help_text(application)),
+            )
+        }
+        Overlay::Message { title, message } => (title.as_str(), Text::from(message.clone())),
         Overlay::ConfirmQuit => (
             " Unsaved Changes ",
-            "Modified documents remain. Press Ctrl+Q again to discard and exit, or Esc to cancel.".to_owned(),
+            Text::from("Modified documents remain. Press Ctrl+Q again to discard and exit, or Esc to cancel."),
         ),
         Overlay::ConfirmTerminateAll => (
             " Live Terminals ",
-            "Live terminal processes remain. Press T to terminate them and exit, or Esc to cancel."
-                .to_owned(),
+            Text::from("Live terminal processes remain. Press T to terminate them and exit, or Esc to cancel."),
         ),
         Overlay::ConfirmTerminalClose => (
             " Live Terminal ",
-            "Press T to terminate the live terminal process, or Esc to cancel.".to_owned(),
+            Text::from("Press T to terminate the live terminal process, or Esc to cancel."),
         ),
         Overlay::ConfirmDocumentClose => (
             " Unsaved Document ",
-            "Press S to save, D to discard, or Esc to cancel.".to_owned(),
+            Text::from("Press S to save, D to discard, or Esc to cancel."),
         ),
         Overlay::SaveConflict => (
             " File Changed Externally ",
-            "Press O to overwrite the file, or Esc to cancel. Save As is available from the file dialog.".to_owned(),
+            Text::from("Press O to overwrite the file, or Esc to cancel. Save As is available from the file dialog."),
         ),
         Overlay::ConfirmSaveAsOverwrite { path, .. } => (
             " File Already Exists ",
-            format!(
+            Text::from(format!(
                 "{} already exists. Press O to overwrite it, or Esc to cancel.",
                 path.display()
-            ),
+            )),
         ),
     };
     frame.render_widget(Clear, to_tui(area));
@@ -1310,29 +1474,66 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
     } else {
         paragraph.wrap(Wrap { trim: false })
     };
+    let paragraph = if let Overlay::Help { scroll } = overlay {
+        paragraph.scroll((u16::try_from(*scroll).unwrap_or(u16::MAX), 0))
+    } else {
+        paragraph
+    };
     frame.render_widget(paragraph, to_tui(area));
 }
 
-fn setting_value(config: &crate::config::Config, dotted_key: &str) -> String {
-    let Ok(mut value) = toml::Value::try_from(config) else {
-        return "unavailable".to_owned();
-    };
-    for segment in dotted_key.split('.') {
-        let Some(next) = value.get(segment).cloned() else {
-            return "unavailable".to_owned();
-        };
-        value = next;
+pub fn help_line_count(application: &Application) -> usize {
+    help_text(application).lines().count()
+}
+
+fn help_text(application: &Application) -> String {
+    let bindings = application
+        .config
+        .effective
+        .keybindings
+        .iter()
+        .filter(|(shortcut, _)| {
+            !matches!(shortcut.as_str(), "ctrl+c" | "ctrl+x" | "ctrl+v" | "ctrl+g")
+        })
+        .map(|(shortcut, command)| format!("  {shortcut:<16} {command}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Keybindings\n\n{bindings}\n\nNavigation\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Esc              Close dialog\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent"
+    )
+}
+
+fn explorer_create_path_label(workspace_root: &Path, directory: &Path) -> String {
+    let workspace_name = workspace_root
+        .file_name()
+        .unwrap_or(workspace_root.as_os_str())
+        .to_string_lossy();
+    let relative = directory.strip_prefix(workspace_root).unwrap_or(Path::new(""));
+    if relative.as_os_str().is_empty() {
+        format!("{workspace_name}/")
+    } else {
+        format!("{workspace_name}/{}/", relative.display())
     }
-    value.to_string()
+}
+
+fn setting_choice_hint(key: &str) -> &'static str {
+    match key {
+        "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar"
+        | "editor.soft_wrap" | "explorer.visible" | "mouse.enabled" | "clipboard.osc52"
+        | "terminal.allow_child_osc52_write" | "ui.bottom_terminal_visible" => "true | false",
+        "editor.default_line_ending" => "lf | crlf",
+        "editor.header_style" => "tabs | breadcrumbs",
+        _ => "",
+    }
 }
 
 pub fn overlay_area(screen: Rect, overlay: &Overlay) -> Rect {
     let width = screen.width.saturating_sub(4).clamp(1, 70);
     let height = match overlay {
-        Overlay::Settings { .. } | Overlay::ThemePicker { .. } => {
+        Overlay::Settings { .. } | Overlay::ThemePicker { .. } | Overlay::Help { .. } => {
             screen.height.saturating_sub(4).clamp(3, 18)
         }
-        Overlay::FileDialog { .. } => screen
+        Overlay::FileDialog { .. } | Overlay::ExplorerCreate { .. } => screen
             .height
             .saturating_sub(4)
             .clamp(7, 20)
@@ -1377,10 +1578,26 @@ fn from_tui(rect: TuiRect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
     use crate::Application;
+
+    #[test]
+    fn explorer_creation_path_includes_workspace_name() {
+        let root = Path::new("/workspace/terminal-editor");
+
+        assert_eq!(
+            explorer_create_path_label(root, root),
+            "terminal-editor/"
+        );
+        assert_eq!(
+            explorer_create_path_label(root, &root.join("src/app")),
+            "terminal-editor/src/app/"
+        );
+    }
 
     #[test]
     fn responsive_regions_collapse_in_expected_order() {
@@ -1442,6 +1659,55 @@ mod tests {
             }
         );
         assert_eq!(explorer_rows(area, 2, false).entries_start, 5);
+    }
+
+    #[test]
+    fn explorer_root_action_hit_targets_match_compact_icon_positions() {
+        let area = Rect {
+            x: 4,
+            y: 2,
+            width: 24,
+            height: 20,
+        };
+        let row = explorer_rows(area, 0, false).root;
+        let right = area.x.saturating_add(area.width.saturating_sub(2));
+
+        assert_eq!(
+            explorer_root_action_at(area, 0, false, right.saturating_sub(4), row),
+            Some(ExplorerRootAction::NewFile)
+        );
+        assert_eq!(
+            explorer_root_action_at(area, 0, false, right.saturating_sub(2), row),
+            Some(ExplorerRootAction::NewFolder)
+        );
+        assert_eq!(
+            explorer_root_action_at(area, 0, false, right, row),
+            Some(ExplorerRootAction::Refresh)
+        );
+        assert_eq!(
+            explorer_root_action_at(area, 0, false, right.saturating_sub(3), row),
+            None
+        );
+    }
+
+    #[test]
+    fn explorer_width_expands_for_workspace_name_and_actions() {
+        let mut application = Application::new_for_test();
+        application.explorer.root = PathBuf::from("workspace-with-a-long-name");
+        let geometry = geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        );
+        let explorer = geometry.explorer.unwrap();
+
+        assert!(explorer.width > application.config.effective.explorer.width);
+        assert_eq!(explorer.width, explorer_required_width(&application));
+        assert!(geometry.workspace.width >= MINIMUM_WORKSPACE_WIDTH);
     }
 
     #[test]
@@ -1580,6 +1846,8 @@ mod tests {
             query: String::new(),
             scope: crate::config::ConfigScope::User,
             selected: 0,
+            editing: None,
+            new_value: String::new(),
         });
         application.focus_owner = FocusOwner::Overlay;
         terminal.draw(|frame| draw(frame, &application)).unwrap();
@@ -1735,6 +2003,10 @@ mod tests {
     fn collapsed_open_editors_hides_documents_and_uses_the_root_name() {
         let mut application = Application::new_for_test();
         application.explorer.open_editors_expanded = false;
+        application.theme.icons.explorer_new_file = "1".to_owned();
+        application.theme.icons.explorer_new_folder = "2".to_owned();
+        application.theme.icons.explorer_refresh = "3".to_owned();
+        application.explorer.root = PathBuf::from("root");
         let root_name = application
             .explorer
             .root
@@ -1767,9 +2039,42 @@ mod tests {
         )));
         assert!(row_text(area.y + 2).trim().is_empty());
         assert!(row_text(area.y + 3).trim().contains(&root_name));
+        assert!(row_text(area.y + 3).contains("1 2 3"));
+        let root_row = row_text(area.y + 3);
+        let action_start = root_row.find('1').unwrap();
+        assert_eq!(root_row.as_bytes()[action_start - 1], b' ');
         assert!(!row_text(area.y + 1).contains("Untitled"));
         let root_cell = buffer.cell((area.x + 1, area.y + 3)).unwrap();
         assert!(root_cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn explorer_root_actions_remain_visible_when_workspace_name_is_wide() {
+        let mut application = Application::new_for_test();
+        application.explorer.open_editors_expanded = false;
+        application.explorer.root = PathBuf::from("workspace-name-that-cannot-fit-in-the-explorer-header");
+        application.theme.icons.explorer_new_file = "1".to_owned();
+        application.theme.icons.explorer_new_folder = "2".to_owned();
+        application.theme.icons.explorer_refresh = "3".to_owned();
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &application)).unwrap();
+        let area = geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 30,
+            },
+        )
+        .explorer
+        .unwrap();
+        let row_text = (area.x.saturating_add(1)..area.x.saturating_add(area.width.saturating_sub(1)))
+            .map(|column| terminal.backend().buffer().cell((column, area.y + 3)).unwrap().symbol())
+            .collect::<String>();
+
+        assert!(row_text.contains("1 2 3"));
+        assert!(row_text.contains(application.theme.icons.overflow.as_str()));
     }
 
     #[test]
@@ -2305,6 +2610,30 @@ mod tests {
             .collect::<String>();
         assert!(open_editor_row.contains("Untitled"));
         assert!(!open_editor_row.contains(&application.theme.icons.file_default));
+    }
+
+    #[test]
+    fn status_bar_renders_git_branch_when_available() {
+        let application = Application::new_for_test();
+        let git_dir = application.explorer.root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &application)).unwrap();
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let status_y = bounds.height - 1;
+        let buffer = terminal.backend().buffer();
+        let status_row = (0..bounds.width)
+            .map(|col| buffer.cell((col, status_y)).unwrap().symbol())
+            .collect::<String>();
+        assert!(status_row.contains("EDIT"));
+        assert!(status_row.contains("main"));
     }
 
     #[test]

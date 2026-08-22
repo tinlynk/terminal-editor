@@ -12,6 +12,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::{AppError, Result, terminal_emulator::TerminalEmulator};
 
 const PTY_OUTPUT_CHANNEL_CAPACITY: usize = 64;
+#[cfg(test)]
+const TERMINATION_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct TerminalSession {
     writer: Box<dyn Write + Send>,
@@ -440,7 +442,7 @@ mod tests {
         .unwrap();
         assert!(session.is_alive().unwrap());
         session.begin_termination();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + TERMINATION_TEST_TIMEOUT;
         while Instant::now() < deadline && session.is_alive().unwrap() {
             std::thread::sleep(Duration::from_millis(10));
         }

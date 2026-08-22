@@ -17,6 +17,7 @@ pub enum Command {
     ToggleExplorer,
     ToggleBottomTerminal,
     OpenSettings,
+    OpenHelp,
     Undo,
     Redo,
     Copy,

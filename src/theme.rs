@@ -83,10 +83,14 @@ pub struct ThemeIcons {
     pub tree_guide_branch: String,
     pub tree_guide_corner: String,
     pub search: String,
+    pub git_branch: String,
     pub modified: String,
     pub scrollbar: String,
     pub scrollbar_horizontal: String,
     pub overflow: String,
+    pub explorer_new_file: String,
+    pub explorer_new_folder: String,
+    pub explorer_refresh: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -424,10 +428,14 @@ fn parse_theme(
                 "tree_guide_branch",
                 "tree_guide_corner",
                 "search",
+                "git_branch",
                 "modified",
                 "scrollbar",
                 "scrollbar_horizontal",
                 "overflow",
+                "explorer_new_file",
+                "explorer_new_folder",
+                "explorer_refresh",
             ],
             "icons",
             &mut diagnostics,
@@ -563,10 +571,14 @@ fn parse_theme(
             tree_guide_branch: icon!(tree_guide_branch, 1, true),
             tree_guide_corner: icon!(tree_guide_corner, 1, true),
             search: icon!(search, 3, false),
+            git_branch: icon!(git_branch, 3, false),
             modified: icon!(modified, 1, true),
             scrollbar: icon!(scrollbar, 1, true),
             scrollbar_horizontal: icon!(scrollbar_horizontal, 1, true),
             overflow: icon!(overflow, 1, true),
+            explorer_new_file: icon!(explorer_new_file, 1, true),
+            explorer_new_folder: icon!(explorer_new_folder, 1, true),
+            explorer_refresh: icon!(explorer_refresh, 1, true),
         },
     };
     Some((theme, diagnostics))
@@ -638,10 +650,14 @@ fn empty_theme() -> Theme {
             tree_guide_branch: String::new(),
             tree_guide_corner: String::new(),
             search: String::new(),
+            git_branch: String::new(),
             modified: String::new(),
             scrollbar: String::new(),
             scrollbar_horizontal: String::new(),
             overflow: String::new(),
+            explorer_new_file: String::new(),
+            explorer_new_folder: String::new(),
+            explorer_refresh: String::new(),
         },
     }
 }
@@ -867,7 +883,11 @@ mod tests {
         assert_eq!(default.theme.icons.folder_open, "▾");
         assert_eq!(default.theme.icons.folder_closed, "▸");
         assert_eq!(default.theme.icons.file_default, "•");
+        assert_eq!(default.theme.icons.git_branch, "⎇");
         assert_eq!(default.theme.icons.scrollbar_horizontal, "▀");
+        assert_eq!(default.theme.icons.explorer_new_file, "+");
+        assert_eq!(default.theme.icons.explorer_new_folder, "+");
+        assert_eq!(default.theme.icons.explorer_refresh, "R");
         assert!(default.diagnostics.is_empty());
     }
 
@@ -889,6 +909,18 @@ mod tests {
             default.theme.icons.tree_collapsed
         );
         assert_eq!(ocean.theme.icons.scrollbar_horizontal, "▄");
+        assert_eq!(
+            ocean.theme.icons.explorer_new_file,
+            default.theme.icons.explorer_new_file
+        );
+        assert_eq!(
+            ocean.theme.icons.explorer_new_folder,
+            default.theme.icons.explorer_new_folder
+        );
+        assert_eq!(
+            ocean.theme.icons.explorer_refresh,
+            default.theme.icons.explorer_refresh
+        );
         assert_eq!(ocean.diagnostics.len(), 2);
     }
 

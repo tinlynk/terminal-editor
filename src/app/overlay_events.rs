@@ -2,10 +2,11 @@ use std::path::Path;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
-use crate::{AppError, Result, config::ConfigScope, layout::Rect, render};
+use crate::{AppError, Result, config::ConfigScope, input::key_sequence, layout::Rect, render};
 
 use super::{
-    Application, FocusOwner, Overlay, SETTINGS_KEYS, file_dialog, move_settings_selection,
+    Application, FocusOwner, Overlay, SETTINGS_KEYS, explorer_create_dialog, file_dialog,
+    move_settings_selection,
 };
 
 impl Application {
@@ -30,6 +31,31 @@ impl Application {
             } else {
                 None
             };
+            if matches!(self.overlay, Some(Overlay::Help { .. })) {
+                let (columns, rows) = crossterm::terminal::size()
+                    .map_err(|error| AppError::io("could not inspect terminal size", error))?;
+                let area = render::overlay_area(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: columns,
+                        height: rows,
+                    },
+                    self.overlay.as_ref().expect("help overlay exists"),
+                );
+                let visible_rows = usize::from(area.height.saturating_sub(2));
+                let maximum = render::help_line_count(self).saturating_sub(visible_rows);
+                if let Some(Overlay::Help { scroll }) = self.overlay.as_mut() {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
+                        MouseEventKind::ScrollDown => {
+                            *scroll = scroll.saturating_add(3).min(maximum)
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(());
+            }
             let mut clicked_entry = false;
             if let Some(Overlay::FileDialog {
                 entries, selected, ..
@@ -63,6 +89,58 @@ impl Application {
             if clicked_entry && click_count.is_some_and(|count| count >= 2) {
                 return self.activate_file_dialog_selection();
             }
+            // Extract query before mutable borrow to avoid conflict
+            let query: String = self.overlay.as_ref().and_then(|o| {
+                if let Overlay::Settings { query, .. } = o {
+                    Some(query.to_lowercase())
+                } else {
+                    None
+                }
+            }).unwrap_or_default();
+
+            if let Some(Overlay::Settings {
+                selected,
+                editing,
+                ..
+            }) = self.overlay.as_mut()
+            {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp if editing.is_none() => {
+                        move_settings_selection(&query, selected, -3);
+                        return Ok(());
+                    }
+                    MouseEventKind::ScrollDown if editing.is_none() => {
+                        move_settings_selection(&query, selected, 3);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if let Some(area) = click_area {
+                    if let MouseEventKind::Down(_) = mouse.kind
+                        && editing.is_none()
+                    {
+                        let content_start = area.y + 2;
+                        let clicked_line = mouse.row.saturating_sub(content_start);
+                        if clicked_line < 12 {
+                            let visible_keys: Vec<&str> = SETTINGS_KEYS
+                                .iter()
+                                .filter(|key| key.to_lowercase().contains(&query))
+                                .copied()
+                                .collect();
+                            let visible_count = 12.min(visible_keys.len());
+                            let start = (*selected)
+                                .saturating_sub(10)
+                                .min(visible_keys.len().saturating_sub(visible_count));
+                            if let Some(index) = visible_keys.get(start.saturating_add(clicked_line as usize))
+                                && let Some(setting_index) = SETTINGS_KEYS.iter().position(|key| *key == *index)
+                            {
+                                *selected = setting_index;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
             return Ok(());
         }
         let Event::Key(key) = event else {
@@ -80,6 +158,12 @@ impl Application {
             ) {
                 self.pending_close_document = None;
             }
+            if let Some(Overlay::Settings { editing, .. }) = self.overlay.as_mut()
+                && editing.is_some()
+            {
+                *editing = None;
+                return Ok(());
+            }
             self.overlay = None;
             self.focus_owner = FocusOwner::Workspace;
             return Ok(());
@@ -95,26 +179,78 @@ impl Application {
                 self.activate_file_dialog_selection()
             };
         }
+        if key.code == KeyCode::Enter && matches!(self.overlay, Some(Overlay::ExplorerCreate { .. })) {
+            return self.submit_explorer_create();
+        }
         if key.code == KeyCode::Enter
             && let Some(Overlay::Settings {
-                scope, selected, ..
-            }) = self.overlay.as_ref()
+                scope, selected, editing, new_value, ..
+            }) = self.overlay.as_mut()
         {
-            if SETTINGS_KEYS[*selected] == "theme.active" {
-                let scope = *scope;
-                self.rescan_themes(true)?;
-                let selected = self
-                    .theme_registry
-                    .entries()
-                    .position(|(id, _)| id == self.config.effective.theme.active)
-                    .unwrap_or(0);
-                self.overlay = Some(Overlay::ThemePicker { scope, selected });
+            // If editing a value, confirm it
+            if let Some(editing_selected) = editing {
+                let key = SETTINGS_KEYS[*editing_selected];
+                let value = new_value.clone();
+                let previous_mouse = self.config.effective.mouse.enabled;
+                let saved = match self.config.set_setting_from_string(*scope, key, &value) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        self.message = Some(format!("Invalid value: {error}"));
+                        false
+                    }
+                };
+                *editing = None;
+                *new_value = String::new();
+                if saved {
+                    self.apply_effective_config(previous_mouse)?;
+                }
                 return Ok(());
             }
-            let path = self.config.ensure_raw_config(*scope)?;
-            self.open_path(&path, None)?;
-            self.overlay = None;
-            self.focus_owner = FocusOwner::Workspace;
+            // Normal Enter: start editing the selected setting
+            {
+                let key = SETTINGS_KEYS[*selected];
+                // theme.active opens theme picker (but we keep it as editable)
+                if key == "theme.active" {
+                    let scope = *scope;
+                    self.rescan_themes(true)?;
+                    let selected = self
+                        .theme_registry
+                        .entries()
+                        .position(|(id, _)| id == self.config.effective.theme.active)
+                        .unwrap_or(0);
+                    self.overlay = Some(Overlay::ThemePicker { scope, selected });
+                    return Ok(());
+                }
+                // Start editing: populate new_value with current value
+                *editing = Some(*selected);
+                let current_value = self.config.effective.get_setting_value(key);
+                *new_value = current_value;
+            }
+            return Ok(());
+        }
+        if let Some((scope, current_key, replacement_key)) = self.overlay.as_ref().and_then(|overlay| {
+            let Overlay::Settings {
+                scope,
+                editing: Some(setting_index),
+                ..
+            } = overlay else {
+                return None;
+            };
+            SETTINGS_KEYS[*setting_index]
+                .strip_prefix("keybindings.")
+                .map(|current_key| (*scope, current_key.to_owned()))
+        }).and_then(|(scope, current_key)| {
+            key_sequence(key).map(|replacement_key| (scope, current_key, replacement_key))
+        }) {
+            let previous_mouse = self.config.effective.mouse.enabled;
+            match self.config.rebind_keybinding(scope, &current_key, &replacement_key) {
+                Ok(()) => self.apply_effective_config(previous_mouse)?,
+                Err(error) => self.message = Some(format!("Invalid keybinding: {error}")),
+            }
+            if let Some(Overlay::Settings { editing, new_value, .. }) = self.overlay.as_mut() {
+                *editing = None;
+                *new_value = String::new();
+            }
             return Ok(());
         }
         if key.code == KeyCode::Enter
@@ -205,31 +341,79 @@ impl Application {
                 }
                 _ => {}
             },
+            Overlay::ExplorerCreate { directory, name, entries, selected, create_directory, .. } => match key.code {
+                KeyCode::Backspace => { name.pop(); }
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => *selected = selected.saturating_add(1).min(entries.len().saturating_sub(1)),
+                KeyCode::Right => {
+                    if let Some(path) = entries.get(*selected) { self.overlay = Some(explorer_create_dialog(path, *create_directory)); }
+                }
+                KeyCode::Left => {
+                    if let Some(parent) = directory.parent().filter(|parent| parent.starts_with(&self.explorer.root)) { self.overlay = Some(explorer_create_dialog(parent, *create_directory)); }
+                }
+                KeyCode::Char(character) if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => name.push(character),
+                _ => {}
+            },
             Overlay::Settings {
                 query,
                 scope,
                 selected,
-            } => match key.code {
-                KeyCode::Backspace => {
-                    query.pop();
-                    move_settings_selection(query, selected, 0);
+                editing,
+                new_value,
+            } => {
+                if editing.is_some() {
+                    // Editing mode: update new_value
+                    match key.code {
+                        KeyCode::Up => cycle_setting_option(
+                            SETTINGS_KEYS[editing.expect("editing state exists")],
+                            new_value,
+                            -1,
+                        ),
+                        KeyCode::Down => cycle_setting_option(
+                            SETTINGS_KEYS[editing.expect("editing state exists")],
+                            new_value,
+                            1,
+                        ),
+                        KeyCode::Backspace => {
+                            new_value.pop();
+                        }
+                        KeyCode::Char(character)
+                            if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+                                && setting_accepts_character(
+                                    SETTINGS_KEYS[editing.expect("editing state exists")],
+                                    new_value,
+                                    character,
+                                ) =>
+                        {
+                            new_value.push(character);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Search mode: update query
+                    match key.code {
+                        KeyCode::Backspace => {
+                            query.pop();
+                            move_settings_selection(query, selected, 0);
+                        }
+                        KeyCode::Char(character)
+                            if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                        {
+                            query.push(character);
+                            move_settings_selection(query, selected, 0);
+                        }
+                        KeyCode::Tab => {
+                            *scope = match scope {
+                                ConfigScope::User => ConfigScope::Workspace,
+                                ConfigScope::Workspace | ConfigScope::Default => ConfigScope::User,
+                            };
+                        }
+                        KeyCode::Up => move_settings_selection(query, selected, -1),
+                        KeyCode::Down => move_settings_selection(query, selected, 1),
+                        _ => {}
+                    }
                 }
-                KeyCode::Char(character)
-                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
-                {
-                    query.push(character);
-                    move_settings_selection(query, selected, 0);
-                }
-                KeyCode::Tab => {
-                    *scope = match scope {
-                        ConfigScope::User => ConfigScope::Workspace,
-                        ConfigScope::Workspace | ConfigScope::Default => ConfigScope::User,
-                    };
-                }
-                KeyCode::Up => move_settings_selection(query, selected, -1),
-                KeyCode::Down => move_settings_selection(query, selected, 1),
-                _ => {}
-            },
+            }
             Overlay::ThemePicker { selected, .. } => match key.code {
                 KeyCode::Up => *selected = selected.saturating_sub(1),
                 KeyCode::Down => {
@@ -288,6 +472,7 @@ impl Application {
                 self.finish_successful_save(document_id)?;
             }
             Overlay::Message { .. }
+            | Overlay::Help { .. }
             | Overlay::ConfirmQuit
             | Overlay::ConfirmTerminateAll
             | Overlay::ConfirmTerminalClose
@@ -297,4 +482,46 @@ impl Application {
         }
         Ok(())
     }
+}
+
+fn setting_accepts_character(key: &str, value: &str, character: char) -> bool {
+    const INTEGER_SETTINGS: &[&str] = &[
+        "editor.indent_width",
+        "editor.undo_limit_mib",
+        "workspace.minimum_pane_width",
+        "workspace.minimum_pane_height",
+        "explorer.width",
+        "explorer.refresh_interval_seconds",
+        "terminal.scrollback_lines",
+        "ui.bottom_terminal_height",
+    ];
+    if INTEGER_SETTINGS.contains(&key) {
+        return character.is_ascii_digit();
+    }
+    if key == "workspace.initial_split_ratio" {
+        return character.is_ascii_digit() || (character == '.' && !value.contains('.'));
+    }
+    true
+}
+
+pub(crate) fn setting_options(key: &str) -> Option<&'static [&'static str]> {
+    match key {
+        "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar"
+        | "editor.soft_wrap" | "explorer.visible" | "mouse.enabled" | "clipboard.osc52"
+        | "terminal.allow_child_osc52_write" | "ui.bottom_terminal_visible" => {
+            Some(&["true", "false"])
+        }
+        "editor.default_line_ending" => Some(&["lf", "crlf"]),
+        "editor.header_style" => Some(&["tabs", "breadcrumbs"]),
+        _ => None,
+    }
+}
+
+fn cycle_setting_option(key: &str, value: &mut String, direction: isize) {
+    let Some(options) = setting_options(key) else {
+        return;
+    };
+    let index = options.iter().position(|option| *option == value).unwrap_or(0);
+    let next = index.saturating_add_signed(direction).min(options.len().saturating_sub(1));
+    *value = options[next].to_owned();
 }

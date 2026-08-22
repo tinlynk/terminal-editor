@@ -83,6 +83,10 @@ impl InputMapper {
             self.cancel_leader();
             return Command::OpenSettings;
         }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('h') {
+            self.cancel_leader();
+            return Command::OpenHelp;
+        }
         if self.leader_pending_since.is_some() {
             self.cancel_leader();
             if key.code == KeyCode::Esc {
@@ -97,11 +101,10 @@ impl InputMapper {
         if terminal_focused {
             return Command::Insert(key_to_terminal_bytes(key));
         }
-        if let Some(command) = key_sequence(key)
-            .and_then(|sequence| self.bindings.get(&sequence))
-            .and_then(|command| named_command(command))
+        if let Some(sequence) = key_sequence(key)
+            && let Some(command) = self.bindings.get(&sequence)
         {
-            return command;
+            return named_command(command).unwrap_or(Command::NoOp);
         }
         let selecting = key.modifiers.contains(KeyModifiers::SHIFT);
         match (key.modifiers, key.code) {
@@ -194,7 +197,7 @@ fn named_command(name: &str) -> Option<Command> {
     }
 }
 
-fn key_sequence(key: KeyEvent) -> Option<String> {
+pub(crate) fn key_sequence(key: KeyEvent) -> Option<String> {
     let key_name = match key.code {
         KeyCode::Char(character) => character.to_ascii_lowercase().to_string(),
         KeyCode::Enter => "enter".to_owned(),

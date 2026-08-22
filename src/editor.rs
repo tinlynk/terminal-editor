@@ -599,7 +599,7 @@ mod tests {
     use crate::config::LineEnding;
 
     fn document(text: &str) -> Document {
-        Document::new(text, None, LineEnding::Lf, 1024)
+        Document::new(text, None, LineEnding::Lf, 1024, "UTF-8")
     }
 
     #[test]
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn newline_preserves_crlf_convention() {
-        let mut document = Document::new("a\r\nb", None, LineEnding::Lf, 1024);
+        let mut document = Document::new("a\r\nb", None, LineEnding::Lf, 1024, "UTF-8");
         let mut view = EditorView {
             cursor: 1,
             ..EditorView::default()

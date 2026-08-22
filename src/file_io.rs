@@ -61,7 +61,7 @@ impl DocumentRegistry {
         let id = self.allocate_id();
         self.documents.insert(
             id,
-            Document::new("", None, self.default_line_ending, self.history_limit),
+            Document::new("", None, self.default_line_ending, self.history_limit, "UTF-8"),
         );
         id
     }
@@ -75,6 +75,7 @@ impl DocumentRegistry {
                 Some(absolute_path(&path)?),
                 self.default_line_ending,
                 self.history_limit,
+                "UTF-8",
             ),
         );
         Ok(id)
@@ -95,18 +96,19 @@ impl DocumentRegistry {
         let bytes = fs::read(&canonical).map_err(|error| {
             AppError::io(format!("could not read {}", canonical.display()), error)
         })?;
-        let text = String::from_utf8(bytes).map_err(|error| {
-            AppError::Arguments(format!(
-                "{} is not valid UTF-8: {error}",
-                canonical.display()
-            ))
-        })?;
+        let text = String::from_utf8_lossy(&bytes);
+        let encoding = if matches!(text, std::borrow::Cow::Borrowed(_)) {
+            "UTF-8"
+        } else {
+            "Binary"
+        };
         let id = self.allocate_id();
         let document = Document::new(
             &text,
             Some(canonical.clone()),
             self.default_line_ending,
             self.history_limit,
+            encoding,
         );
         self.snapshots.insert(id, snapshot(&canonical)?);
         self.canonical_paths.insert(canonical, id);
@@ -221,6 +223,7 @@ impl DocumentRegistry {
                 Some(path.clone()),
                 self.default_line_ending,
                 self.history_limit,
+                "UTF-8",
             ),
         );
         self.snapshots.insert(id, snapshot(&path)?);
@@ -348,16 +351,17 @@ mod tests {
     }
 
     #[test]
-    fn opening_invalid_utf8_returns_an_error_without_registering_a_document() {
+    fn opening_binary_file_succeeds_with_binary_encoding() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("binary.dat");
-        fs::write(&path, [0xff, 0xfe]).unwrap();
+        fs::write(&path, [0xff, 0xfe, 0x00, 0x41]).unwrap();
         let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
 
-        let error = registry.open(&path).unwrap_err();
+        let (id, _) = registry.open(&path).unwrap();
 
-        assert!(error.to_string().contains("not valid UTF-8"));
-        assert_eq!(registry.iter().count(), 0);
+        let document = registry.get(id);
+        assert_eq!(document.encoding, "Binary");
+        assert_eq!(registry.iter().count(), 1);
     }
 
     #[test]

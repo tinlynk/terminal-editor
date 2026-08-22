@@ -5,6 +5,7 @@ use std::{
 };
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{AppError, Result};
 
@@ -22,6 +23,8 @@ pub struct Explorer {
     pub root: PathBuf,
     pub visible: bool,
     pub selected: usize,
+    pub viewport_row: usize,
+    pub viewport_column: usize,
     pub open_editors_expanded: bool,
     pub open_editors_header_selected: bool,
     expanded: BTreeSet<PathBuf>,
@@ -36,6 +39,8 @@ impl Explorer {
             root,
             visible,
             selected: 0,
+            viewport_row: 0,
+            viewport_column: 0,
             open_editors_expanded: true,
             open_editors_header_selected: false,
             expanded: BTreeSet::new(),
@@ -72,6 +77,20 @@ impl Explorer {
             .min(self.entries.len().saturating_sub(1));
     }
 
+    pub fn scroll_vertical(&mut self, delta: isize) {
+        self.viewport_row = self
+            .viewport_row
+            .saturating_add_signed(delta)
+            .min(self.entries.len().saturating_sub(1));
+    }
+
+    pub fn scroll_horizontal(&mut self, delta: isize) {
+        self.viewport_column = self
+            .viewport_column
+            .saturating_add_signed(delta)
+            .min(self.maximum_entry_width());
+    }
+
     pub fn toggle_selected(&mut self) -> Result<Option<PathBuf>> {
         if self.open_editors_header_selected {
             self.open_editors_expanded = !self.open_editors_expanded;
@@ -96,10 +115,30 @@ impl Explorer {
         let mut entries = Vec::new();
         self.walk(&self.root, 0, &mut entries)?;
         self.entries = entries;
+        self.viewport_row = self
+            .viewport_row
+            .min(self.entries.len().saturating_sub(1));
         self.selected = selected_path
             .and_then(|path| self.entries.iter().position(|entry| entry.path == path))
             .unwrap_or_else(|| previous_index.min(self.entries.len().saturating_sub(1)));
         Ok(())
+    }
+
+    fn maximum_entry_width(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| {
+                let name = entry.path.file_name().map_or_else(
+                    || entry.path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                2usize
+                    .saturating_mul(entry.depth.saturating_add(1))
+                    .saturating_add(2)
+                    .saturating_add(name.width())
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn set_exclusions(&mut self, exclusions: &[String]) -> Result<()> {
@@ -143,7 +182,15 @@ impl Explorer {
 }
 
 pub fn root_for_startup(startup_path: Option<&Path>, current_directory: &Path) -> PathBuf {
-    match startup_path {
+    let startup_path = startup_path.map(|path| {
+        let path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            current_directory.join(path)
+        };
+        fs::canonicalize(&path).unwrap_or(path)
+    });
+    match startup_path.as_deref() {
         Some(path) if path.is_dir() => path.to_owned(),
         Some(path) => path
             .parent()
@@ -189,6 +236,18 @@ mod tests {
         assert_eq!(
             root_for_startup(Some(Path::new("README.md")), Path::new("/workspace")),
             Path::new("/workspace")
+        );
+    }
+
+    #[test]
+    fn relative_directory_startup_resolves_to_its_actual_name() {
+        let current_directory = tempdir().unwrap();
+        let workspace = current_directory.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+
+        assert_eq!(
+            root_for_startup(Some(Path::new("workspace")), current_directory.path()),
+            workspace
         );
     }
 
@@ -247,6 +306,21 @@ mod tests {
         assert!(!explorer.open_editors_expanded);
         explorer.move_selection(1);
         assert!(!explorer.open_editors_header_selected);
+    }
+
+    #[test]
+    fn scroll_offsets_are_bounded_to_explorer_content() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("long-file-name.txt"), "text").unwrap();
+        let mut explorer = Explorer::new(directory.path().to_owned(), true, &[]).unwrap();
+
+        explorer.scroll_vertical(5);
+        explorer.scroll_horizontal(5);
+
+        assert_eq!(explorer.viewport_row, 0);
+        assert_eq!(explorer.viewport_column, 5);
+        explorer.scroll_horizontal(-10);
+        assert_eq!(explorer.viewport_column, 0);
     }
 
     #[cfg(unix)]

@@ -156,7 +156,7 @@ file_default = "•"
 
 Colors accept `default`, the sixteen ANSI color names, or `#RRGGBB` values without alpha.
 
-The available color and icon keys are documented by the complete repository default theme. Panel controls have `_visible` and `_hidden` icon values, while the Settings action has one `settings` value.
+The available color and icon keys are documented by the complete repository default theme. Panel controls have `_visible` and `_hidden` icon values, while the Settings action has one `settings` value. Explorer root actions use `explorer_new_file`, `explorer_new_folder`, and `explorer_refresh`; their defaults are portable ASCII glyphs.
 
 Theme files are limited to 256 KiB, must contain UTF-8 TOML, and cannot change child-process ANSI, indexed, RGB, inverse, or default terminal color behavior.
 

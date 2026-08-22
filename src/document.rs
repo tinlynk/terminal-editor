@@ -47,6 +47,7 @@ impl Edit {
 pub struct Document {
     text: Rope,
     line_width_frequencies: BTreeMap<usize, usize>,
+    pub encoding: &'static str,
     pub path: Option<PathBuf>,
     pub line_ending: LineEnding,
     revision: u64,
@@ -65,12 +66,14 @@ impl Document {
         path: Option<PathBuf>,
         default_line_ending: LineEnding,
         history_limit: usize,
+        encoding: &'static str,
     ) -> Self {
         let line_ending = detect_line_ending(text).unwrap_or(default_line_ending);
         Self {
             text: Rope::from_str(text),
             line_width_frequencies: initial_line_width_frequencies(text),
             path,
+            encoding,
             line_ending,
             revision: 0,
             saved_revision: 0,
@@ -391,7 +394,7 @@ mod tests {
     use super::*;
 
     fn document(text: &str) -> Document {
-        Document::new(text, None, LineEnding::Lf, 1024)
+        Document::new(text, None, LineEnding::Lf, 1024, "UTF-8")
     }
 
     #[test]
@@ -454,7 +457,7 @@ mod tests {
 
     #[test]
     fn oversized_latest_edit_is_retained_alone() {
-        let mut document = Document::new("", None, LineEnding::Lf, 2);
+        let mut document = Document::new("", None, LineEnding::Lf, 2, "UTF-8");
         document.insert(0, "small");
         assert_eq!(document.undo(), Some(0));
         assert!(document.is_empty());
@@ -462,7 +465,7 @@ mod tests {
 
     #[test]
     fn detects_crlf_without_normalizing_content() {
-        let document = Document::new("one\r\ntwo\r\n", None, LineEnding::Lf, 1024);
+        let document = Document::new("one\r\ntwo\r\n", None, LineEnding::Lf, 1024, "UTF-8");
         assert_eq!(document.line_ending, LineEnding::Crlf);
         assert_eq!(document.text(), "one\r\ntwo\r\n");
     }

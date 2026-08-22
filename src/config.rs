@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::{AppError, Result};
 
@@ -197,6 +197,45 @@ impl Default for Config {
             ui: UiConfig::default(),
             theme: ThemeConfig::default(),
             keybindings: default_keybindings(),
+        }
+    }
+}
+
+impl Config {
+    pub fn get_setting_value(&self, dotted_key: &str) -> String {
+        match dotted_key {
+            "editor.indent_width" => self.editor.indent_width.to_string(),
+            "editor.insert_spaces" => self.editor.insert_spaces.to_string(),
+            "editor.default_line_ending" => match self.editor.default_line_ending {
+                LineEnding::Lf => "lf".to_owned(),
+                LineEnding::Crlf => "crlf".to_owned(),
+            },
+            "editor.undo_limit_mib" => self.editor.undo_limit_mib.to_string(),
+            "editor.line_numbers" => self.editor.line_numbers.to_string(),
+            "editor.scrollbar" => self.editor.scrollbar.to_string(),
+            "editor.soft_wrap" => self.editor.soft_wrap.to_string(),
+            "editor.header_style" => match self.editor.header_style {
+                EditorHeaderStyle::Tabs => "tabs".to_owned(),
+                EditorHeaderStyle::Breadcrumbs => "breadcrumbs".to_owned(),
+            },
+            "workspace.minimum_pane_width" => self.workspace.minimum_pane_width.to_string(),
+            "workspace.minimum_pane_height" => self.workspace.minimum_pane_height.to_string(),
+            "workspace.initial_split_ratio" => self.workspace.initial_split_ratio.to_string(),
+            "explorer.visible" => self.explorer.visible.to_string(),
+            "explorer.width" => self.explorer.width.to_string(),
+            "explorer.exclusions" => self.explorer.exclusions.join(", "),
+            "explorer.refresh_interval_seconds" => self.explorer.refresh_interval_seconds.to_string(),
+            "mouse.enabled" => self.mouse.enabled.to_string(),
+            "clipboard.osc52" => self.clipboard.osc52.to_string(),
+            "terminal.shell" => self.terminal.shell.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            "terminal.arguments" => self.terminal.arguments.join(", "),
+            "terminal.scrollback_lines" => self.terminal.scrollback_lines.to_string(),
+            "terminal.allow_child_osc52_write" => self.terminal.allow_child_osc52_write.to_string(),
+            "terminal.leader" => self.terminal.leader.clone(),
+            "ui.bottom_terminal_visible" => self.ui.bottom_terminal_visible.to_string(),
+            "ui.bottom_terminal_height" => self.ui.bottom_terminal_height.to_string(),
+            "theme.active" => self.theme.active.clone(),
+            key => self.keybindings.get(key).cloned().unwrap_or_default(),
         }
     }
 }
@@ -473,6 +512,139 @@ impl LoadedConfig {
         atomic_config_write(&path, document.to_string().as_bytes())?;
         *self = Self::load_paths(self.user_path.clone(), self.workspace_path.clone())?;
         Ok(())
+    }
+
+    pub fn set_setting_from_string(&mut self, scope: ConfigScope, dotted_key: &str, value: &str) -> Result<()> {
+        if scope == ConfigScope::Default {
+            return Err(AppError::Arguments(
+                "default settings cannot be modified".to_owned(),
+            ));
+        }
+        if dotted_key.starts_with("terminal.") && scope == ConfigScope::Workspace {
+            return Err(AppError::Arguments(
+                "terminal settings are restricted to user configuration".to_owned(),
+            ));
+        }
+        let path = match scope {
+            ConfigScope::User => self.user_path.clone(),
+            ConfigScope::Workspace => self.workspace_path.clone(),
+            ConfigScope::Default => unreachable!(),
+        };
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(AppError::io(
+                    format!("could not read {}", path.display()),
+                    error,
+                ));
+            }
+        };
+        let mut document = if text.is_empty() {
+            DocumentMut::new()
+        } else {
+            text.parse::<DocumentMut>()
+                .map_err(|error| AppError::Config {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?
+        };
+        let value = Item::Value(parsed_setting_value(dotted_key, value)?);
+        let segments: Vec<&str> = dotted_key.split('.').collect();
+        let mut table = document.as_table_mut();
+        for segment in &segments[..segments.len() - 1] {
+            let item = table.entry(segment)
+                .or_insert_with(|| Item::Table(Table::new()));
+            table = item.as_table_mut().ok_or_else(|| AppError::Config {
+                path: path.clone(),
+                message: format!("`{segment}` must be a table"),
+            })?;
+        }
+        let leaf = *segments.last().ok_or_else(|| AppError::Arguments("setting key must not be empty".to_owned()))?;
+        table[leaf] = value;
+        atomic_config_write(&path, document.to_string().as_bytes())?;
+        *self = Self::load_paths(self.user_path.clone(), self.workspace_path.clone())?;
+        Ok(())
+    }
+
+    pub fn rebind_keybinding(
+        &mut self,
+        scope: ConfigScope,
+        current_key: &str,
+        replacement_key: &str,
+    ) -> Result<()> {
+        let command = self
+            .effective
+            .keybindings
+            .get(current_key)
+            .cloned()
+            .ok_or_else(|| AppError::Arguments(format!("no command is bound to `{current_key}`")))?;
+        self.set_setting_from_string(scope, &format!("keybindings.{current_key}"), "disabled")?;
+        self.set_setting_from_string(scope, &format!("keybindings.{replacement_key}"), &command)
+    }
+}
+
+fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
+    let trimmed = value.trim();
+    match dotted_key {
+        "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar" | "editor.soft_wrap"
+        | "explorer.visible" | "mouse.enabled" | "clipboard.osc52" | "terminal.allow_child_osc52_write"
+        | "ui.bottom_terminal_visible" => {
+            match trimmed {
+                "true" | "yes" | "1" => Ok(Value::from(true)),
+                "false" | "no" | "0" => Ok(Value::from(false)),
+                _ => Err(AppError::Arguments(format!(
+                    "expected boolean value for `{dotted_key}`, got `{trimmed}`"
+                ))),
+            }
+        }
+        "editor.indent_width" => {
+            trimmed.parse::<i64>().map(Value::from).map_err(|_| {
+                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
+            })
+        }
+        "editor.undo_limit_mib" | "terminal.scrollback_lines" => {
+            trimmed.parse::<i64>().map(Value::from).map_err(|_| {
+                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
+            })
+        }
+        "workspace.minimum_pane_width" | "workspace.minimum_pane_height" | "explorer.width" | "ui.bottom_terminal_height" => {
+            trimmed.parse::<i64>().map(Value::from).map_err(|_| {
+                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
+            })
+        }
+        "workspace.initial_split_ratio" => {
+            trimmed.parse::<f64>().map(Value::from).map_err(|_| {
+                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
+            })
+        }
+        "explorer.refresh_interval_seconds" => {
+            trimmed.parse::<i64>().map(Value::from).map_err(|_| {
+                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
+            })
+        }
+        "editor.default_line_ending" => {
+            match trimmed {
+                "lf" | "LF" => Ok(Value::from("lf")),
+                "crlf" | "CRLF" => Ok(Value::from("crlf")),
+                _ => Ok(Value::from(trimmed)),
+            }
+        }
+        "editor.header_style" => {
+            match trimmed {
+                "tabs" | "Tabs" => Ok(Value::from("tabs")),
+                "breadcrumbs" | "Breadcrumbs" => Ok(Value::from("breadcrumbs")),
+                _ => Ok(Value::from(trimmed)),
+            }
+        }
+        "explorer.exclusions" | "terminal.arguments" => {
+            let mut array = Array::new();
+            for item in trimmed.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+                array.push(item);
+            }
+            Ok(Value::Array(array))
+        }
+        _ => Ok(Value::from(trimmed)),
     }
 }
 
@@ -904,7 +1076,13 @@ fn apply_scope(
         provenance.insert("theme".to_owned(), scope);
     }
     if let Some(bindings) = partial.keybindings {
-        config.keybindings.extend(bindings);
+        for (key, command) in bindings {
+            if command == "disabled" {
+                config.keybindings.remove(&key);
+            } else {
+                config.keybindings.insert(key, command);
+            }
+        }
         provenance.insert("keybindings".to_owned(), scope);
     }
     if let Some(terminal) = partial.terminal {
@@ -1018,7 +1196,7 @@ fn valid_keybinding(sequence: &str, command: &str) -> bool {
         "toggle-terminal",
         "toggle-explorer",
     ];
-    !sequence.trim().is_empty() && COMMANDS.contains(&command)
+    !sequence.trim().is_empty() && (command == "disabled" || COMMANDS.contains(&command))
 }
 
 fn default_provenance() -> BTreeMap<String, ConfigScope> {
@@ -1283,5 +1461,23 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.effective.theme.active, "default");
         assert_eq!(loaded.provenance["theme"], ConfigScope::Default);
+    }
+
+    #[test]
+    fn rebinding_disables_the_inherited_shortcut() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        let mut loaded = LoadedConfig::load_paths(user_path.clone(), workspace_path).unwrap();
+
+        loaded
+            .rebind_keybinding(ConfigScope::User, "ctrl+s", "ctrl+k")
+            .unwrap();
+
+        assert!(!loaded.effective.keybindings.contains_key("ctrl+s"));
+        assert_eq!(loaded.effective.keybindings["ctrl+k"], "save");
+        let text = fs::read_to_string(user_path).unwrap();
+        assert!(text.contains("\"ctrl+s\" = \"disabled\""));
+        assert!(text.contains("\"ctrl+k\" = \"save\""));
     }
 }
