@@ -66,7 +66,7 @@ impl Application {
                 view.viewport_wrap_segment = 0;
             }
         }
-        if let Some(session) = self.bottom_terminal.as_mut() {
+        for session in &mut self.bottom_terminals {
             session.apply_runtime_config(
                 self.config.effective.terminal.scrollback_lines,
                 self.config.effective.terminal.allow_child_osc52_write,
@@ -76,8 +76,9 @@ impl Application {
             self.pending_mouse_capture = Some(self.config.effective.mouse.enabled);
         }
         let bottom_terminal_visible = self.config.effective.ui.bottom_terminal_visible;
-        if bottom_terminal_visible && self.bottom_terminal.is_none() {
-            self.bottom_terminal = Some(self.spawn_terminal(None)?);
+        if bottom_terminal_visible && self.bottom_terminals.is_empty() {
+            self.bottom_terminals.push(self.spawn_terminal(None)?);
+            self.active_bottom_terminal = 0;
         }
         self.bottom_terminal_visible = bottom_terminal_visible;
         if !self.bottom_terminal_visible && self.focus_owner == FocusOwner::BottomTerminal {

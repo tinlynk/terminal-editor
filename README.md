@@ -2,7 +2,7 @@
 
 TinLynk Terminal Editor is a lightweight terminal-native text editor with an integrated terminal for macOS.
 
-It combines Unicode-aware file editing, tiled editor panes, a file Explorer, and one PTY-backed terminal session.
+It combines Unicode-aware file editing, tiled editor panes, a file Explorer, and up to eight PTY-backed terminal sessions.
 
 ## Requirements
 
@@ -42,14 +42,14 @@ Files that appear to be binary data or a supported archive format require confir
 | `Ctrl+B`, then `H` | Split the editor top and bottom. |
 | `Ctrl+B`, then Arrow | Focus the nearest editor pane in that direction. |
 | `Ctrl+E` | Toggle the Explorer. |
-| `Ctrl+T` | Toggle the persistent bottom terminal. |
+| `Ctrl+T` | Create or toggle the persistent bottom terminal panel. |
 | `Ctrl+G` | Open the searchable settings view. |
 | `Ctrl+H` | Open Help. |
 | `Ctrl+F` | Open Search and Replace for the focused document. |
 | `Ctrl+Z` and `Ctrl+Y` | Undo and redo. |
 | `Ctrl+C`, `Ctrl+X`, and `Ctrl+V` | Copy, cut, and paste with the internal clipboard. |
 
-The in-app Help view reflects the active keybindings. See [the complete controls reference](docs/controls.md) for Explorer, terminal, dialog, mouse, scroll, and leader-key behavior.
+The in-app Help view reflects the active keybindings. Terminal-focused leader commands create, switch, and close terminal sessions; the complete controls reference covers those commands and tab selection in [docs/controls.md](docs/controls.md).
 
 ## Configuration
 

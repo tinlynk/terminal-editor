@@ -12,7 +12,7 @@ use super::{Application, FocusOwner, Overlay, file_dialog};
 
 pub(super) fn request_close(application: &mut Application) -> Result<()> {
     if application.focus_owner == FocusOwner::BottomTerminal {
-        if application.bottom_terminal.is_some() {
+        if application.active_bottom_terminal().is_some() {
             application.overlay = Some(Overlay::ConfirmTerminalClose);
             application.focus_owner = FocusOwner::Overlay;
         }

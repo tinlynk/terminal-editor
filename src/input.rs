@@ -154,6 +154,9 @@ impl InputMapper {
             match key.code {
                 KeyCode::Char('q') => Command::Quit,
                 KeyCode::Char('w') => Command::ClosePane,
+                KeyCode::Char('n') => Command::NewBottomTerminal,
+                KeyCode::Char('[') => Command::PreviousBottomTerminal,
+                KeyCode::Char(']') => Command::NextBottomTerminal,
                 KeyCode::Char('`') => Command::ToggleBottomTerminal,
                 KeyCode::Char('c') => Command::Copy,
                 KeyCode::PageUp => Command::Scroll(-10),
@@ -331,6 +334,24 @@ mod tests {
                     true
                 ),
                 Command::NoOp
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_leader_maps_session_commands() {
+        let mut mapper = InputMapper::default();
+        let leader = Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        let cases = [
+            (KeyCode::Char('n'), Command::NewBottomTerminal),
+            (KeyCode::Char('['), Command::PreviousBottomTerminal),
+            (KeyCode::Char(']'), Command::NextBottomTerminal),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(mapper.map(leader.clone(), true), Command::NoOp);
+            assert_eq!(
+                mapper.map(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), true),
+                expected
             );
         }
     }

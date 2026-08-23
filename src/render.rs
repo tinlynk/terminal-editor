@@ -1160,7 +1160,7 @@ fn pane_block<'a>(application: &Application, pane_id: PaneId, title: Line<'a>) -
 }
 
 fn draw_bottom_terminal(frame: &mut Frame<'_>, application: &Application, area: Rect) {
-    let lines = application.bottom_terminal.as_ref().map_or_else(
+    let lines = application.active_bottom_terminal().map_or_else(
         || vec![Line::raw("Terminal is not running")],
         |session| {
             terminal_lines(
@@ -1182,12 +1182,12 @@ fn draw_bottom_terminal(frame: &mut Frame<'_>, application: &Application, area: 
                 .borders(Borders::ALL)
                 .border_type(application.theme.border_type())
                 .border_style(style)
-                .title(" Terminal "),
+                .title(terminal_tab_line(application, area)),
         ),
         to_tui(area),
     );
     if application.focus_owner == FocusOwner::BottomTerminal
-        && let Some(session) = application.bottom_terminal.as_ref()
+        && let Some(session) = application.active_bottom_terminal()
         && session.at_live_bottom()
     {
         let (row, column) = session.cursor();
@@ -1196,6 +1196,65 @@ fn draw_bottom_terminal(frame: &mut Frame<'_>, application: &Application, area: 
             area.y.saturating_add(1).saturating_add(row),
         ));
     }
+}
+
+pub fn terminal_tab_at(
+    application: &Application,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if row != area.y || column <= area.x || column >= area.x.saturating_add(area.width) {
+        return None;
+    }
+    let mut current_x = area.x.saturating_add(1);
+    let maximum_x = area.x.saturating_add(area.width.saturating_sub(1));
+    for (index, session) in application.bottom_terminals.iter().enumerate() {
+        let label = terminal_tab_label(index, session);
+        let width = u16::try_from(UnicodeWidthStr::width(label.as_str())).unwrap_or(u16::MAX);
+        let end = current_x.saturating_add(width);
+        if end > maximum_x {
+            return None;
+        }
+        if column >= current_x && column < end {
+            return Some(index);
+        }
+        current_x = end;
+    }
+    None
+}
+
+fn terminal_tab_line(application: &Application, area: Rect) -> Line<'static> {
+    let available_width = usize::from(area.width.saturating_sub(2));
+    let mut used_width = 0usize;
+    let mut spans = Vec::new();
+    for (index, session) in application.bottom_terminals.iter().enumerate() {
+        let label = terminal_tab_label(index, session);
+        let width = UnicodeWidthStr::width(label.as_str());
+        if used_width.saturating_add(width) > available_width {
+            break;
+        }
+        let style = if index == application.active_bottom_terminal_index() {
+            Style::default()
+                .fg(application.theme.colors.active_border)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(application.theme.colors.inactive_border)
+        };
+        spans.push(Span::styled(label, style));
+        used_width = used_width.saturating_add(width);
+    }
+    Line::from(spans)
+}
+
+fn terminal_tab_label(index: usize, session: &crate::terminal_session::TerminalSession) -> String {
+    let directory = session
+        .working_directory
+        .file_name()
+        .map_or_else(|| session.working_directory.display().to_string(), |name| {
+            name.to_string_lossy().into_owned()
+        });
+    format!(" {}:{directory} ", index.saturating_add(1))
 }
 
 fn terminal_lines(
@@ -1542,8 +1601,8 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
             Text::from("Live terminal processes remain. Press T to terminate them and exit, or Esc to cancel."),
         ),
         Overlay::ConfirmTerminalClose => (
-            " Live Terminal ",
-            Text::from("Press T to terminate the live terminal process, or Esc to cancel."),
+            " Live Terminal Session ",
+            Text::from("Press T to terminate the active terminal session, or Esc to cancel."),
         ),
         Overlay::ConfirmDocumentClose => (
             " Unsaved Document ",
@@ -1633,7 +1692,7 @@ fn help_text(application: &Application) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+F           Search and Replace\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, W      Close terminal (terminal focus)\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
+        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+F           Search and Replace\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, N      New terminal session\n  {leader}, [ / ]  Previous / next terminal session\n  {leader}, W      Close active terminal session\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nTerminal sessions\n  Click a tab       Select its session\n  Up to 8 sessions  Keep separate shell state\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
     )
 }
 
@@ -1759,6 +1818,11 @@ mod tests {
             "Explorer",
             "Enter / Right    Open file or expand folder",
             "Leader (Ctrl+B)",
+            "New terminal session",
+            "Previous / next terminal session",
+            "Close active terminal session",
+            "Click a tab       Select its session",
+            "Up to 8 sessions  Keep separate shell state",
             "Page Up / Down   Scroll by page",
         ] {
             assert!(text.contains(expected), "missing Help entry: {expected}");

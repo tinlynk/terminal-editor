@@ -13,6 +13,8 @@ use crate::{
 
 use super::{Application, FocusOwner};
 
+const MAX_BOTTOM_TERMINALS: usize = 8;
+
 impl Application {
     pub(super) fn resize_terminals(&mut self, columns: u16, rows: u16) -> Result<()> {
         let geometry = render::geometry(
@@ -55,11 +57,13 @@ impl Application {
                 view.viewport_wrap_segment = 0;
             }
         }
-        if let (Some(area), Some(session)) = (geometry.terminal, self.bottom_terminal.as_mut()) {
-            session.resize_screen(
-                area.height.saturating_sub(2).max(1),
-                area.width.saturating_sub(2).max(1),
-            )?;
+        if let Some(area) = geometry.terminal {
+            for session in &mut self.bottom_terminals {
+                session.resize_screen(
+                    area.height.saturating_sub(2).max(1),
+                    area.width.saturating_sub(2).max(1),
+                )?;
+            }
         }
         Ok(())
     }
@@ -70,7 +74,7 @@ impl Application {
         column: u16,
         row: u16,
     ) -> Option<Rect> {
-        if let (Some(_), Some(area)) = (self.bottom_terminal.as_ref(), geometry.terminal)
+        if let (true, Some(area)) = (!self.bottom_terminals.is_empty(), geometry.terminal)
             && terminal_content_contains(area, column, row)
         {
             return Some(area);
@@ -84,12 +88,12 @@ impl Application {
         mouse: MouseEvent,
     ) -> Result<bool> {
         let Some(area) = geometry.terminal.filter(|area| {
-            self.bottom_terminal.is_some()
+            !self.bottom_terminals.is_empty()
                 && terminal_content_contains(*area, mouse.column, mouse.row)
         }) else {
             return Ok(false);
         };
-        let Some(session) = self.bottom_terminal.as_mut() else {
+        let Some(session) = self.active_bottom_terminal_mut() else {
             return Ok(false);
         };
         if !session.mouse_reporting() {
@@ -131,8 +135,9 @@ impl Application {
     }
 
     pub(super) fn toggle_bottom_terminal(&mut self) -> Result<()> {
-        if self.bottom_terminal.is_none() {
-            self.bottom_terminal = Some(self.spawn_terminal(None)?);
+        if self.bottom_terminals.is_empty() {
+            self.bottom_terminals.push(self.spawn_terminal(None)?);
+            self.active_bottom_terminal = 0;
         }
         self.bottom_terminal_visible = !self.bottom_terminal_visible;
         self.focus_owner = if self.bottom_terminal_visible {
@@ -146,6 +151,46 @@ impl Application {
             self.resize_terminals(columns, rows)?;
         }
         Ok(())
+    }
+
+    pub(super) fn close_active_bottom_terminal(&mut self) {
+        if self.bottom_terminals.is_empty() {
+            return;
+        }
+        let mut session = self.bottom_terminals.remove(self.active_bottom_terminal);
+        session.begin_termination();
+        self.active_bottom_terminal = self
+            .active_bottom_terminal
+            .min(self.bottom_terminals.len().saturating_sub(1));
+        if self.bottom_terminals.is_empty() {
+            self.bottom_terminal_visible = false;
+            self.focus_owner = FocusOwner::Workspace;
+        }
+    }
+
+    pub(super) fn new_bottom_terminal(&mut self) -> Result<()> {
+        if self.bottom_terminals.len() >= MAX_BOTTOM_TERMINALS {
+            self.message = Some(format!("Terminal limit reached ({MAX_BOTTOM_TERMINALS})"));
+            return Ok(());
+        }
+        self.bottom_terminals.push(self.spawn_terminal(None)?);
+        self.active_bottom_terminal = self.bottom_terminals.len().saturating_sub(1);
+        self.bottom_terminal_visible = true;
+        self.focus_owner = FocusOwner::BottomTerminal;
+        let (columns, rows) = crossterm::terminal::size()
+            .map_err(|error| AppError::io("could not inspect terminal size", error))?;
+        self.resize_terminals(columns, rows)
+    }
+
+    pub(super) fn cycle_bottom_terminal(&mut self, delta: isize) {
+        let count = self.bottom_terminals.len();
+        if count == 0 {
+            return;
+        }
+        self.active_bottom_terminal = (self.active_bottom_terminal as isize + delta)
+            .rem_euclid(count as isize) as usize;
+        self.bottom_terminal_visible = true;
+        self.focus_owner = FocusOwner::BottomTerminal;
     }
 
     pub(super) fn spawn_terminal(&self, directory: Option<&Path>) -> Result<TerminalSession> {

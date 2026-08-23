@@ -612,18 +612,13 @@ impl Application {
                 self.request_quit();
             }
             Overlay::ConfirmTerminateAll if key.code == KeyCode::Char('t') => {
-                if let Some(session) = self.bottom_terminal.as_mut() {
+                for session in &mut self.bottom_terminals {
                     session.begin_termination();
                 }
                 self.running = false;
             }
             Overlay::ConfirmTerminalClose if key.code == KeyCode::Char('t') => {
-                if let Some(session) = self.bottom_terminal.as_mut() {
-                    session.begin_termination();
-                }
-                self.bottom_terminal = None;
-                self.bottom_terminal_visible = false;
-                self.focus_owner = FocusOwner::Workspace;
+                self.close_active_bottom_terminal();
                 self.overlay = None;
             }
             Overlay::ConfirmDocumentClose if key.code == KeyCode::Char('d') => {

@@ -50,10 +50,14 @@ Ordinary keyboard and paste input is sent to the terminal child process. The def
 | `Ctrl+B`, then `H` | Split the editor horizontally. |
 | `Ctrl+B`, then Arrow | Focus the nearest editor pane. |
 | `Ctrl+B`, then `Q` | Exit when the terminal is focused. |
-| `Ctrl+B`, then `W` | Terminate the terminal with confirmation. |
+| `Ctrl+B`, then `N` | Create and select a terminal session. |
+| `Ctrl+B`, then `[` or `]` | Select the previous or next terminal session. |
+| `Ctrl+B`, then `W` | Terminate the active terminal session with confirmation. |
 | `Ctrl+B`, then Page Up or Page Down | Navigate application terminal scrollback. |
 | `Ctrl+B`, then `C` | Copy the application-owned terminal selection. |
 | `Ctrl+B` twice | Send a literal `Ctrl+B` to the child. |
+
+`Ctrl+T` creates the first session when none exists, then toggles the bottom panel without closing its sessions. Terminal sessions appear as clickable tabs in the bottom panel. Each tab shows its number and current working-directory name. The panel holds at most eight live sessions.
 
 Editor split and focus chords are inactive while the terminal owns focus. ``Ctrl+` `` and `Ctrl+,` are accepted only when the outer terminal can report those modified punctuation keys distinctly.
 

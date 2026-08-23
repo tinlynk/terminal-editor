@@ -142,7 +142,8 @@ pub struct Application {
     pub documents: DocumentRegistry,
     pub workspace: Workspace,
     pub explorer: Explorer,
-    pub bottom_terminal: Option<TerminalSession>,
+    pub bottom_terminals: Vec<TerminalSession>,
+    active_bottom_terminal: usize,
     pub bottom_terminal_visible: bool,
     pub focus_owner: FocusOwner,
     pub overlay: Option<Overlay>,
@@ -175,6 +176,26 @@ pub struct Application {
 }
 
 impl Application {
+    pub(crate) fn active_bottom_terminal(&self) -> Option<&TerminalSession> {
+        self.bottom_terminals.get(self.active_bottom_terminal)
+    }
+
+    pub(crate) fn active_bottom_terminal_mut(&mut self) -> Option<&mut TerminalSession> {
+        self.bottom_terminals.get_mut(self.active_bottom_terminal)
+    }
+
+    pub(crate) fn active_bottom_terminal_index(&self) -> usize {
+        self.active_bottom_terminal
+    }
+
+    pub(crate) fn select_bottom_terminal(&mut self, index: usize) {
+        if index < self.bottom_terminals.len() {
+            self.active_bottom_terminal = index;
+            self.bottom_terminal_visible = true;
+            self.focus_owner = FocusOwner::BottomTerminal;
+        }
+    }
+
     pub fn new(startup_path: Option<PathBuf>) -> Result<Self> {
         let current_directory = env::current_dir()
             .map_err(|error| AppError::io("could not determine current directory", error))?;
@@ -222,7 +243,8 @@ impl Application {
             documents,
             workspace,
             explorer,
-            bottom_terminal: None,
+            bottom_terminals: Vec::new(),
+            active_bottom_terminal: 0,
             focus_owner: if overlay.is_some() {
                 FocusOwner::Overlay
             } else {
@@ -261,7 +283,7 @@ impl Application {
         }
         application.show_next_recovery();
         if application.bottom_terminal_visible {
-            application.bottom_terminal = Some(application.spawn_terminal(None)?);
+            application.bottom_terminals.push(application.spawn_terminal(None)?);
         }
         Ok(application)
     }
@@ -288,7 +310,8 @@ impl Application {
             explorer: Explorer::new(directory.clone(), true, &[".git".to_owned()]).unwrap(),
             config,
             documents,
-            bottom_terminal: None,
+            bottom_terminals: Vec::new(),
+            active_bottom_terminal: 0,
             bottom_terminal_visible: false,
             focus_owner: FocusOwner::Workspace,
             overlay: None,
@@ -356,7 +379,7 @@ impl Application {
             if let Some(enabled) = self.pending_mouse_capture.take() {
                 terminal.set_mouse_capture(enabled)?;
             }
-            if let Some(session) = self.bottom_terminal.as_mut() {
+            for session in &mut self.bottom_terminals {
                 redraw |= session.drain_output()?;
                 if let Some(clipboard) = session.take_child_clipboard_write() {
                     self.clipboard = clipboard;
@@ -379,6 +402,13 @@ impl Application {
             },
         );
         self.title_control_hover = geometry.title_controls.action_at(mouse.column, mouse.row);
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(area) = geometry.terminal
+            && let Some(index) = render::terminal_tab_at(self, area, mouse.column, mouse.row)
+        {
+            self.select_bottom_terminal(index);
+            return Ok(());
+        }
         if self.forward_terminal_mouse(&geometry, mouse)? {
             return Ok(());
         }
@@ -417,12 +447,11 @@ impl Application {
                 }
                 if let Some(area) = self.terminal_at(&geometry, mouse.column, mouse.row)
                     && self
-                        .bottom_terminal
-                        .as_ref()
+                        .active_bottom_terminal()
                         .is_some_and(|session| !session.mouse_reporting())
                 {
                     let rows = usize::from(area.height.saturating_sub(2));
-                    if let Some(session) = self.bottom_terminal.as_mut() {
+                    if let Some(session) = self.active_bottom_terminal_mut() {
                         session.start_selection(
                             usize::from(mouse.row.saturating_sub(area.y.saturating_add(1))),
                             usize::from(mouse.column.saturating_sub(area.x.saturating_add(1))),
@@ -583,7 +612,7 @@ impl Application {
                     self.resize_terminals(columns, rows)?;
                 } else if self.terminal_selection_drag
                     && let Some(area) = self.terminal_at(&geometry, mouse.column, mouse.row)
-                    && let Some(session) = self.bottom_terminal.as_mut()
+                    && let Some(session) = self.active_bottom_terminal_mut()
                 {
                     session.update_selection(
                         usize::from(mouse.row.saturating_sub(area.y.saturating_add(1))),
@@ -667,7 +696,7 @@ impl Application {
             return;
         }
         if self.terminal_at(geometry, column, row).is_some() {
-            if let Some(session) = self.bottom_terminal.as_mut() {
+            if let Some(session) = self.active_bottom_terminal_mut() {
                 session.scroll(-delta);
             }
             return;
@@ -1095,6 +1124,9 @@ impl Application {
                 }
             }
             Command::ToggleBottomTerminal => self.toggle_bottom_terminal()?,
+            Command::NewBottomTerminal => self.new_bottom_terminal()?,
+            Command::PreviousBottomTerminal => self.cycle_bottom_terminal(-1),
+            Command::NextBottomTerminal => self.cycle_bottom_terminal(1),
             Command::OpenSettings => {
                 self.overlay = Some(Overlay::Settings {
                     query: String::new(),
@@ -1241,7 +1273,7 @@ impl Application {
             }
             Command::Scroll(delta) => {
                 if self.focus_owner == FocusOwner::BottomTerminal {
-                    if let Some(session) = self.bottom_terminal.as_mut() {
+                    if let Some(session) = self.active_bottom_terminal_mut() {
                         session.scroll(-isize::from(delta));
                     }
                 } else {
@@ -1471,9 +1503,9 @@ impl Application {
 
     fn request_quit(&mut self) {
         let has_live_terminal = self
-            .bottom_terminal
-            .as_mut()
-            .is_some_and(|session| session.is_alive().unwrap_or(true));
+            .bottom_terminals
+            .iter_mut()
+            .any(|session| session.is_alive().unwrap_or(true));
         if !has_live_terminal {
             self.running = false;
         } else {
@@ -1731,7 +1763,7 @@ impl Application {
 
     fn insert_text(&mut self, text: &str) -> Result<()> {
         if self.focus_owner == FocusOwner::BottomTerminal {
-            if let Some(session) = self.bottom_terminal.as_mut() {
+            if let Some(session) = self.active_bottom_terminal_mut() {
                 session.write(text.as_bytes())?;
             }
             return Ok(());
@@ -1750,8 +1782,7 @@ impl Application {
 
     fn copy_selection(&mut self, cut: bool) {
         let terminal_selection = if self.focus_owner == FocusOwner::BottomTerminal {
-            self.bottom_terminal
-                .as_ref()
+            self.active_bottom_terminal()
                 .and_then(TerminalSession::selected_text)
         } else {
             None
@@ -2601,17 +2632,19 @@ mod tests {
     #[test]
     fn hiding_the_bottom_terminal_preserves_the_single_session() {
         let mut application = Application::new_for_test();
-        application.bottom_terminal = Some(application.spawn_terminal(None).unwrap());
+        application
+            .bottom_terminals
+            .push(application.spawn_terminal(None).unwrap());
         application.bottom_terminal_visible = true;
         application.focus_owner = FocusOwner::BottomTerminal;
-        let session = application.bottom_terminal.as_ref().unwrap() as *const TerminalSession;
+        let session = application.active_bottom_terminal().unwrap() as *const TerminalSession;
 
         application.toggle_bottom_terminal().unwrap();
 
         assert!(!application.bottom_terminal_visible);
         assert_eq!(application.focus_owner, FocusOwner::Workspace);
         assert_eq!(
-            application.bottom_terminal.as_ref().unwrap() as *const TerminalSession,
+            application.active_bottom_terminal().unwrap() as *const TerminalSession,
             session
         );
         assert_eq!(application.workspace.panes.len(), 1);
@@ -2621,7 +2654,9 @@ mod tests {
     fn confirmed_terminal_close_removes_the_only_session_without_changing_editors() {
         let mut application = Application::new_for_test();
         let document_id = application.focused_document_id().unwrap();
-        application.bottom_terminal = Some(application.spawn_terminal(None).unwrap());
+        application
+            .bottom_terminals
+            .push(application.spawn_terminal(None).unwrap());
         application.bottom_terminal_visible = true;
         application.focus_owner = FocusOwner::BottomTerminal;
 
@@ -2634,10 +2669,75 @@ mod tests {
             )))
             .unwrap();
 
-        assert!(application.bottom_terminal.is_none());
+        assert!(application.bottom_terminals.is_empty());
         assert!(!application.bottom_terminal_visible);
         assert_eq!(application.focused_document_id(), Some(document_id));
         assert_eq!(application.workspace.panes.len(), 1);
+    }
+
+    #[test]
+    fn terminal_sessions_cycle_wrap_and_close_independently() {
+        let mut application = Application::new_for_test();
+        application
+            .bottom_terminals
+            .push(application.spawn_terminal(None).unwrap());
+        application
+            .bottom_terminals
+            .push(application.spawn_terminal(None).unwrap());
+        application.bottom_terminal_visible = true;
+
+        application.cycle_bottom_terminal(-1);
+        assert_eq!(application.active_bottom_terminal, 1);
+        application.cycle_bottom_terminal(1);
+        assert_eq!(application.active_bottom_terminal, 0);
+
+        application.close_active_bottom_terminal();
+        assert_eq!(application.bottom_terminals.len(), 1);
+        assert_eq!(application.active_bottom_terminal, 0);
+        assert!(application.bottom_terminal_visible);
+    }
+
+    #[test]
+    fn terminal_tab_hit_testing_selects_the_matching_session() {
+        let mut application = Application::new_for_test();
+        application
+            .bottom_terminals
+            .push(application.spawn_terminal(None).unwrap());
+        application
+            .bottom_terminals
+            .push(application.spawn_terminal(None).unwrap());
+        let area = Rect {
+            x: 0,
+            y: 10,
+            width: 80,
+            height: 8,
+        };
+
+        let second_tab_column = (1..area.width)
+            .find(|column| render::terminal_tab_at(&application, area, *column, area.y) == Some(1))
+            .unwrap();
+        let second_tab = render::terminal_tab_at(&application, area, second_tab_column, area.y)
+            .unwrap();
+        application.select_bottom_terminal(second_tab);
+
+        assert_eq!(second_tab, 1);
+        assert_eq!(application.active_bottom_terminal, 1);
+        assert_eq!(application.focus_owner, FocusOwner::BottomTerminal);
+    }
+
+    #[test]
+    fn terminal_session_limit_prevents_new_session_creation() {
+        let mut application = Application::new_for_test();
+        for _ in 0..8 {
+            application
+                .bottom_terminals
+                .push(application.spawn_terminal(None).unwrap());
+        }
+
+        application.new_bottom_terminal().unwrap();
+
+        assert_eq!(application.bottom_terminals.len(), 8);
+        assert_eq!(application.message.as_deref(), Some("Terminal limit reached (8)"));
     }
 
     #[test]
