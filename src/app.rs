@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -15,7 +15,10 @@ use crate::{
     config::{ConfigScope, LoadedConfig},
     document::DocumentId,
     explorer::{Explorer, root_for_startup},
-    file_io::DocumentRegistry,
+    file_io::{
+        DocumentRegistry, ExternalFileState, ExternalFileVersion, RecoveryRecord, load_recovery_records,
+        recovery_directory, remove_recovery_record, write_recovery_record,
+    },
     input::InputMapper,
     layout::{PaneId, Rect, SplitDirection},
     render,
@@ -118,6 +121,15 @@ pub enum Overlay {
         warning: &'static str,
     },
     SaveConflict,
+    Recovery {
+        path: PathBuf,
+        record: RecoveryRecord,
+    },
+    ExternalFileChange {
+        document_id: DocumentId,
+        missing: bool,
+        version: ExternalFileVersion,
+    },
     ConfirmSaveAsOverwrite {
         document_id: crate::document::DocumentId,
         path: PathBuf,
@@ -155,6 +167,11 @@ pub struct Application {
     last_click: Option<(Instant, u16, u16)>,
     click_count: u8,
     syntax_caches: RefCell<BTreeMap<crate::document::DocumentId, SyntaxCache>>,
+    recovery_directory: PathBuf,
+    recovery_records: VecDeque<(PathBuf, RecoveryRecord)>,
+    deferred_external_changes: BTreeMap<DocumentId, ExternalFileVersion>,
+    last_autosave: Instant,
+    last_external_file_check: Instant,
 }
 
 impl Application {
@@ -163,6 +180,8 @@ impl Application {
             .map_err(|error| AppError::io("could not determine current directory", error))?;
         let explorer_root = root_for_startup(startup_path.as_deref(), &current_directory);
         let config = LoadedConfig::load(&explorer_root)?;
+        let recovery_directory = recovery_directory(&config.user_path)?;
+        let recovery_records = load_recovery_records(&recovery_directory).unwrap_or_default();
         let theme_registry = ThemeRegistry::load_for_config(&config.user_path)?;
         let (theme, theme_message) = theme_registry.resolve(&config.effective.theme.active);
         let theme = theme.clone();
@@ -231,7 +250,16 @@ impl Application {
             last_click: None,
             click_count: 0,
             syntax_caches: RefCell::new(BTreeMap::new()),
+            recovery_directory,
+            recovery_records: recovery_records.into(),
+            deferred_external_changes: BTreeMap::new(),
+            last_autosave: Instant::now(),
+            last_external_file_check: Instant::now(),
         };
+        if !application.recovery_records.is_empty() {
+            application.overlay = None;
+        }
+        application.show_next_recovery();
         if application.bottom_terminal_visible {
             application.bottom_terminal = Some(application.spawn_terminal(None)?);
         }
@@ -257,7 +285,7 @@ impl Application {
         let document_id = documents.new_untitled();
         Self {
             workspace: Workspace::with_editor(document_id, 0.5),
-            explorer: Explorer::new(directory, true, &[".git".to_owned()]).unwrap(),
+            explorer: Explorer::new(directory.clone(), true, &[".git".to_owned()]).unwrap(),
             config,
             documents,
             bottom_terminal: None,
@@ -285,6 +313,11 @@ impl Application {
             last_click: None,
             click_count: 0,
             syntax_caches: RefCell::new(BTreeMap::new()),
+            recovery_directory: directory.join("recovery"),
+            recovery_records: VecDeque::new(),
+            deferred_external_changes: BTreeMap::new(),
+            last_autosave: Instant::now(),
+            last_external_file_check: Instant::now(),
         }
     }
 
@@ -314,6 +347,7 @@ impl Application {
                 redraw = true;
             }
             redraw |= self.refresh_explorer_if_due(Instant::now());
+            redraw |= self.refresh_document_lifecycle(Instant::now());
             redraw |= self.input.expire_leader(Instant::now());
             if !self.pending_terminal_control.is_empty() {
                 let control = std::mem::take(&mut self.pending_terminal_control);
@@ -1463,6 +1497,114 @@ impl Application {
         true
     }
 
+    fn refresh_document_lifecycle(&mut self, now: Instant) -> bool {
+        let mut redraw = false;
+        let autosave_interval = self.config.effective.editor.autosave_interval_seconds;
+        let autosave_interval = u64::try_from(autosave_interval).unwrap_or(0);
+        if autosave_interval > 0
+            && now.duration_since(self.last_autosave) >= Duration::from_secs(autosave_interval)
+        {
+            self.last_autosave = now;
+            for (document_id, modified) in self
+                .documents
+                .iter()
+                .map(|(id, document)| (id, document.is_modified()))
+                .collect::<Vec<_>>()
+            {
+                let result = if modified {
+                    write_recovery_record(
+                        &self.recovery_directory,
+                        document_id,
+                        self.documents.get(document_id),
+                    )
+                    .map(|_| ())
+                } else {
+                    remove_recovery_record(
+                        &self.recovery_directory,
+                        document_id,
+                        self.documents.get(document_id),
+                    )
+                };
+                if let Err(error) = result {
+                    self.message = Some(format!("Autosave recovery failed: {error}"));
+                }
+            }
+        }
+        if self.overlay.is_some()
+            || now.duration_since(self.last_external_file_check) < Duration::from_secs(2)
+        {
+            return redraw;
+        }
+        self.last_external_file_check = now;
+        for (document_id, modified) in self
+            .documents
+            .iter()
+            .map(|(id, document)| (id, document.is_modified()))
+            .collect::<Vec<_>>()
+        {
+            let (state, version) = match self.documents.external_file_state_and_version(document_id) {
+                Ok(state) => state,
+                Err(error) => {
+                    self.message = Some(format!("Could not inspect open file: {error}"));
+                    continue;
+                }
+            };
+            if self.deferred_external_changes.get(&document_id) == version.as_ref() {
+                continue;
+            }
+            self.deferred_external_changes.remove(&document_id);
+            match state {
+                ExternalFileState::Unchanged => {}
+                ExternalFileState::Changed if !modified => {
+                    if let Err(error) = self.documents.reload(document_id, true) {
+                        self.message = Some(format!("Could not reload changed file: {error}"));
+                    } else {
+                        self.message = Some("Reloaded file changed outside the editor".to_owned());
+                        redraw = true;
+                    }
+                }
+                ExternalFileState::Changed | ExternalFileState::Missing => {
+                    let Some(version) = version else {
+                        continue;
+                    };
+                    self.overlay = Some(Overlay::ExternalFileChange {
+                        document_id,
+                        missing: state == ExternalFileState::Missing,
+                        version,
+                    });
+                    self.focus_owner = FocusOwner::Overlay;
+                    return true;
+                }
+            }
+        }
+        redraw
+    }
+
+    fn show_next_recovery(&mut self) {
+        if self.overlay.is_some() {
+            return;
+        }
+        if let Some((path, record)) = self.recovery_records.pop_front() {
+            self.overlay = Some(Overlay::Recovery { path, record });
+            self.focus_owner = FocusOwner::Overlay;
+        }
+    }
+
+    fn restore_recovery_record(&mut self, record: RecoveryRecord) {
+        let document_id = self.documents.new_untitled();
+        self.documents.get_mut(document_id).insert(0, &record.text);
+        let pane_id = self.workspace.focused;
+        self.switch_editor_document(pane_id, document_id);
+    }
+
+    fn remove_recovery_for_document(&mut self, document_id: DocumentId) -> Result<()> {
+        remove_recovery_record(
+            &self.recovery_directory,
+            document_id,
+            self.documents.get(document_id),
+        )
+    }
+
     fn request_close(&mut self) -> Result<()> {
         document_lifecycle::request_close(self)
     }
@@ -1480,6 +1622,10 @@ impl Application {
             matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
         });
         if !still_visible {
+            self.deferred_external_changes.remove(&document_id);
+            if let Err(error) = self.remove_recovery_for_document(document_id) {
+                self.message = Some(format!("Could not remove recovery data: {error}"));
+            }
             self.documents.remove(document_id);
             self.saved_editor_views.remove(&document_id);
         }
@@ -2067,7 +2213,7 @@ pub(super) fn explorer_create_dialog(directory: &Path, create_directory: bool) -
     }
 }
 
-pub(crate) const SETTINGS_KEYS: [&str; 35] = [
+pub(crate) const SETTINGS_KEYS: [&str; 36] = [
     "editor.indent_width",
     "editor.insert_spaces",
     "editor.default_line_ending",
@@ -2077,6 +2223,7 @@ pub(crate) const SETTINGS_KEYS: [&str; 35] = [
     "editor.soft_wrap",
     "editor.syntax_highlighting",
     "editor.syntax_highlighting_max_file_size_kib",
+    "editor.autosave_interval_seconds",
     "editor.header_style",
     "workspace.minimum_pane_width",
     "workspace.minimum_pane_height",
@@ -3529,6 +3676,263 @@ mod tests {
                 .any(|entry| entry.path == path)
         );
     }
+
+        #[test]
+        fn autosave_writes_a_recovery_record_for_modified_documents() {
+            let mut application = Application::new_for_test();
+            let document_id = application.focused_document_id().unwrap();
+            application.documents.get_mut(document_id).insert(0, "unsaved");
+            let now = Instant::now();
+            application.last_autosave = now - Duration::from_secs(30);
+
+            application.refresh_document_lifecycle(now);
+
+            let records = load_recovery_records(&application.recovery_directory).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].1.text, "unsaved");
+        }
+
+        #[test]
+        fn non_positive_autosave_intervals_disable_recovery_writes() {
+            for interval in [0, -1] {
+                let mut application = Application::new_for_test();
+                let document_id = application.focused_document_id().unwrap();
+                application.documents.get_mut(document_id).insert(0, "unsaved");
+                application.config.effective.editor.autosave_interval_seconds = interval;
+                let now = Instant::now();
+                application.last_autosave = now - Duration::from_secs(30);
+
+                application.refresh_document_lifecycle(now);
+
+                assert!(load_recovery_records(&application.recovery_directory)
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+
+        #[test]
+        fn modified_external_changes_open_a_resolution_overlay() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("file.txt");
+            fs::write(&path, "original").unwrap();
+            let mut application = Application::new_for_test();
+            let (document_id, _) = application.documents.open(&path).unwrap();
+            application.switch_editor_document(application.workspace.focused, document_id);
+            application.documents.get_mut(document_id).insert(8, " local");
+            fs::write(&path, "external").unwrap();
+            let now = Instant::now();
+            application.last_external_file_check = now - Duration::from_secs(2);
+
+            assert!(application.refresh_document_lifecycle(now));
+            assert!(matches!(
+                application.overlay,
+                Some(Overlay::ExternalFileChange {
+                    document_id: changed_id,
+                    missing: false,
+                    ..
+                }) if changed_id == document_id
+            ));
+        }
+
+        #[test]
+        fn recovery_overlay_restores_discards_and_defers_records() {
+            let mut application = Application::new_for_test();
+            let document_id = application.focused_document_id().unwrap();
+            application.documents.get_mut(document_id).insert(0, "unsaved");
+            let path = write_recovery_record(
+                &application.recovery_directory,
+                document_id,
+                application.documents.get(document_id),
+            )
+            .unwrap();
+            let record = load_recovery_records(&application.recovery_directory)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .1;
+            let deferred_record = RecoveryRecord {
+                text: "deferred".to_owned(),
+                ..record.clone()
+            };
+
+            application.overlay = Some(Overlay::Recovery {
+                path: path.clone(),
+                record,
+            });
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('r'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert!(!path.exists());
+            assert_eq!(
+                application
+                    .documents
+                    .get(application.focused_document_id().unwrap())
+                    .text(),
+                "unsaved"
+            );
+
+            let deferred_path = application.recovery_directory.join("deferred.toml");
+        fs::write(&deferred_path, toml::to_string(&deferred_record).unwrap()).unwrap();
+            application.overlay = Some(Overlay::Recovery {
+                path: deferred_path.clone(),
+                record: deferred_record.clone(),
+            });
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert!(deferred_path.exists());
+
+            application.overlay = Some(Overlay::Recovery {
+                path: deferred_path.clone(),
+                record: deferred_record,
+            });
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('d'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert!(!deferred_path.exists());
+        }
+
+        #[test]
+        fn save_and_close_remove_recovery_records() {
+            let mut application = Application::new_for_test();
+            let document_id = application.focused_document_id().unwrap();
+            application.documents.get_mut(document_id).insert(0, "unsaved");
+            write_recovery_record(
+                &application.recovery_directory,
+                document_id,
+                application.documents.get(document_id),
+            )
+            .unwrap();
+
+            application.finish_successful_save(document_id).unwrap();
+            assert!(load_recovery_records(&application.recovery_directory)
+                .unwrap()
+                .is_empty());
+
+            write_recovery_record(
+                &application.recovery_directory,
+                document_id,
+                application.documents.get(document_id),
+            )
+            .unwrap();
+            application.close_focused_editor_view();
+            assert!(load_recovery_records(&application.recovery_directory)
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn pristine_external_changes_reload_automatically() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("file.txt");
+            fs::write(&path, "original").unwrap();
+            let mut application = Application::new_for_test();
+            let (document_id, _) = application.documents.open(&path).unwrap();
+            application.switch_editor_document(application.workspace.focused, document_id);
+            fs::write(&path, "external").unwrap();
+            let now = Instant::now();
+            application.last_external_file_check = now - Duration::from_secs(2);
+
+            assert!(application.refresh_document_lifecycle(now));
+            assert_eq!(application.documents.get(document_id).text(), "external");
+            assert!(application.overlay.is_none());
+        }
+
+        #[test]
+        fn external_change_resolution_reloads_or_keeps_local_contents() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("file.txt");
+            fs::write(&path, "original").unwrap();
+            let mut application = Application::new_for_test();
+            let (document_id, _) = application.documents.open(&path).unwrap();
+            application.switch_editor_document(application.workspace.focused, document_id);
+            application.documents.get_mut(document_id).insert(8, " local");
+            fs::write(&path, "external").unwrap();
+            let now = Instant::now();
+            application.last_external_file_check = now - Duration::from_secs(2);
+            application.refresh_document_lifecycle(now);
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('k'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert_eq!(application.documents.get(document_id).text(), "original local");
+            assert_eq!(
+                application.documents.external_file_state(document_id).unwrap(),
+                ExternalFileState::Unchanged
+            );
+
+            fs::write(&path, "replacement").unwrap();
+            application.last_external_file_check = now - Duration::from_secs(2);
+            application.refresh_document_lifecycle(now);
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('r'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert_eq!(application.documents.get(document_id).text(), "replacement");
+            assert!(!application.documents.get(document_id).is_modified());
+        }
+
+        #[test]
+        fn deleted_file_acknowledgement_and_new_external_versions_are_reported() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("file.txt");
+            fs::write(&path, "original").unwrap();
+            let mut application = Application::new_for_test();
+            let (document_id, _) = application.documents.open(&path).unwrap();
+            application.switch_editor_document(application.workspace.focused, document_id);
+            application.documents.get_mut(document_id).insert(8, " local");
+            fs::write(&path, "first external").unwrap();
+            let now = Instant::now();
+            application.last_external_file_check = now - Duration::from_secs(2);
+            application.refresh_document_lifecycle(now);
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            fs::write(&path, "second external").unwrap();
+            application.last_external_file_check = now - Duration::from_secs(2);
+            assert!(application.refresh_document_lifecycle(now));
+            assert!(matches!(application.overlay, Some(Overlay::ExternalFileChange { .. })));
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+
+            fs::remove_file(&path).unwrap();
+            application.last_external_file_check = now - Duration::from_secs(2);
+            application.refresh_document_lifecycle(now);
+            assert!(matches!(
+                application.overlay,
+                Some(Overlay::ExternalFileChange { missing: true, .. })
+            ));
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('r'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert_eq!(
+                application.documents.external_file_state(document_id).unwrap(),
+                ExternalFileState::Unchanged
+            );
+        }
 
     #[test]
     fn zero_explorer_refresh_interval_disables_polling() {

@@ -2,7 +2,10 @@ use std::path::Path;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
-use crate::{AppError, Result, config::ConfigScope, input::key_sequence, layout::Rect, render};
+use crate::{
+    AppError, Result, config::ConfigScope, file_io::remove_recovery_path, input::key_sequence,
+    layout::Rect, render,
+};
 
 use super::{
     Application, FocusOwner, Overlay, SETTINGS_KEYS, explorer_create_dialog, file_dialog,
@@ -153,6 +156,15 @@ impl Application {
             return Ok(());
         }
         if key.code == KeyCode::Esc {
+            if let Some(Overlay::ExternalFileChange {
+                document_id,
+                version,
+                ..
+            }) = self.overlay.as_ref()
+            {
+                self.deferred_external_changes
+                    .insert(*document_id, version.clone());
+            }
             if matches!(
                 self.overlay,
                 Some(Overlay::FileDialog { save_as: true, .. })
@@ -167,6 +179,72 @@ impl Application {
                 *editing = None;
                 return Ok(());
             }
+            self.overlay = None;
+            self.focus_owner = FocusOwner::Workspace;
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('r')
+            && let Some((path, record)) = self.overlay.as_ref().and_then(|overlay| {
+                let Overlay::Recovery { path, record } = overlay else {
+                    return None;
+                };
+                Some((path.clone(), record.clone()))
+            })
+        {
+            self.restore_recovery_record(record);
+            remove_recovery_path(&path)?;
+            self.overlay = None;
+            self.focus_owner = FocusOwner::Workspace;
+            self.show_next_recovery();
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('d')
+            && let Some(path) = self.overlay.as_ref().and_then(|overlay| {
+                let Overlay::Recovery { path, .. } = overlay else {
+                    return None;
+                };
+                Some(path.clone())
+            })
+        {
+            remove_recovery_path(&path)?;
+            self.overlay = None;
+            self.focus_owner = FocusOwner::Workspace;
+            self.show_next_recovery();
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('k')
+            && let Some(document_id) = self.overlay.as_ref().and_then(|overlay| {
+                let Overlay::ExternalFileChange { document_id, .. } = overlay else {
+                    return None;
+                };
+                Some(*document_id)
+            })
+        {
+            self.documents.accept_external_file_state(document_id)?;
+            self.deferred_external_changes.remove(&document_id);
+            self.overlay = None;
+            self.focus_owner = FocusOwner::Workspace;
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('r')
+            && let Some((document_id, missing)) = self.overlay.as_ref().and_then(|overlay| {
+                let Overlay::ExternalFileChange {
+                    document_id,
+                    missing,
+                    ..
+                } = overlay else {
+                    return None;
+                };
+                Some((*document_id, *missing))
+            })
+        {
+            if missing {
+                self.documents.accept_external_file_state(document_id)?;
+                self.message = Some("The missing file was kept open with local contents".to_owned());
+            } else {
+                self.documents.reload(document_id, true)?;
+            }
+            self.deferred_external_changes.remove(&document_id);
             self.overlay = None;
             self.focus_owner = FocusOwner::Workspace;
             return Ok(());
@@ -557,7 +635,7 @@ impl Application {
                 self.pending_close_document = self.focused_editor().map(|(id, _)| id);
                 self.save_focused()?;
             }
-            Overlay::ConfirmUnsafeOpen { .. } => {}
+            Overlay::ConfirmUnsafeOpen { .. } | Overlay::Recovery { .. } | Overlay::ExternalFileChange { .. } => {}
             Overlay::SaveConflict if key.code == KeyCode::Char('o') => {
                 let document_id = self.focused_editor().map(|(id, _)| id);
                 if let Some(document_id) = document_id {
@@ -595,6 +673,7 @@ fn setting_accepts_character(key: &str, value: &str, character: char) -> bool {
         "editor.indent_width",
         "editor.undo_limit_mib",
         "editor.syntax_highlighting_max_file_size_kib",
+        "editor.autosave_interval_seconds",
         "workspace.minimum_pane_width",
         "workspace.minimum_pane_height",
         "explorer.width",
@@ -603,7 +682,7 @@ fn setting_accepts_character(key: &str, value: &str, character: char) -> bool {
         "ui.bottom_terminal_height",
     ];
     if INTEGER_SETTINGS.contains(&key) {
-        return character.is_ascii_digit();
+        return character.is_ascii_digit() || (character == '-' && value.is_empty());
     }
     if key == "workspace.initial_split_ratio" {
         return character.is_ascii_digit() || (character == '.' && !value.contains('.'));

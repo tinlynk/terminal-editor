@@ -10,7 +10,9 @@ Before opening a file, the editor inspects a bounded header. ZIP, gzip, RAR, 7z,
 
 Files are saved through a temporary file in the target directory followed by atomic replacement. Existing permissions are preserved. Saving through a symlink replaces its resolved target without replacing the symlink.
 
-If a file changes externally before save, the editor offers overwrite or cancellation and leaves the external file untouched until confirmation. LF and CRLF content is preserved, and inserted lines use the detected document convention.
+Modified documents are captured in local recovery records every 30 seconds by default. At the next startup after an unclean exit, press `R` to restore a record as an unsaved document, `D` to discard it, or Escape to defer it until the next launch. Configure or disable this behavior with `editor.autosave_interval_seconds`.
+
+The editor also checks open named files for external changes every two seconds. A pristine document reloads automatically. For a modified document, press `R` to reload and discard local edits, `K` to keep local edits and acknowledge the external version, or Escape to defer that version. A later external version or deletion prompts again. When a file is removed, `R` acknowledges the removal while retaining the local contents. Saving a changed file still offers overwrite or cancellation and leaves the external file untouched until confirmation. LF and CRLF content is preserved, and inserted lines use the detected document convention.
 
 ## Terminal and clipboard security
 

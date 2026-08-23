@@ -23,6 +23,7 @@ scrollbar = true
 soft_wrap = false
 syntax_highlighting = true
 syntax_highlighting_max_file_size_kib = 1024
+autosave_interval_seconds = 30
 header_style = "tabs"
 
 [workspace]
@@ -57,5 +58,7 @@ active = "default"
 `editor.default_line_ending` accepts `lf` or `crlf`. `editor.header_style` accepts `tabs` or `breadcrumbs`. Set `editor.soft_wrap = true` to wrap long lines and disable horizontal panning and its scrollbar.
 
 Syntax highlighting is enabled by default for recognized source files. Set `editor.syntax_highlighting = false` to disable it, or change `editor.syntax_highlighting_max_file_size_kib` from its 1024 KiB default to control the largest file parsed for highlighting.
+
+Modified documents are written to user-local recovery records every 30 seconds. Set `editor.autosave_interval_seconds` to `0` or a negative value to disable recovery autosave. Recovery records are stored under `$HOME/.tinlynk/terminal-editor/recovery/` and are offered at the next startup after an unclean exit.
 
 Use [theme authoring](themes.md) for `theme.active` and custom theme behavior.

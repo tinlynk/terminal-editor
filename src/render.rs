@@ -1560,6 +1560,21 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
             " File Changed Externally ",
             Text::from("Press O to overwrite the file, or Esc to cancel. Save As is available from the file dialog."),
         ),
+        Overlay::Recovery { record, .. } => (
+            " Recover Unsaved Changes ",
+            Text::from(format!(
+                "Recovered changes are available for {}. Press R to restore as an unsaved document, D to discard, or Esc to defer.",
+                record.path.as_deref().map_or("an untitled document".to_owned(), |path| path.display().to_string())
+            )),
+        ),
+        Overlay::ExternalFileChange { missing, .. } => (
+            " File Changed Externally ",
+            Text::from(if *missing {
+                "The file was removed outside the editor. Press K to keep the local contents, R to acknowledge the removal, or Esc to defer."
+            } else {
+                "The file changed outside the editor. Press R to reload and discard local edits, K to keep local edits, or Esc to defer."
+            }),
+        ),
         Overlay::ConfirmSaveAsOverwrite { path, .. } => (
             " File Already Exists ",
             Text::from(format!(

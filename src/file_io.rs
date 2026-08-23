@@ -5,8 +5,12 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     AppError, Result,
@@ -16,6 +20,125 @@ use crate::{
 
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 const OPEN_WARNING_PROBE_BYTES: usize = 512;
+const MAX_RECOVERY_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+const RECOVERY_FORMAT_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecoveryRecord {
+    pub format_version: u8,
+    pub path: Option<PathBuf>,
+    pub revision: u64,
+    pub captured_at_unix_seconds: u64,
+    pub text: String,
+}
+
+pub fn recovery_directory(user_config_path: &Path) -> Result<PathBuf> {
+    user_config_path
+        .parent()
+        .map(|directory| directory.join("recovery"))
+        .ok_or_else(|| AppError::Arguments("user configuration path has no parent".to_owned()))
+}
+
+pub fn write_recovery_record(
+    directory: &Path,
+    document_id: DocumentId,
+    document: &Document,
+) -> Result<PathBuf> {
+    let path = recovery_record_path(directory, document_id, document);
+    let record = RecoveryRecord {
+        format_version: RECOVERY_FORMAT_VERSION,
+        path: document.path.clone(),
+        revision: document.revision(),
+        captured_at_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        text: document.text(),
+    };
+    let text = toml::to_string(&record).map_err(|error| AppError::Arguments(error.to_string()))?;
+    if text.len() as u64 > MAX_RECOVERY_RECORD_BYTES {
+        return Err(AppError::Arguments(format!(
+            "recovery data for {} exceeds the {} MiB limit",
+            document
+                .path
+                .as_deref()
+                .map_or_else(|| "untitled document".to_owned(), |path| path.display().to_string()),
+            MAX_RECOVERY_RECORD_BYTES / (1024 * 1024)
+        )));
+    }
+    atomic_write(&path, text.as_bytes())?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        AppError::io(format!("could not protect recovery record {}", path.display()), error)
+    })?;
+    Ok(path)
+}
+
+pub fn remove_recovery_record(directory: &Path, document_id: DocumentId, document: &Document) -> Result<()> {
+    let path = recovery_record_path(directory, document_id, document);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::io(
+            format!("could not remove recovery record {}", path.display()),
+            error,
+        )),
+    }
+}
+
+pub fn load_recovery_records(directory: &Path) -> Result<Vec<(PathBuf, RecoveryRecord)>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(AppError::io(
+                format!("could not read recovery directory {}", directory.display()),
+                error,
+            ));
+        }
+    };
+    let mut records = Vec::new();
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "toml")
+            || entry.metadata().map_or(true, |metadata| metadata.len() > MAX_RECOVERY_RECORD_BYTES)
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = toml::from_str::<RecoveryRecord>(&text) else {
+            continue;
+        };
+        if record.format_version == RECOVERY_FORMAT_VERSION {
+            records.push((path, record));
+        }
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(records)
+}
+
+pub fn remove_recovery_path(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::io(
+            format!("could not remove recovery record {}", path.display()),
+            error,
+        )),
+    }
+}
+
+fn recovery_record_path(directory: &Path, document_id: DocumentId, document: &Document) -> PathBuf {
+    let identity = document.path.as_ref().map_or_else(
+        || format!("untitled-{}", document_id.0),
+        |path| path.to_string_lossy().into_owned(),
+    );
+    let mut hasher = DefaultHasher::new();
+    identity.hash(&mut hasher);
+    directory.join(format!("{:016x}.toml", hasher.finish()))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenFileWarning {
@@ -79,6 +202,23 @@ pub enum SaveOutcome {
 pub enum SaveAsOutcome {
     Saved,
     ExistingTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalFileState {
+    Unchanged,
+    Changed,
+    Missing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalFileVersion {
+    Present {
+        modified: Option<SystemTime>,
+        length: u64,
+        content_fingerprint: u64,
+    },
+    Missing,
 }
 
 #[derive(Debug)]
@@ -276,6 +416,64 @@ impl DocumentRegistry {
         Ok(())
     }
 
+    pub fn external_file_state(&self, id: DocumentId) -> Result<ExternalFileState> {
+        Ok(self.external_file_state_and_version(id)?.0)
+    }
+
+    pub fn external_file_state_and_version(
+        &self,
+        id: DocumentId,
+    ) -> Result<(ExternalFileState, Option<ExternalFileVersion>)> {
+        let Some(path) = self.documents[&id].path.as_deref() else {
+            return Ok((ExternalFileState::Unchanged, None));
+        };
+        let current = match snapshot(path) {
+            Ok(current) => current,
+            Err(AppError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                let state = if self.snapshots.contains_key(&id) {
+                    ExternalFileState::Missing
+                } else {
+                    ExternalFileState::Unchanged
+                };
+                return Ok((state, Some(ExternalFileVersion::Missing)));
+            }
+            Err(error) => return Err(error),
+        };
+        let state = if self
+            .snapshots
+            .get(&id)
+            .is_some_and(|expected| *expected != current)
+        {
+            ExternalFileState::Changed
+        } else {
+            ExternalFileState::Unchanged
+        };
+        Ok((
+            state,
+            Some(ExternalFileVersion::Present {
+                modified: current.modified,
+                length: current.length,
+                content_fingerprint: current.content_fingerprint,
+            }),
+        ))
+    }
+
+    pub fn accept_external_file_state(&mut self, id: DocumentId) -> Result<()> {
+        let Some(path) = self.documents[&id].path.as_deref() else {
+            return Ok(());
+        };
+        match snapshot(path) {
+            Ok(snapshot) => {
+                self.snapshots.insert(id, snapshot);
+            }
+            Err(AppError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                self.snapshots.remove(&id);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
     fn changed_externally(&self, id: DocumentId, path: &Path) -> Result<bool> {
         let current = match snapshot(path) {
             Ok(current) => current,
@@ -447,6 +645,56 @@ mod tests {
             SaveOutcome::ExternalChange
         ));
         assert_eq!(fs::read_to_string(path).unwrap(), "other");
+    }
+
+    #[test]
+    fn external_file_state_detects_changes_and_missing_files() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "first").unwrap();
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        let (id, _) = registry.open(&path).unwrap();
+        assert_eq!(
+            registry.external_file_state(id).unwrap(),
+            ExternalFileState::Unchanged
+        );
+
+        fs::write(&path, "second").unwrap();
+        assert_eq!(
+            registry.external_file_state(id).unwrap(),
+            ExternalFileState::Changed
+        );
+        registry.accept_external_file_state(id).unwrap();
+        assert_eq!(
+            registry.external_file_state(id).unwrap(),
+            ExternalFileState::Unchanged
+        );
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            registry.external_file_state(id).unwrap(),
+            ExternalFileState::Missing
+        );
+    }
+
+    #[test]
+    fn recovery_records_round_trip_and_can_be_removed() {
+        let directory = tempdir().unwrap();
+        let recovery = directory.path().join("recovery");
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        let id = registry.new_untitled();
+        registry.get_mut(id).insert(0, "unsaved text");
+
+        write_recovery_record(&recovery, id, registry.get(id)).unwrap();
+        let records = load_recovery_records(&recovery).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1.revision, registry.get(id).revision());
+        assert!(records[0].1.captured_at_unix_seconds > 0);
+        assert_eq!(records[0].1.path, None);
+        assert_eq!(records[0].1.text, "unsaved text");
+
+        remove_recovery_record(&recovery, id, registry.get(id)).unwrap();
+        assert!(load_recovery_records(&recovery).unwrap().is_empty());
     }
 
     #[test]

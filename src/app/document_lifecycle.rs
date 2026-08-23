@@ -49,6 +49,10 @@ pub(super) fn close_focused_editor_view(application: &mut Application) {
     };
     if application.workspace.panes.len() == 1 {
         application.workspace.panes.insert(pane_id, Pane::Empty);
+        application.deferred_external_changes.remove(&document_id);
+        if let Err(error) = application.remove_recovery_for_document(document_id) {
+            application.message = Some(format!("Could not remove recovery data: {error}"));
+        }
         application.documents.remove(document_id);
         application.saved_editor_views.remove(&document_id);
         if let Some(next_document) = application.documents.iter().next().map(|(id, _)| id) {
@@ -115,6 +119,8 @@ pub(super) fn finish_successful_save(
     application: &mut Application,
     document_id: DocumentId,
 ) -> Result<()> {
+    application.remove_recovery_for_document(document_id)?;
+    application.deferred_external_changes.remove(&document_id);
     let saved_path = application.documents.get(document_id).path.clone();
     if saved_path.as_deref().is_some_and(|path| {
         path == application.config.user_path.as_path()

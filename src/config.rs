@@ -13,6 +13,7 @@ const CONFIG_RELATIVE_PATH: &str = ".tinlynk/terminal-editor/config.toml";
 const DEFAULT_UNDO_LIMIT_MIB: usize = 32;
 const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 const DEFAULT_SYNTAX_HIGHLIGHTING_MAX_FILE_SIZE_KIB: usize = 1024;
+const DEFAULT_AUTOSAVE_INTERVAL_SECONDS: i64 = 30;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -42,6 +43,7 @@ pub struct EditorConfig {
     pub soft_wrap: bool,
     pub syntax_highlighting: bool,
     pub syntax_highlighting_max_file_size_kib: usize,
+    pub autosave_interval_seconds: i64,
     pub header_style: EditorHeaderStyle,
 }
 
@@ -57,6 +59,7 @@ impl Default for EditorConfig {
             soft_wrap: false,
             syntax_highlighting: true,
             syntax_highlighting_max_file_size_kib: DEFAULT_SYNTAX_HIGHLIGHTING_MAX_FILE_SIZE_KIB,
+            autosave_interval_seconds: DEFAULT_AUTOSAVE_INTERVAL_SECONDS,
             header_style: EditorHeaderStyle::Tabs,
         }
     }
@@ -224,6 +227,9 @@ impl Config {
                 .editor
                 .syntax_highlighting_max_file_size_kib
                 .to_string(),
+            "editor.autosave_interval_seconds" => {
+                self.editor.autosave_interval_seconds.to_string()
+            }
             "editor.header_style" => match self.editor.header_style {
                 EditorHeaderStyle::Tabs => "tabs".to_owned(),
                 EditorHeaderStyle::Breadcrumbs => "breadcrumbs".to_owned(),
@@ -314,6 +320,7 @@ struct PartialEditorConfig {
     soft_wrap: Option<bool>,
     syntax_highlighting: Option<bool>,
     syntax_highlighting_max_file_size_kib: Option<usize>,
+    autosave_interval_seconds: Option<i64>,
     header_style: Option<EditorHeaderStyle>,
 }
 
@@ -450,9 +457,12 @@ impl LoadedConfig {
                 ));
             }
         };
-        if scope == ConfigScope::Workspace && dotted_key.starts_with("terminal.") {
+        if scope == ConfigScope::Workspace
+            && (dotted_key.starts_with("terminal.")
+                || dotted_key == "editor.autosave_interval_seconds")
+        {
             return Err(AppError::Arguments(
-                "terminal settings are restricted to user configuration".to_owned(),
+                "this setting is restricted to user configuration".to_owned(),
             ));
         }
         let text = match fs::read_to_string(&path) {
@@ -532,9 +542,12 @@ impl LoadedConfig {
                 "default settings cannot be modified".to_owned(),
             ));
         }
-        if dotted_key.starts_with("terminal.") && scope == ConfigScope::Workspace {
+        if (dotted_key.starts_with("terminal.")
+            || dotted_key == "editor.autosave_interval_seconds")
+            && scope == ConfigScope::Workspace
+        {
             return Err(AppError::Arguments(
-                "terminal settings are restricted to user configuration".to_owned(),
+                "this setting is restricted to user configuration".to_owned(),
             ));
         }
         let path = match scope {
@@ -617,6 +630,7 @@ fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
             })
         }
         "editor.undo_limit_mib" | "editor.syntax_highlighting_max_file_size_kib"
+        | "editor.autosave_interval_seconds"
         | "terminal.scrollback_lines" => {
             trimmed.parse::<i64>().map(Value::from).map_err(|_| {
                 AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
@@ -806,6 +820,14 @@ fn parse_partial_config(
                 syntax_highlighting_max_file_size_kib: config_value(
                     table,
                     "syntax_highlighting_max_file_size_kib",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                autosave_interval_seconds: config_value(
+                    table,
+                    "autosave_interval_seconds",
                     "editor",
                     path,
                     scope,
@@ -1060,6 +1082,17 @@ fn apply_scope(
             &mut config.editor.syntax_highlighting_max_file_size_kib,
             editor.syntax_highlighting_max_file_size_kib,
         );
+        if scope == ConfigScope::Workspace && editor.autosave_interval_seconds.is_some() {
+            diagnostics.push(ConfigDiagnostic {
+                scope,
+                message: "workspace autosave settings are restricted and were ignored".to_owned(),
+            });
+        } else {
+            assign(
+                &mut config.editor.autosave_interval_seconds,
+                editor.autosave_interval_seconds,
+            );
+        }
         assign(&mut config.editor.header_style, editor.header_style);
         provenance.insert("editor".to_owned(), scope);
     }
@@ -1300,6 +1333,22 @@ mod tests {
 
         assert!(loaded.effective.editor.soft_wrap);
         assert_eq!(loaded.provenance["editor"], ConfigScope::User);
+    }
+
+    #[test]
+    fn negative_autosave_interval_can_be_configured() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(
+            &user_path,
+            "[editor]\nautosave_interval_seconds = -1\n",
+        )
+        .unwrap();
+
+        let loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+
+        assert_eq!(loaded.effective.editor.autosave_interval_seconds, -1);
     }
 
     #[test]
