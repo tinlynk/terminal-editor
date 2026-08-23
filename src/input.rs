@@ -87,6 +87,10 @@ impl InputMapper {
             self.cancel_leader();
             return Command::OpenHelp;
         }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('f') {
+            self.cancel_leader();
+            return Command::OpenSearchReplace;
+        }
         if self.leader_pending_since.is_some() {
             self.cancel_leader();
             if key.code == KeyCode::Esc {
@@ -191,6 +195,7 @@ fn named_command(name: &str) -> Option<Command> {
         "undo" => Some(Command::Undo),
         "redo" => Some(Command::Redo),
         "settings" => Some(Command::OpenSettings),
+        "search" => Some(Command::OpenSearchReplace),
         "toggle-terminal" => Some(Command::ToggleBottomTerminal),
         "toggle-explorer" => Some(Command::ToggleExplorer),
         _ => None,

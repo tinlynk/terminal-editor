@@ -8,6 +8,7 @@ Open the in-app Help view with `Ctrl+H` to see the active configurable keybindin
 | --- | --- |
 | `Ctrl+H` | Open Help. |
 | `Ctrl+G` | Open Settings. |
+| `Ctrl+F` | Open Search and Replace for the focused document. |
 | `Ctrl+T` | Toggle the bottom terminal. |
 | Escape | Close the active dialog. |
 | `Ctrl+O` | Open the file dialog. |
@@ -22,6 +23,8 @@ Open the in-app Help view with `Ctrl+H` to see the active configurable keybindin
 Arrow keys move the cursor. Home and End move to the start and end of the line, while Page Up and Page Down move by a page. Use Shift with arrows, Home, End, Page Up, or Page Down to extend a selection when the terminal reports those modified keys.
 
 `Ctrl+C`, `Ctrl+X`, and `Ctrl+V` copy, cut, and paste through the internal clipboard. Enter inserts a line, Backspace and Delete remove text, Tab indents, and Shift+Tab unindents.
+
+Search and Replace uses literal, case-sensitive text matching in the focused document. Type the search query, press Enter for the next match or Shift+Enter for the previous match, and use Tab to move to the replacement field. `Ctrl+R` replaces the selected match; `Ctrl+Shift+R` replaces all matches.
 
 When soft wrap is disabled, Shift plus the vertical mouse wheel pans long lines horizontally. Horizontal terminal-wheel events can also pan long lines when the terminal forwards them. Click or drag the bottom-border scrollbar to navigate the document width.
 

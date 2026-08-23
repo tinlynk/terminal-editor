@@ -87,6 +87,13 @@ pub enum Overlay {
     Help {
         scroll: usize,
     },
+    SearchReplace {
+        document_id: crate::document::DocumentId,
+        query: String,
+        replacement: String,
+        editing_replacement: bool,
+        current_match: Option<std::ops::Range<usize>>,
+    },
     ExplorerCreate {
         directory: PathBuf,
         name: String,
@@ -182,7 +189,7 @@ impl Application {
         let overlay = startup_path
             .as_deref()
             .filter(|path| path.is_dir())
-            .map(|path| file_dialog(path, false));
+            .map(|path| file_dialog(path, false, &explorer));
         let input = InputMapper::new(
             config.effective.keybindings.clone(),
             &config.effective.terminal.leader,
@@ -991,7 +998,7 @@ impl Application {
                 }
             }
             Command::OpenDialog => {
-                self.overlay = Some(file_dialog(&self.explorer.root, false));
+                self.overlay = Some(file_dialog(&self.explorer.root, false, &self.explorer));
                 self.focus_owner = FocusOwner::Overlay;
             }
             Command::Open(path) => self.open_path(&path, None)?,
@@ -1027,6 +1034,7 @@ impl Application {
                 self.overlay = Some(Overlay::Help { scroll: 0 });
                 self.focus_owner = FocusOwner::Overlay;
             }
+            Command::OpenSearchReplace => self.open_search_replace(),
             Command::Copy => self.copy_selection(false),
             Command::Cut => self.copy_selection(true),
             Command::PasteClipboard => {
@@ -1242,6 +1250,134 @@ impl Application {
             Pane::Editor { document_id, .. } => Some((*document_id, self.workspace.focused)),
             Pane::Empty => None,
         }
+    }
+
+    fn open_search_replace(&mut self) {
+        let Some((document_id, _)) = self.focused_editor() else {
+            return;
+        };
+        let query = match self.workspace.focused_pane() {
+            Pane::Editor { view, .. } => view
+                .selected_text(self.documents.get(document_id))
+                .unwrap_or_default(),
+            Pane::Empty => String::new(),
+        };
+        self.overlay = Some(Overlay::SearchReplace {
+            document_id,
+            query,
+            replacement: String::new(),
+            editing_replacement: false,
+            current_match: None,
+        });
+        self.focus_owner = FocusOwner::Overlay;
+        self.select_search_match(true);
+    }
+
+    fn select_search_match(&mut self, forward: bool) {
+        let Some((document_id, query, current_match)) = self.overlay.as_ref().and_then(|overlay| {
+            let Overlay::SearchReplace {
+                document_id,
+                query,
+                current_match,
+                ..
+            } = overlay else {
+                return None;
+            };
+            Some((*document_id, query.clone(), current_match.clone()))
+        }) else {
+            return;
+        };
+        let matches = literal_matches(&self.documents.get(document_id).text(), &query);
+        let cursor = match self.workspace.focused_pane() {
+            Pane::Editor { view, .. } => view.cursor,
+            Pane::Empty => 0,
+        };
+        let matched = if forward {
+            let start = current_match.as_ref().map_or(cursor, |range| range.end);
+            matches
+                .iter()
+                .find(|range| range.start >= start)
+                .cloned()
+                .or_else(|| matches.first().cloned())
+        } else {
+            let end = current_match.as_ref().map_or(cursor, |range| range.start);
+            matches
+                .iter()
+                .rev()
+                .find(|range| range.end <= end)
+                .cloned()
+                .or_else(|| matches.last().cloned())
+        };
+        if let Some(range) = matched.as_ref()
+            && let Pane::Editor { document_id: active_id, view } = self.workspace.focused_pane_mut()
+            && *active_id == document_id
+        {
+            view.selection_anchor = Some(range.start);
+            view.cursor = range.end;
+        }
+        if let Some(Overlay::SearchReplace { current_match, .. }) = self.overlay.as_mut() {
+            *current_match = matched;
+        }
+    }
+
+    fn replace_search_match(&mut self) {
+        let Some((document_id, query, replacement, current_match)) = self.overlay.as_ref().and_then(|overlay| {
+            let Overlay::SearchReplace {
+                document_id,
+                query,
+                replacement,
+                current_match,
+                ..
+            } = overlay else {
+                return None;
+            };
+            Some((*document_id, query.clone(), replacement.clone(), current_match.clone()))
+        }) else {
+            return;
+        };
+        let Some(range) = current_match else {
+            return;
+        };
+        if self.documents.get(document_id).slice(range.start, range.end) != query {
+            self.select_search_match(true);
+            return;
+        }
+        self.edit_focused(|document, view| {
+            let end = document.replace(range.start, range.end, &replacement);
+            view.selection_anchor = Some(range.start);
+            view.cursor = end;
+        });
+        if let Some(Overlay::SearchReplace { current_match, .. }) = self.overlay.as_mut() {
+            *current_match = None;
+        }
+        self.select_search_match(true);
+    }
+
+    fn replace_all_search_matches(&mut self) {
+        let Some((document_id, query, replacement)) = self.overlay.as_ref().and_then(|overlay| {
+            let Overlay::SearchReplace {
+                document_id,
+                query,
+                replacement,
+                ..
+            } = overlay else {
+                return None;
+            };
+            Some((*document_id, query.clone(), replacement.clone()))
+        }) else {
+            return;
+        };
+        let matches = literal_matches(&self.documents.get(document_id).text(), &query);
+        for range in matches.into_iter().rev() {
+            self.edit_focused(|document, view| {
+                view.cursor = document.replace(range.start, range.end, &replacement);
+                view.clear_selection();
+            });
+        }
+        if let Some(Overlay::SearchReplace { current_match, .. }) = self.overlay.as_mut() {
+            *current_match = None;
+        }
+        self.select_search_match(true);
     }
 
     fn ensure_focused_editor(&mut self) {
@@ -1495,7 +1631,7 @@ impl Application {
         let path = PathBuf::from(input);
         let save_as = *save_as;
         if path.is_dir() {
-            self.overlay = Some(file_dialog(&path, save_as));
+            self.overlay = Some(file_dialog(&path, save_as, &self.explorer));
             return Ok(());
         }
         let result = if save_as {
@@ -1832,20 +1968,34 @@ fn global_command(command: &Command) -> bool {
             | Command::ToggleBottomTerminal
             | Command::OpenSettings
             | Command::OpenHelp
+            | Command::OpenSearchReplace
     )
 }
 
-fn file_dialog(directory: &Path, save_as: bool) -> Overlay {
+fn literal_matches(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    text.match_indices(query)
+        .map(|(byte_start, matched)| {
+            let start = text[..byte_start].chars().count();
+            start..start + matched.chars().count()
+        })
+        .collect()
+}
+
+fn file_dialog(directory: &Path, save_as: bool, explorer: &Explorer) -> Overlay {
     let directory = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_owned());
     let mut entries = std::fs::read_dir(&directory)
         .map(|entries| {
             entries
                 .filter_map(std::result::Result::ok)
+                .filter(|entry| !explorer.is_excluded(&entry.path()))
                 .map(|entry| entry.path())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    entries.sort();
+    entries.sort_by_key(|path| path.file_name().map_or_else(String::new, |name| name.to_string_lossy().to_ascii_lowercase()));
     let input = if save_as {
         format!("{}{}", directory.display(), std::path::MAIN_SEPARATOR)
     } else {
@@ -2090,6 +2240,76 @@ mod tests {
             application.documents.get(document_id).path.as_deref(),
             Some(fs::canonicalize(path).unwrap().as_path())
         );
+    }
+
+    #[test]
+    fn search_replace_selects_cycles_and_replaces_document_matches() {
+        let mut application = Application::new_for_test();
+        application
+            .apply(Command::Insert("red blue red".to_owned()))
+            .unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        assert!(matches!(application.overlay, Some(Overlay::SearchReplace { .. })));
+
+        for character in "red".chars() {
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+        }
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.selection(), Some(0..3));
+
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let Pane::Editor { view, .. } = application.workspace.focused_pane() else {
+            panic!("expected editor pane");
+        };
+        assert_eq!(view.selection(), Some(9..12));
+
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        for character in "green".chars() {
+            application
+                .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+        }
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        let document_id = application.focused_document_id().unwrap();
+        assert_eq!(application.documents.get(document_id).text(), "red blue green");
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )))
+            .unwrap();
+
+        assert_eq!(application.documents.get(document_id).text(), "green blue green");
     }
 
     #[test]
@@ -3279,7 +3499,7 @@ mod tests {
         fs::write(&file, "hello").unwrap();
         let canonical_file = fs::canonicalize(&file).unwrap();
         let mut application = Application::new_for_test();
-        application.overlay = Some(file_dialog(directory.path(), false));
+        application.overlay = Some(file_dialog(directory.path(), false, &application.explorer));
         application.activate_file_dialog_selection().unwrap();
         let Some(Overlay::FileDialog {
             directory: current,
@@ -3301,13 +3521,32 @@ mod tests {
     }
 
     #[test]
+    fn file_dialog_uses_explorer_exclusions_but_keeps_other_dotfiles() {
+        let mut application = Application::new_for_test();
+        fs::create_dir(application.explorer.root.join(".git")).unwrap();
+        fs::write(application.explorer.root.join(".env"), "value").unwrap();
+
+        application.overlay = Some(file_dialog(
+            &application.explorer.root,
+            false,
+            &application.explorer,
+        ));
+
+        let Some(Overlay::FileDialog { entries, .. }) = application.overlay.as_ref() else {
+            panic!("expected file dialog");
+        };
+        assert!(entries.iter().any(|entry| entry.ends_with(".env")));
+        assert!(!entries.iter().any(|entry| entry.ends_with(".git")));
+    }
+
+    #[test]
     fn file_dialog_mouse_wheel_moves_the_selection() {
         let directory = tempfile::tempdir().unwrap();
         for index in 0..8 {
             fs::write(directory.path().join(format!("{index}.txt")), "x").unwrap();
         }
         let mut application = Application::new_for_test();
-        application.overlay = Some(file_dialog(directory.path(), false));
+        application.overlay = Some(file_dialog(directory.path(), false, &application.explorer));
         application
             .handle_overlay_event(Event::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollDown,
@@ -3325,7 +3564,8 @@ mod tests {
     #[test]
     fn file_dialog_uses_an_absolute_path_for_relative_directories() {
         let current_directory = env::current_dir().unwrap();
-        let Overlay::FileDialog { directory, input, .. } = file_dialog(Path::new("."), false) else {
+        let explorer = Explorer::new(current_directory.clone(), true, &[]).unwrap();
+        let Overlay::FileDialog { directory, input, .. } = file_dialog(Path::new("."), false, &explorer) else {
             panic!("expected file dialog");
         };
 
@@ -3388,7 +3628,7 @@ mod tests {
         application
             .apply(Command::Insert("saved content".to_owned()))
             .unwrap();
-        application.overlay = Some(file_dialog(directory.path(), true));
+        application.overlay = Some(file_dialog(directory.path(), true, &application.explorer));
         application.focus_owner = FocusOwner::Overlay;
         let Some(Overlay::FileDialog { input, .. }) = application.overlay.as_mut() else {
             panic!("expected Save As dialog");

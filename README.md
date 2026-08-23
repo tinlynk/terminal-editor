@@ -45,6 +45,7 @@ Files that appear to be binary data or a supported archive format require confir
 | `Ctrl+T` | Toggle the persistent bottom terminal. |
 | `Ctrl+G` | Open the searchable settings view. |
 | `Ctrl+H` | Open Help. |
+| `Ctrl+F` | Open Search and Replace for the focused document. |
 | `Ctrl+Z` and `Ctrl+Y` | Undo and redo. |
 | `Ctrl+C`, `Ctrl+X`, and `Ctrl+V` | Copy, cut, and paste with the internal clipboard. |
 

@@ -18,6 +18,7 @@ pub enum Command {
     ToggleBottomTerminal,
     OpenSettings,
     OpenHelp,
+    OpenSearchReplace,
     Undo,
     Redo,
     Copy,

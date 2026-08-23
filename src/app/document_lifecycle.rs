@@ -75,7 +75,11 @@ pub(super) fn save_focused(application: &mut Application) -> Result<()> {
         return Ok(());
     };
     if application.documents.get(document_id).path.is_none() {
-        application.overlay = Some(file_dialog(&application.explorer.root, true));
+        application.overlay = Some(file_dialog(
+            &application.explorer.root,
+            true,
+            &application.explorer,
+        ));
         application.focus_owner = FocusOwner::Overlay;
         return Ok(());
     }

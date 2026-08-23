@@ -361,6 +361,19 @@ fn explorer_file_icon<'a>(
     (icon.glyph, parse_hex_color(icon.color))
 }
 
+fn explorer_entry_style(application: &Application, ignored: bool, selected: bool) -> Style {
+    let style = if selected {
+        Style::default().bg(application.theme.colors.selected_row_background)
+    } else {
+        Style::default()
+    };
+    if ignored {
+        style.fg(application.theme.colors.muted)
+    } else {
+        style
+    }
+}
+
 fn parse_hex_color(value: &str) -> Option<Color> {
     let value = value.strip_prefix('#')?;
     if value.len() != 6 {
@@ -646,21 +659,23 @@ fn draw_explorer(frame: &mut Frame<'_>, application: &Application, area: Rect) {
             || entry.path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let style = if index == application.explorer.selected
-            && application.focus_owner == FocusOwner::Explorer
-        {
-            Style::default().bg(application.theme.colors.selected_row_background)
-        } else {
-            Style::default()
-        };
+        let style = explorer_entry_style(
+            application,
+            entry.ignored,
+            index == application.explorer.selected && application.focus_owner == FocusOwner::Explorer,
+        );
         let indent = "  ".repeat(entry.depth + 1);
         let line = if is_dir {
             Line::styled(format!("{indent}{prefix} {name}"), style)
         } else {
             let (icon, icon_color) = explorer_file_icon(application, &name);
-            let icon_style = icon_color.map_or_else(Style::default, |color| Style::default().fg(color));
+            let icon_style = if entry.ignored {
+                Style::default().fg(application.theme.colors.muted)
+            } else {
+                icon_color.map_or_else(Style::default, |color| Style::default().fg(color))
+            };
             Line::from(vec![
-                Span::raw(format!("{indent}  ")),
+                Span::raw(indent),
                 Span::styled(icon, icon_style),
                 Span::raw(format!(" {name}")),
             ])
@@ -1513,6 +1528,23 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
                 Text::from(help_text(application)),
             )
         }
+        Overlay::SearchReplace {
+            query,
+            replacement,
+            editing_replacement,
+            current_match,
+            ..
+        } => {
+            let find = if *editing_replacement { format!("Find: {query}") } else { format!("> Find: {query}") };
+            let replace = if *editing_replacement { format!("> Replace: {replacement}") } else { format!("Replace: {replacement}") };
+            let status = if current_match.is_some() { "Match selected" } else if query.is_empty() { "Type to search" } else { "No matches" };
+            (
+                " Search and Replace ",
+                Text::from(format!(
+                    "{find}\n{replace}\n\n{status}\n\nEnter next, Shift+Enter previous, Tab changes field, Ctrl+R replaces, Ctrl+Shift+R replaces all, Esc closes."
+                )),
+            )
+        }
         Overlay::Message { title, message } => (title.as_str(), Text::from(message.clone())),
         Overlay::ConfirmQuit => (
             " Unsaved Changes ",
@@ -1599,7 +1631,7 @@ fn help_text(application: &Application) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, W      Close terminal (terminal focus)\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
+        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+F           Search and Replace\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, W      Close terminal (terminal focus)\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
     )
 }
 
@@ -1647,6 +1679,7 @@ pub fn overlay_area(screen: Rect, overlay: &Overlay) -> Rect {
         Overlay::Settings { .. } | Overlay::ThemePicker { .. } | Overlay::Help { .. } => {
             screen.height.saturating_sub(4).clamp(3, 18)
         }
+        Overlay::SearchReplace { .. } => 9.min(screen.height),
         Overlay::FileDialog { .. } | Overlay::ExplorerCreate { .. } => screen
             .height
             .saturating_sub(4)
@@ -1719,6 +1752,7 @@ mod tests {
         let text = help_text(&application);
 
         for expected in [
+            "Ctrl+F           Search and Replace",
             "Ctrl+T           Toggle bottom terminal",
             "Explorer",
             "Enter / Right    Open file or expand folder",
@@ -1758,6 +1792,18 @@ mod tests {
         let (glyph, color) = explorer_file_icon(&application, "main.rs");
         assert_eq!(glyph, expected.glyph);
         assert_eq!(color, parse_hex_color(expected.color));
+    }
+
+    #[test]
+    fn ignored_explorer_entries_use_muted_foreground_and_keep_selection_background() {
+        let application = Application::new_for_test();
+        let style = explorer_entry_style(&application, true, true);
+
+        assert_eq!(style.fg, Some(application.theme.colors.muted));
+        assert_eq!(
+            style.bg,
+            Some(application.theme.colors.selected_row_background)
+        );
     }
 
     #[test]

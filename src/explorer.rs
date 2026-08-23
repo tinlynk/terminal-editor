@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeSet,
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -16,6 +18,7 @@ pub struct ExplorerEntry {
     pub is_directory: bool,
     pub is_symlink: bool,
     pub expanded: bool,
+    pub ignored: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +136,10 @@ impl Explorer {
         let previous_index = self.selected;
         let mut entries = Vec::new();
         self.walk(&self.root, 0, &mut entries)?;
+        let ignored = git_ignored_paths(&self.root, &entries);
+        for entry in &mut entries {
+            entry.ignored = ignored.contains(&entry.path);
+        }
         self.entries = entries;
         self.viewport_row = self
             .viewport_row
@@ -165,6 +172,11 @@ impl Explorer {
         self.refresh()
     }
 
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root)
+            .is_ok_and(|relative| self.exclusions.is_match(relative))
+    }
+
     fn walk(&self, directory: &Path, depth: usize, output: &mut Vec<ExplorerEntry>) -> Result<()> {
         let read_dir = fs::read_dir(directory).map_err(|error| {
             AppError::io(format!("could not browse {}", directory.display()), error)
@@ -172,11 +184,25 @@ impl Explorer {
         let mut children = read_dir
             .filter_map(std::result::Result::ok)
             .filter_map(|entry| {
-                let relative = entry.path().strip_prefix(&self.root).ok()?.to_owned();
-                (!self.exclusions.is_match(&relative)).then_some(entry)
+                (!self.is_excluded(&entry.path())).then_some(entry)
             })
             .collect::<Vec<_>>();
-        children.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
+        children.sort_by(|left, right| {
+            let left_is_directory = left.file_type().is_ok_and(|file_type| {
+                file_type.is_dir() && !file_type.is_symlink()
+            });
+            let right_is_directory = right.file_type().is_ok_and(|file_type| {
+                file_type.is_dir() && !file_type.is_symlink()
+            });
+            right_is_directory
+                .cmp(&left_is_directory)
+                .then_with(|| {
+                    left.file_name()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .cmp(&right.file_name().to_string_lossy().to_ascii_lowercase())
+                })
+        });
         for child in children {
             let path = child.path();
             let file_type = child.file_type().map_err(|error| {
@@ -191,6 +217,7 @@ impl Explorer {
                 is_directory,
                 is_symlink,
                 expanded,
+                ignored: false,
             });
             if expanded {
                 self.walk(&path, depth + 1, output)?;
@@ -198,6 +225,52 @@ impl Explorer {
         }
         Ok(())
     }
+}
+
+fn git_ignored_paths(root: &Path, entries: &[ExplorerEntry]) -> BTreeSet<PathBuf> {
+    let paths = entries
+        .iter()
+        .filter_map(|entry| entry.path.strip_prefix(root).ok())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut child = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "--no-index", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return BTreeSet::new(),
+    };
+    let input = paths.iter().fold(Vec::new(), |mut input, path| {
+        input.extend_from_slice(path.to_string_lossy().as_bytes());
+        input.push(0);
+        input
+    });
+    let Some(mut stdin) = child.stdin.take() else {
+        return BTreeSet::new();
+    };
+    if stdin.write_all(&input).is_err() {
+        return BTreeSet::new();
+    }
+    drop(stdin);
+    let Ok(output) = child.wait_with_output() else {
+        return BTreeSet::new();
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        return BTreeSet::new();
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| root.join(String::from_utf8_lossy(path).as_ref()))
+        .collect()
 }
 
 pub fn root_for_startup(startup_path: Option<&Path>, current_directory: &Path) -> PathBuf {
@@ -293,6 +366,91 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path.ends_with(".git"))
         );
+    }
+
+    #[test]
+    fn directories_precede_files_and_each_group_is_case_insensitively_sorted() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("zebra")).unwrap();
+        fs::create_dir(directory.path().join("Alpha")).unwrap();
+        fs::write(directory.path().join("zebra.txt"), "x").unwrap();
+        fs::write(directory.path().join("beta.txt"), "x").unwrap();
+        let explorer = Explorer::new(directory.path().to_owned(), true, &[]).unwrap();
+
+        let names = explorer
+            .entries()
+            .iter()
+            .map(|entry| entry.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["Alpha", "zebra", "beta.txt", "zebra.txt"]);
+    }
+
+    #[test]
+    fn refresh_marks_git_ignored_files_and_folders() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        Command::new("git")
+            .args(["init", "-q", root.to_str().unwrap()])
+            .status()
+            .unwrap();
+        fs::write(root.join(".gitignore"), "ignored-file\nignored-folder/\n").unwrap();
+        fs::write(root.join("ignored-file"), "ignored").unwrap();
+        fs::create_dir(root.join("ignored-folder")).unwrap();
+        fs::write(root.join("regular-file"), "regular").unwrap();
+
+        let explorer = Explorer::new(root.to_owned(), true, &[]).unwrap();
+
+        assert!(explorer
+            .entries()
+            .iter()
+            .any(|entry| entry.path.ends_with("ignored-file") && entry.ignored));
+        assert!(explorer
+            .entries()
+            .iter()
+            .any(|entry| entry.path.ends_with("ignored-folder") && entry.ignored));
+        assert!(explorer
+            .entries()
+            .iter()
+            .any(|entry| entry.path.ends_with("regular-file") && !entry.ignored));
+    }
+
+    #[test]
+    fn refresh_recalculates_ignored_entries_after_gitignore_changes() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        Command::new("git")
+            .args(["init", "-q", root.to_str().unwrap()])
+            .status()
+            .unwrap();
+        fs::write(root.join("tracked-later"), "text").unwrap();
+        Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "add", "tracked-later"])
+            .status()
+            .unwrap();
+        let mut explorer = Explorer::new(root.to_owned(), true, &[]).unwrap();
+        assert!(explorer
+            .entries()
+            .iter()
+            .any(|entry| entry.path.ends_with("tracked-later") && !entry.ignored));
+
+        fs::write(root.join(".gitignore"), "tracked-later\n").unwrap();
+        explorer.refresh().unwrap();
+
+        assert!(explorer
+            .entries()
+            .iter()
+            .any(|entry| entry.path.ends_with("tracked-later") && entry.ignored));
+    }
+
+    #[test]
+    fn refresh_without_git_marks_no_entries_ignored() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("file.txt"), "text").unwrap();
+
+        let explorer = Explorer::new(directory.path().to_owned(), true, &[]).unwrap();
+
+        assert!(explorer.entries().iter().all(|entry| !entry.ignored));
     }
 
     #[test]

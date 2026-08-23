@@ -198,6 +198,81 @@ impl Application {
             self.focus_owner = FocusOwner::Workspace;
             return Ok(());
         }
+        if matches!(self.overlay, Some(Overlay::SearchReplace { .. })) {
+            if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && key.code == KeyCode::Char('r')
+            {
+                self.replace_all_search_matches();
+                return Ok(());
+            }
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
+                self.replace_search_match();
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.select_search_match(false);
+                }
+                KeyCode::Enter => self.select_search_match(true),
+                KeyCode::Tab => {
+                    if let Some(Overlay::SearchReplace {
+                        editing_replacement,
+                        ..
+                    }) = self.overlay.as_mut()
+                    {
+                        *editing_replacement = !*editing_replacement;
+                    }
+                }
+                KeyCode::Backspace => {
+                    let mut query_changed = false;
+                    if let Some(Overlay::SearchReplace {
+                        query,
+                        replacement,
+                        editing_replacement,
+                        current_match,
+                        ..
+                    }) = self.overlay.as_mut()
+                    {
+                        if *editing_replacement {
+                            replacement.pop();
+                        } else {
+                            query.pop();
+                            *current_match = None;
+                            query_changed = true;
+                        }
+                    }
+                    if query_changed {
+                        self.select_search_match(true);
+                    }
+                }
+                KeyCode::Char(character)
+                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                {
+                    let mut query_changed = false;
+                    if let Some(Overlay::SearchReplace {
+                        query,
+                        replacement,
+                        editing_replacement,
+                        current_match,
+                        ..
+                    }) = self.overlay.as_mut()
+                    {
+                        if *editing_replacement {
+                            replacement.push(character);
+                        } else {
+                            query.push(character);
+                            *current_match = None;
+                            query_changed = true;
+                        }
+                    }
+                    if query_changed {
+                        self.select_search_match(true);
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         if matches!(self.overlay, Some(Overlay::Help { .. })) {
             let maximum = self.help_maximum_scroll()?;
             if let Some(Overlay::Help { scroll }) = self.overlay.as_mut() {
@@ -335,7 +410,7 @@ impl Application {
                         Some(Overlay::FileDialog { save_as: true, .. })
                     );
                     if let Some(parent) = parent {
-                        self.overlay = Some(file_dialog(&parent, save_as));
+                        self.overlay = Some(file_dialog(&parent, save_as, &self.explorer));
                     }
                 }
                 KeyCode::Backspace => {
@@ -360,7 +435,7 @@ impl Application {
                         Some(Overlay::FileDialog { save_as: true, .. })
                     );
                     if let Some(parent) = parent {
-                        self.overlay = Some(file_dialog(&parent, save_as));
+                        self.overlay = Some(file_dialog(&parent, save_as, &self.explorer));
                     }
                 }
                 KeyCode::Char(character)
@@ -452,6 +527,7 @@ impl Application {
                 }
                 _ => {}
             },
+            Overlay::SearchReplace { .. } => {}
             Overlay::ConfirmQuit
                 if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') =>
             {
