@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
@@ -18,6 +19,7 @@ use crate::{
     input::InputMapper,
     layout::{PaneId, Rect, SplitDirection},
     render,
+    syntax::{SyntaxCache, SyntaxPalette, SyntaxSpan},
     terminal::{TerminalGuard, install_panic_restoration_hook},
     terminal_session::TerminalSession,
     theme::{Theme, ThemeRegistry},
@@ -152,6 +154,7 @@ pub struct Application {
     last_explorer_refresh: Instant,
     last_click: Option<(Instant, u16, u16)>,
     click_count: u8,
+    syntax_caches: RefCell<BTreeMap<crate::document::DocumentId, SyntaxCache>>,
 }
 
 impl Application {
@@ -227,6 +230,7 @@ impl Application {
             last_explorer_refresh: Instant::now(),
             last_click: None,
             click_count: 0,
+            syntax_caches: RefCell::new(BTreeMap::new()),
         };
         if application.bottom_terminal_visible {
             application.bottom_terminal = Some(application.spawn_terminal(None)?);
@@ -280,6 +284,7 @@ impl Application {
             last_explorer_refresh: Instant::now(),
             last_click: None,
             click_count: 0,
+            syntax_caches: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -781,6 +786,42 @@ impl Application {
             Pane::Editor { document_id, .. } => Some(*document_id),
             Pane::Empty => None,
         }
+    }
+
+    pub fn syntax_spans(
+        &self,
+        document_id: crate::document::DocumentId,
+        document: &crate::document::Document,
+        line_index: usize,
+    ) -> Vec<SyntaxSpan> {
+        let editor = &self.config.effective.editor;
+        let maximum_bytes = editor
+            .syntax_highlighting_max_file_size_kib
+            .saturating_mul(1024);
+        if !editor.syntax_highlighting || document.len_bytes() > maximum_bytes {
+            return Vec::new();
+        }
+        let palette = SyntaxPalette {
+            foreground: self.theme.colors.foreground,
+            comment: self.theme.colors.syntax_comment,
+            string: self.theme.colors.syntax_string,
+            number: self.theme.colors.syntax_number,
+            keyword: self.theme.colors.syntax_keyword,
+            type_name: self.theme.colors.syntax_type,
+            function: self.theme.colors.syntax_function,
+            variable: self.theme.colors.syntax_variable,
+        };
+        self.syntax_caches
+            .borrow_mut()
+            .entry(document_id)
+            .or_default()
+            .highlight_line(
+                document.path.as_deref(),
+                document.revision(),
+                palette,
+                line_index,
+                |line| document.line(line),
+            )
     }
 
     fn register_click(&mut self, column: u16, row: u16) -> u8 {
@@ -2026,7 +2067,7 @@ pub(super) fn explorer_create_dialog(directory: &Path, create_directory: bool) -
     }
 }
 
-pub(crate) const SETTINGS_KEYS: [&str; 33] = [
+pub(crate) const SETTINGS_KEYS: [&str; 35] = [
     "editor.indent_width",
     "editor.insert_spaces",
     "editor.default_line_ending",
@@ -2034,6 +2075,8 @@ pub(crate) const SETTINGS_KEYS: [&str; 33] = [
     "editor.line_numbers",
     "editor.scrollbar",
     "editor.soft_wrap",
+    "editor.syntax_highlighting",
+    "editor.syntax_highlighting_max_file_size_kib",
     "editor.header_style",
     "workspace.minimum_pane_width",
     "workspace.minimum_pane_height",
@@ -2323,6 +2366,40 @@ mod tests {
 
         assert!(application.overlay.is_none());
         assert_eq!(application.open_document_ids().len(), 1);
+    }
+
+    #[test]
+    fn syntax_highlighting_can_be_disabled() {
+        let mut application = Application::new_for_test();
+        let path = application.explorer.root.join("main.rs");
+        let document_id = application.documents.new_at_path(path).unwrap();
+        application
+            .documents
+            .get_mut(document_id)
+            .insert(0, "fn main() {};");
+        application.config.effective.editor.syntax_highlighting = false;
+        let document = application.documents.get(document_id);
+
+        assert!(application.syntax_spans(document_id, document, 0).is_empty());
+    }
+
+    #[test]
+    fn oversized_documents_skip_syntax_highlighting() {
+        let mut application = Application::new_for_test();
+        let path = application.explorer.root.join("main.rs");
+        let document_id = application.documents.new_at_path(path).unwrap();
+        application
+            .documents
+            .get_mut(document_id)
+            .insert(0, "fn main() {};");
+        application
+            .config
+            .effective
+            .editor
+            .syntax_highlighting_max_file_size_kib = 0;
+        let document = application.documents.get(document_id);
+
+        assert!(application.syntax_spans(document_id, document, 0).is_empty());
     }
 
     #[test]

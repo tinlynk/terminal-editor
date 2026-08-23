@@ -14,7 +14,7 @@ use crate::{
     app::{Application, FocusOwner, Overlay},
     document::Document,
     layout::{CalculatedLayout, PaneId, Rect},
-    syntax::{SyntaxHighlighter, SyntaxSpan},
+    syntax::SyntaxSpan,
     terminal_emulator::{TerminalCell, TerminalColor},
     workspace::Pane,
 };
@@ -878,24 +878,13 @@ fn draw_editor(
     } else {
         crate::editor::WrappedPosition::default()
     };
-    let mut syntax = document
-        .path
-        .as_deref()
-        .and_then(SyntaxHighlighter::for_path);
-    if let Some(highlighter) = syntax.as_mut() {
-        for line_index in 0..viewport_line {
-            highlighter.highlight_line(&document.line(line_index));
-        }
-    }
     let mut highlighted_line = None;
     let mut syntax_spans = Vec::new();
     if soft_wrap {
         for row in &visible_wrapped_rows {
             let position = row.position;
             if highlighted_line != Some(position.line) {
-                syntax_spans = syntax.as_mut().map_or_else(Vec::new, |highlighter| {
-                    highlighter.highlight_line(&document.line(position.line))
-                });
+                syntax_spans = application.syntax_spans(document_id, document, position.line);
                 highlighted_line = Some(position.line);
             }
             let mut spans = Vec::new();
@@ -947,9 +936,7 @@ fn draw_editor(
             let maximum_chars = usize::from(area.width).saturating_mul(4).max(1);
             let segment_end = segment_start.saturating_add(maximum_chars).min(end);
             let text = document.slice(segment_start, segment_end);
-            syntax_spans = syntax.as_mut().map_or_else(Vec::new, |highlighter| {
-                highlighter.highlight_line(&document.line(line_index))
-            });
+            syntax_spans = application.syntax_spans(document_id, document, line_index);
             let overflow = segment_end < end || text.width() > available_text_width;
             let text_width = available_text_width.saturating_sub(usize::from(overflow));
             let mut spans = Vec::new();

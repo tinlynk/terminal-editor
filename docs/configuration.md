@@ -21,6 +21,8 @@ undo_limit_mib = 32
 line_numbers = true
 scrollbar = true
 soft_wrap = false
+syntax_highlighting = true
+syntax_highlighting_max_file_size_kib = 1024
 header_style = "tabs"
 
 [workspace]
@@ -53,5 +55,7 @@ active = "default"
 ```
 
 `editor.default_line_ending` accepts `lf` or `crlf`. `editor.header_style` accepts `tabs` or `breadcrumbs`. Set `editor.soft_wrap = true` to wrap long lines and disable horizontal panning and its scrollbar.
+
+Syntax highlighting is enabled by default for recognized source files. Set `editor.syntax_highlighting = false` to disable it, or change `editor.syntax_highlighting_max_file_size_kib` from its 1024 KiB default to control the largest file parsed for highlighting.
 
 Use [theme authoring](themes.md) for `theme.active` and custom theme behavior.

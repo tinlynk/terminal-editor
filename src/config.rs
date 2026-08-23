@@ -12,6 +12,7 @@ use crate::{AppError, Result};
 const CONFIG_RELATIVE_PATH: &str = ".tinlynk/terminal-editor/config.toml";
 const DEFAULT_UNDO_LIMIT_MIB: usize = 32;
 const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+const DEFAULT_SYNTAX_HIGHLIGHTING_MAX_FILE_SIZE_KIB: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,6 +40,8 @@ pub struct EditorConfig {
     pub line_numbers: bool,
     pub scrollbar: bool,
     pub soft_wrap: bool,
+    pub syntax_highlighting: bool,
+    pub syntax_highlighting_max_file_size_kib: usize,
     pub header_style: EditorHeaderStyle,
 }
 
@@ -52,6 +55,8 @@ impl Default for EditorConfig {
             line_numbers: true,
             scrollbar: true,
             soft_wrap: false,
+            syntax_highlighting: true,
+            syntax_highlighting_max_file_size_kib: DEFAULT_SYNTAX_HIGHLIGHTING_MAX_FILE_SIZE_KIB,
             header_style: EditorHeaderStyle::Tabs,
         }
     }
@@ -214,6 +219,11 @@ impl Config {
             "editor.line_numbers" => self.editor.line_numbers.to_string(),
             "editor.scrollbar" => self.editor.scrollbar.to_string(),
             "editor.soft_wrap" => self.editor.soft_wrap.to_string(),
+            "editor.syntax_highlighting" => self.editor.syntax_highlighting.to_string(),
+            "editor.syntax_highlighting_max_file_size_kib" => self
+                .editor
+                .syntax_highlighting_max_file_size_kib
+                .to_string(),
             "editor.header_style" => match self.editor.header_style {
                 EditorHeaderStyle::Tabs => "tabs".to_owned(),
                 EditorHeaderStyle::Breadcrumbs => "breadcrumbs".to_owned(),
@@ -302,6 +312,8 @@ struct PartialEditorConfig {
     line_numbers: Option<bool>,
     scrollbar: Option<bool>,
     soft_wrap: Option<bool>,
+    syntax_highlighting: Option<bool>,
+    syntax_highlighting_max_file_size_kib: Option<usize>,
     header_style: Option<EditorHeaderStyle>,
 }
 
@@ -588,6 +600,7 @@ fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
     let trimmed = value.trim();
     match dotted_key {
         "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar" | "editor.soft_wrap"
+        | "editor.syntax_highlighting"
         | "explorer.visible" | "mouse.enabled" | "clipboard.osc52" | "terminal.allow_child_osc52_write"
         | "ui.bottom_terminal_visible" => {
             match trimmed {
@@ -603,7 +616,8 @@ fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
                 AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
             })
         }
-        "editor.undo_limit_mib" | "terminal.scrollback_lines" => {
+        "editor.undo_limit_mib" | "editor.syntax_highlighting_max_file_size_kib"
+        | "terminal.scrollback_lines" => {
             trimmed.parse::<i64>().map(Value::from).map_err(|_| {
                 AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
             })
@@ -781,6 +795,22 @@ fn parse_partial_config(
                 ),
                 scrollbar: config_value(table, "scrollbar", "editor", path, scope, diagnostics),
                 soft_wrap: config_value(table, "soft_wrap", "editor", path, scope, diagnostics),
+                syntax_highlighting: config_value(
+                    table,
+                    "syntax_highlighting",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                syntax_highlighting_max_file_size_kib: config_value(
+                    table,
+                    "syntax_highlighting_max_file_size_kib",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
                 header_style: config_value(table, "header_style", "editor", path, scope, diagnostics),
             }
         }),
@@ -1022,6 +1052,14 @@ fn apply_scope(
         assign(&mut config.editor.line_numbers, editor.line_numbers);
         assign(&mut config.editor.scrollbar, editor.scrollbar);
         assign(&mut config.editor.soft_wrap, editor.soft_wrap);
+        assign(
+            &mut config.editor.syntax_highlighting,
+            editor.syntax_highlighting,
+        );
+        assign(
+            &mut config.editor.syntax_highlighting_max_file_size_kib,
+            editor.syntax_highlighting_max_file_size_kib,
+        );
         assign(&mut config.editor.header_style, editor.header_style);
         provenance.insert("editor".to_owned(), scope);
     }

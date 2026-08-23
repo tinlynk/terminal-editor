@@ -594,6 +594,7 @@ fn setting_accepts_character(key: &str, value: &str, character: char) -> bool {
     const INTEGER_SETTINGS: &[&str] = &[
         "editor.indent_width",
         "editor.undo_limit_mib",
+        "editor.syntax_highlighting_max_file_size_kib",
         "workspace.minimum_pane_width",
         "workspace.minimum_pane_height",
         "explorer.width",
@@ -613,7 +614,8 @@ fn setting_accepts_character(key: &str, value: &str, character: char) -> bool {
 pub(crate) fn setting_options(key: &str) -> Option<&'static [&'static str]> {
     match key {
         "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar"
-        | "editor.soft_wrap" | "explorer.visible" | "mouse.enabled" | "clipboard.osc52"
+        | "editor.soft_wrap" | "editor.syntax_highlighting" | "explorer.visible"
+        | "mouse.enabled" | "clipboard.osc52"
         | "terminal.allow_child_osc52_write" | "ui.bottom_terminal_visible" => {
             Some(&["true", "false"])
         }

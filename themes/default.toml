@@ -42,6 +42,13 @@ tree_guide = "dark-gray"
 dialog_backdrop = "default"
 dialog_header_background = "#007ACC"
 dialog_header_foreground = "white"
+syntax_comment = "#6A9955"
+syntax_string = "#CE9178"
+syntax_number = "#B5CEA8"
+syntax_keyword = "#569CD6"
+syntax_type = "#4EC9B0"
+syntax_function = "#DCDCAA"
+syntax_variable = "#9CDCFE"
 
 [icons]
 left_panel_visible = "◧"
