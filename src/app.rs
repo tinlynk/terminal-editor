@@ -425,13 +425,13 @@ impl Application {
                 }
                 let click_count = self.register_click(mouse.column, mouse.row);
                 if let Some(area) = geometry.explorer
-                    && explorer_divider_contains(area, mouse.column, mouse.row)
+                    && explorer_divider_contains(area, geometry.explorer_divider, mouse.column, mouse.row)
                 {
                     self.workbench_drag = Some(WorkbenchDrag::Explorer);
                     return Ok(());
                 }
                 if let Some(area) = geometry.terminal
-                    && bottom_divider_contains(area, mouse.column, mouse.row)
+                    && bottom_divider_contains(area, geometry.terminal_divider, mouse.column, mouse.row)
                 {
                     self.workbench_drag = Some(WorkbenchDrag::BottomTerminal);
                     return Ok(());
@@ -2152,17 +2152,18 @@ impl Application {
     }
 }
 
-fn explorer_divider_contains(area: Rect, column: u16, row: u16) -> bool {
-    row >= area.y
+fn explorer_divider_contains(area: Rect, divider: Option<Rect>, column: u16, row: u16) -> bool {
+    (row >= area.y
         && row < area.y.saturating_add(area.height)
-        && (column == area.x.saturating_add(area.width.saturating_sub(1))
-            || column == area.x.saturating_add(area.width))
+        && column == area.x.saturating_add(area.width.saturating_sub(1)))
+        || divider.is_some_and(|d| d.contains(column, row))
 }
 
-fn bottom_divider_contains(area: Rect, column: u16, row: u16) -> bool {
-    column >= area.x
+fn bottom_divider_contains(area: Rect, divider: Option<Rect>, column: u16, row: u16) -> bool {
+    (column >= area.x
         && column < area.x.saturating_add(area.width)
-        && (row == area.y || row.saturating_add(1) == area.y)
+        && row == area.y)
+        || divider.is_some_and(|d| d.contains(column, row))
 }
 
 fn title_control_command(action: render::TitleControlAction) -> Command {
@@ -2244,7 +2245,7 @@ pub(super) fn explorer_create_dialog(directory: &Path, create_directory: bool) -
     }
 }
 
-pub(crate) const SETTINGS_KEYS: [&str; 36] = [
+pub(crate) const SETTINGS_KEYS: [&str; 40] = [
     "editor.indent_width",
     "editor.insert_spaces",
     "editor.default_line_ending",
@@ -2259,10 +2260,13 @@ pub(crate) const SETTINGS_KEYS: [&str; 36] = [
     "workspace.minimum_pane_width",
     "workspace.minimum_pane_height",
     "workspace.initial_split_ratio",
+    "workspace.vertical_divider_thickness",
+    "workspace.horizontal_divider_thickness",
     "explorer.visible",
     "explorer.width",
     "explorer.exclusions",
     "explorer.refresh_interval_seconds",
+    "explorer.divider_thickness",
     "mouse.enabled",
     "clipboard.osc52",
     "terminal.shell",
@@ -2272,6 +2276,7 @@ pub(crate) const SETTINGS_KEYS: [&str; 36] = [
     "terminal.leader",
     "ui.bottom_terminal_visible",
     "ui.bottom_terminal_height",
+    "ui.terminal_divider_thickness",
     "theme.active",
     "keybindings.ctrl+q",
     "keybindings.ctrl+s",
@@ -4065,10 +4070,31 @@ mod tests {
             width: 24,
             height: 10,
         };
-        assert!(explorer_divider_contains(area, 23, 5));
-        assert!(explorer_divider_contains(area, 24, 5));
-        assert!(bottom_divider_contains(area, 5, 2));
-        assert!(bottom_divider_contains(area, 5, 1));
+        let explorer_divider = Some(Rect {
+            x: 24,
+            y: 2,
+            width: 1,
+            height: 10,
+        });
+        assert!(explorer_divider_contains(area, explorer_divider, 23, 5));
+        assert!(explorer_divider_contains(area, explorer_divider, 24, 5));
+        assert!(!explorer_divider_contains(area, explorer_divider, 25, 5));
+
+        let terminal_area = Rect {
+            x: 0,
+            y: 2,
+            width: 80,
+            height: 10,
+        };
+        let terminal_divider = Some(Rect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 1,
+        });
+        assert!(bottom_divider_contains(terminal_area, terminal_divider, 5, 2));
+        assert!(bottom_divider_contains(terminal_area, terminal_divider, 5, 1));
+        assert!(!bottom_divider_contains(terminal_area, terminal_divider, 5, 0));
     }
 
     #[test]
@@ -4078,6 +4104,7 @@ mod tests {
         fs::create_dir(&nested).unwrap();
         let file = nested.join("note.txt");
         fs::write(&file, "hello").unwrap();
+        let canonical_nested = fs::canonicalize(&nested).unwrap();
         let canonical_file = fs::canonicalize(&file).unwrap();
         let mut application = Application::new_for_test();
         application.overlay = Some(file_dialog(directory.path(), false, &application.explorer));
@@ -4090,8 +4117,8 @@ mod tests {
         else {
             panic!("expected file dialog");
         };
-        assert_eq!(current, &nested);
-        assert_eq!(entries, &vec![file.clone()]);
+        assert_eq!(current, &canonical_nested);
+        assert_eq!(entries, &vec![canonical_file.clone()]);
         application.activate_file_dialog_selection().unwrap();
         assert!(application.overlay.is_none());
         let document_id = application.focused_document_id().unwrap();

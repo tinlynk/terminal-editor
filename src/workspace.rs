@@ -131,8 +131,16 @@ impl Workspace {
         area: Rect,
         minimum_width: u16,
         minimum_height: u16,
+        vertical_divider_thickness: u16,
+        horizontal_divider_thickness: u16,
     ) -> CalculatedLayout {
-        self.layout.calculate(area, minimum_width, minimum_height)
+        self.layout.calculate(
+            area,
+            minimum_width,
+            minimum_height,
+            vertical_divider_thickness,
+            horizontal_divider_thickness,
+        )
     }
 
     pub fn focus_at(&mut self, layout: &CalculatedLayout, x: u16, y: u16) -> bool {

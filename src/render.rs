@@ -26,7 +26,6 @@ const TITLE_CONTROL_GAP: u16 = 1;
 const TITLE_CONTROLS_WIDTH: u16 = TITLE_CONTROL_WIDTH * 4 + TITLE_CONTROL_GAP * 3;
 const TITLE_CONTROLS_RIGHT_INSET: u16 = 1;
 const EXPLORER_BORDER_WIDTH: u16 = 2;
-const EXPLORER_SEPARATOR_WIDTH: u16 = 1;
 const EXPLORER_ROOT_ACTION_GAP: usize = 1;
 const MINIMUM_WORKSPACE_WIDTH: u16 = 20;
 
@@ -80,8 +79,10 @@ pub struct WorkbenchGeometry {
     pub title: Option<Rect>,
     pub title_controls: TitleControls,
     pub explorer: Option<Rect>,
+    pub explorer_divider: Option<Rect>,
     pub workspace: Rect,
     pub terminal: Option<Rect>,
+    pub terminal_divider: Option<Rect>,
     pub status: Rect,
     pub pane_layout: CalculatedLayout,
 }
@@ -291,9 +292,10 @@ pub fn geometry(application: &Application, screen: Rect) -> WorkbenchGeometry {
         width: screen.width,
         height: status_height,
     };
-    let explorer = (application.explorer.visible && screen.width >= 80).then(|| {
+    let explorer_divider_thickness = application.config.effective.explorer.divider_thickness;
+    let (explorer, explorer_divider) = if application.explorer.visible && screen.width >= 80 {
         let maximum_width = content.width.saturating_sub(
-            MINIMUM_WORKSPACE_WIDTH.saturating_add(EXPLORER_SEPARATOR_WIDTH),
+            MINIMUM_WORKSPACE_WIDTH.saturating_add(explorer_divider_thickness),
         );
         let width = application
             .config
@@ -303,11 +305,20 @@ pub fn geometry(application: &Application, screen: Rect) -> WorkbenchGeometry {
             .max(explorer_required_width(application))
             .min(maximum_width);
         let area = Rect { width, ..content };
-        content.x = content.x.saturating_add(width.saturating_add(EXPLORER_SEPARATOR_WIDTH));
-        content.width = content.width.saturating_sub(width.saturating_add(EXPLORER_SEPARATOR_WIDTH));
-        area
-    });
-    let bottom_terminal = (application.bottom_terminal_visible && screen.height >= 24).then(|| {
+        let divider = Rect {
+            x: area.x.saturating_add(width),
+            y: area.y,
+            width: explorer_divider_thickness,
+            height: area.height,
+        };
+        content.x = content.x.saturating_add(width.saturating_add(explorer_divider_thickness));
+        content.width = content.width.saturating_sub(width.saturating_add(explorer_divider_thickness));
+        (Some(area), Some(divider))
+    } else {
+        (None, None)
+    };
+    let terminal_divider_thickness = application.config.effective.ui.terminal_divider_thickness;
+    let (bottom_terminal, terminal_divider) = if application.bottom_terminal_visible && screen.height >= 24 {
         let height = application
             .config
             .effective
@@ -322,20 +333,32 @@ pub fn geometry(application: &Application, screen: Rect) -> WorkbenchGeometry {
             width: content.width,
             height,
         };
-        content.height = content.height.saturating_sub(height.saturating_add(1));
-        area
-    });
+        let divider = Rect {
+            x: content.x,
+            y: area.y.saturating_sub(terminal_divider_thickness),
+            width: content.width,
+            height: terminal_divider_thickness,
+        };
+        content.height = content.height.saturating_sub(height.saturating_add(terminal_divider_thickness));
+        (Some(area), Some(divider))
+    } else {
+        (None, None)
+    };
     let pane_layout = application.workspace.calculate(
         content,
         application.config.effective.workspace.minimum_pane_width,
         application.config.effective.workspace.minimum_pane_height,
+        application.config.effective.workspace.vertical_divider_thickness,
+        application.config.effective.workspace.horizontal_divider_thickness,
     );
     WorkbenchGeometry {
         title,
         title_controls,
         explorer,
+        explorer_divider,
         workspace: content,
         terminal: bottom_terminal,
+        terminal_divider,
         status,
         pane_layout,
     }
@@ -487,11 +510,29 @@ pub fn draw(frame: &mut Frame<'_>, application: &Application) {
     if let Some(area) = geometry.explorer {
         draw_explorer(frame, application, area);
     }
+    if let Some(divider) = geometry.explorer_divider
+        && divider.width > 0
+    {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(application.theme.colors.divider)),
+            to_tui(divider),
+        );
+    }
     draw_workspace(frame, application, &geometry.pane_layout);
     for splitter in &geometry.pane_layout.splitters {
+        if splitter.rect.width > 0 && splitter.rect.height > 0 {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(application.theme.colors.divider)),
+                to_tui(splitter.rect),
+            );
+        }
+    }
+    if let Some(divider) = geometry.terminal_divider
+        && divider.height > 0
+    {
         frame.render_widget(
-            Paragraph::new(" ").style(Style::default().bg(application.theme.colors.divider)),
-            to_tui(splitter.rect),
+            Block::default().style(Style::default().bg(application.theme.colors.divider)),
+            to_tui(divider),
         );
     }
     if let Some(area) = geometry.terminal {
@@ -1981,6 +2022,45 @@ mod tests {
         assert!(explorer.width > application.config.effective.explorer.width);
         assert_eq!(explorer.width, explorer_required_width(&application));
         assert!(geometry.workspace.width >= MINIMUM_WORKSPACE_WIDTH);
+    }
+
+    #[test]
+    fn workbench_geometry_respects_configurable_divider_thicknesses() {
+        let mut application = Application::new_for_test();
+        application.explorer.visible = true;
+        application.config.effective.explorer.visible = true;
+        application.config.effective.explorer.divider_thickness = 3;
+        application.bottom_terminal_visible = true;
+        application.config.effective.ui.bottom_terminal_visible = true;
+        application.config.effective.ui.bottom_terminal_height = 6;
+        application.config.effective.ui.terminal_divider_thickness = 2;
+        application.config.effective.workspace.vertical_divider_thickness = 4;
+        application.config.effective.workspace.horizontal_divider_thickness = 5;
+        application.workspace.split_contextual(crate::layout::SplitDirection::Vertical);
+
+        let geom = geometry(
+            &application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            },
+        );
+
+        let explorer = geom.explorer.unwrap();
+        let explorer_divider = geom.explorer_divider.unwrap();
+        assert_eq!(explorer_divider.x, explorer.x + explorer.width);
+        assert_eq!(explorer_divider.width, 3);
+        assert_eq!(geom.workspace.x, explorer_divider.x + 3);
+
+        let terminal = geom.terminal.unwrap();
+        let terminal_divider = geom.terminal_divider.unwrap();
+        assert_eq!(terminal_divider.y, terminal.y - 2);
+        assert_eq!(terminal_divider.height, 2);
+
+        assert_eq!(geom.pane_layout.splitters.len(), 1);
+        assert_eq!(geom.pane_layout.splitters[0].rect.width, 4);
     }
 
     #[test]

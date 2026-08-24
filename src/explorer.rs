@@ -41,7 +41,7 @@ impl Explorer {
     pub fn new(root: PathBuf, visible: bool, exclusions: &[String]) -> Result<Self> {
         let exclusions = compile_exclusions(exclusions)?;
         let mut explorer = Self {
-            root,
+            root: fs::canonicalize(&root).unwrap_or(root),
             visible,
             selected: 0,
             viewport_row: 0,
@@ -336,10 +336,11 @@ mod tests {
         let current_directory = tempdir().unwrap();
         let workspace = current_directory.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
+        let canonical_workspace = fs::canonicalize(&workspace).unwrap();
 
         assert_eq!(
             root_for_startup(Some(Path::new("workspace")), current_directory.path()),
-            workspace
+            canonical_workspace
         );
     }
 

@@ -71,6 +71,8 @@ pub struct WorkspaceConfig {
     pub minimum_pane_width: u16,
     pub minimum_pane_height: u16,
     pub initial_split_ratio: f32,
+    pub vertical_divider_thickness: u16,
+    pub horizontal_divider_thickness: u16,
 }
 
 impl Default for WorkspaceConfig {
@@ -79,6 +81,8 @@ impl Default for WorkspaceConfig {
             minimum_pane_width: 12,
             minimum_pane_height: 4,
             initial_split_ratio: 0.5,
+            vertical_divider_thickness: 1,
+            horizontal_divider_thickness: 0,
         }
     }
 }
@@ -90,6 +94,7 @@ pub struct ExplorerConfig {
     pub width: u16,
     pub exclusions: Vec<String>,
     pub refresh_interval_seconds: u64,
+    pub divider_thickness: u16,
 }
 
 impl Default for ExplorerConfig {
@@ -99,6 +104,7 @@ impl Default for ExplorerConfig {
             width: 24,
             exclusions: vec![".git".to_owned(), ".git/**".to_owned()],
             refresh_interval_seconds: 5,
+            divider_thickness: 1,
         }
     }
 }
@@ -154,6 +160,7 @@ impl Default for TerminalConfig {
 pub struct UiConfig {
     pub bottom_terminal_visible: bool,
     pub bottom_terminal_height: u16,
+    pub terminal_divider_thickness: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -175,6 +182,7 @@ impl Default for UiConfig {
         Self {
             bottom_terminal_visible: false,
             bottom_terminal_height: 6,
+            terminal_divider_thickness: 0,
         }
     }
 }
@@ -237,10 +245,13 @@ impl Config {
             "workspace.minimum_pane_width" => self.workspace.minimum_pane_width.to_string(),
             "workspace.minimum_pane_height" => self.workspace.minimum_pane_height.to_string(),
             "workspace.initial_split_ratio" => self.workspace.initial_split_ratio.to_string(),
+            "workspace.vertical_divider_thickness" => self.workspace.vertical_divider_thickness.to_string(),
+            "workspace.horizontal_divider_thickness" => self.workspace.horizontal_divider_thickness.to_string(),
             "explorer.visible" => self.explorer.visible.to_string(),
             "explorer.width" => self.explorer.width.to_string(),
             "explorer.exclusions" => self.explorer.exclusions.join(", "),
             "explorer.refresh_interval_seconds" => self.explorer.refresh_interval_seconds.to_string(),
+            "explorer.divider_thickness" => self.explorer.divider_thickness.to_string(),
             "mouse.enabled" => self.mouse.enabled.to_string(),
             "clipboard.osc52" => self.clipboard.osc52.to_string(),
             "terminal.shell" => self.terminal.shell.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -250,6 +261,7 @@ impl Config {
             "terminal.leader" => self.terminal.leader.clone(),
             "ui.bottom_terminal_visible" => self.ui.bottom_terminal_visible.to_string(),
             "ui.bottom_terminal_height" => self.ui.bottom_terminal_height.to_string(),
+            "ui.terminal_divider_thickness" => self.ui.terminal_divider_thickness.to_string(),
             "theme.active" => self.theme.active.clone(),
             key => self.keybindings.get(key).cloned().unwrap_or_default(),
         }
@@ -330,6 +342,8 @@ struct PartialWorkspaceConfig {
     minimum_pane_width: Option<u16>,
     minimum_pane_height: Option<u16>,
     initial_split_ratio: Option<f32>,
+    vertical_divider_thickness: Option<u16>,
+    horizontal_divider_thickness: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -339,6 +353,7 @@ struct PartialExplorerConfig {
     width: Option<u16>,
     exclusions: Option<Vec<String>>,
     refresh_interval_seconds: Option<u64>,
+    divider_thickness: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -368,6 +383,7 @@ struct PartialTerminalConfig {
 struct PartialUiConfig {
     bottom_terminal_visible: Option<bool>,
     bottom_terminal_height: Option<u16>,
+    terminal_divider_thickness: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -636,10 +652,25 @@ fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
                 AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
             })
         }
-        "workspace.minimum_pane_width" | "workspace.minimum_pane_height" | "explorer.width" | "ui.bottom_terminal_height" => {
-            trimmed.parse::<i64>().map(Value::from).map_err(|_| {
+        "workspace.minimum_pane_width"
+        | "workspace.minimum_pane_height"
+        | "workspace.vertical_divider_thickness"
+        | "workspace.horizontal_divider_thickness"
+        | "explorer.width"
+        | "explorer.divider_thickness"
+        | "ui.bottom_terminal_height"
+        | "ui.terminal_divider_thickness" => {
+            let parsed = trimmed.parse::<i64>().map_err(|_| {
                 AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
-            })
+            })?;
+            if ["workspace.vertical_divider_thickness", "workspace.horizontal_divider_thickness", "explorer.divider_thickness", "ui.terminal_divider_thickness"].contains(&dotted_key)
+                && !(0..=10).contains(&parsed)
+            {
+                return Err(AppError::Arguments(format!(
+                    "`{dotted_key}` must be between 0 and 10, got `{trimmed}`"
+                )));
+            }
+            Ok(Value::from(parsed))
         }
         "workspace.initial_split_ratio" => {
             trimmed.parse::<f64>().map(Value::from).map_err(|_| {
@@ -862,6 +893,22 @@ fn parse_partial_config(
                     scope,
                     diagnostics,
                 ),
+                vertical_divider_thickness: config_value(
+                    table,
+                    "vertical_divider_thickness",
+                    "workspace",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                horizontal_divider_thickness: config_value(
+                    table,
+                    "horizontal_divider_thickness",
+                    "workspace",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
             }
         }),
         explorer: config_table(root, "explorer", path, scope, diagnostics).map(|table| {
@@ -872,6 +919,14 @@ fn parse_partial_config(
                 refresh_interval_seconds: config_value(
                     table,
                     "refresh_interval_seconds",
+                    "explorer",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
+                divider_thickness: config_value(
+                    table,
+                    "divider_thickness",
                     "explorer",
                     path,
                     scope,
@@ -924,6 +979,14 @@ fn parse_partial_config(
             bottom_terminal_height: config_value(
                 table,
                 "bottom_terminal_height",
+                "ui",
+                path,
+                scope,
+                diagnostics,
+            ),
+            terminal_divider_thickness: config_value(
+                table,
+                "terminal_divider_thickness",
                 "ui",
                 path,
                 scope,
@@ -1109,6 +1172,14 @@ fn apply_scope(
             &mut config.workspace.initial_split_ratio,
             workspace.initial_split_ratio,
         );
+        assign(
+            &mut config.workspace.vertical_divider_thickness,
+            workspace.vertical_divider_thickness,
+        );
+        assign(
+            &mut config.workspace.horizontal_divider_thickness,
+            workspace.horizontal_divider_thickness,
+        );
         provenance.insert("workspace".to_owned(), scope);
     }
     if let Some(explorer) = partial.explorer {
@@ -1118,6 +1189,10 @@ fn apply_scope(
         assign(
             &mut config.explorer.refresh_interval_seconds,
             explorer.refresh_interval_seconds,
+        );
+        assign(
+            &mut config.explorer.divider_thickness,
+            explorer.divider_thickness,
         );
         provenance.insert("explorer".to_owned(), scope);
     }
@@ -1137,6 +1212,10 @@ fn apply_scope(
         assign(
             &mut config.ui.bottom_terminal_height,
             ui.bottom_terminal_height,
+        );
+        assign(
+            &mut config.ui.terminal_divider_thickness,
+            ui.terminal_divider_thickness,
         );
         provenance.insert("ui".to_owned(), scope);
     }
@@ -1213,6 +1292,30 @@ fn validate(config: &mut Config, diagnostics: &mut Vec<ConfigDiagnostic>) {
         "workspace.initial_split_ratio must be between 0.1 and 0.9; the default was used",
     ) {
         config.workspace.initial_split_ratio = defaults.workspace.initial_split_ratio;
+    }
+    if fallback(
+        config.workspace.vertical_divider_thickness > 10,
+        "workspace.vertical_divider_thickness must be between 0 and 10; the default was used",
+    ) {
+        config.workspace.vertical_divider_thickness = defaults.workspace.vertical_divider_thickness;
+    }
+    if fallback(
+        config.workspace.horizontal_divider_thickness > 10,
+        "workspace.horizontal_divider_thickness must be between 0 and 10; the default was used",
+    ) {
+        config.workspace.horizontal_divider_thickness = defaults.workspace.horizontal_divider_thickness;
+    }
+    if fallback(
+        config.explorer.divider_thickness > 10,
+        "explorer.divider_thickness must be between 0 and 10; the default was used",
+    ) {
+        config.explorer.divider_thickness = defaults.explorer.divider_thickness;
+    }
+    if fallback(
+        config.ui.terminal_divider_thickness > 10,
+        "ui.terminal_divider_thickness must be between 0 and 10; the default was used",
+    ) {
+        config.ui.terminal_divider_thickness = defaults.ui.terminal_divider_thickness;
     }
     if fallback(
         config
@@ -1302,8 +1405,65 @@ mod tests {
         assert!(!config.editor.soft_wrap);
         assert_eq!(config.editor.header_style, EditorHeaderStyle::Tabs);
         assert_eq!(config.explorer.refresh_interval_seconds, 5);
+        assert_eq!(config.explorer.divider_thickness, 1);
+        assert_eq!(config.workspace.vertical_divider_thickness, 1);
+        assert_eq!(config.workspace.horizontal_divider_thickness, 0);
+        assert_eq!(config.ui.terminal_divider_thickness, 0);
         assert_eq!(config.terminal.scrollback_lines, 10_000);
         assert!(!config.terminal.allow_child_osc52_write);
+    }
+
+    #[test]
+    fn divider_thicknesses_can_be_configured_and_mutated() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(
+            &user_path,
+            "[explorer]\ndivider_thickness = 3\n[workspace]\nvertical_divider_thickness = 2\nhorizontal_divider_thickness = 4\n[ui]\nterminal_divider_thickness = 0\n",
+        )
+        .unwrap();
+
+        let mut loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+
+        assert_eq!(loaded.effective.explorer.divider_thickness, 3);
+        assert_eq!(loaded.effective.workspace.vertical_divider_thickness, 2);
+        assert_eq!(loaded.effective.workspace.horizontal_divider_thickness, 4);
+        assert_eq!(loaded.effective.ui.terminal_divider_thickness, 0);
+
+        loaded
+            .set_setting_from_string(ConfigScope::User, "explorer.divider_thickness", "5")
+            .unwrap();
+        assert_eq!(loaded.effective.explorer.divider_thickness, 5);
+
+        loaded
+            .set_setting_from_string(
+                ConfigScope::User,
+                "workspace.vertical_divider_thickness",
+                "4",
+            )
+            .unwrap();
+        assert_eq!(loaded.effective.workspace.vertical_divider_thickness, 4);
+
+        loaded
+            .set_setting_from_string(
+                ConfigScope::User,
+                "workspace.horizontal_divider_thickness",
+                "5",
+            )
+            .unwrap();
+        assert_eq!(loaded.effective.workspace.horizontal_divider_thickness, 5);
+
+        loaded
+            .set_setting_from_string(ConfigScope::User, "ui.terminal_divider_thickness", "2")
+            .unwrap();
+        assert_eq!(loaded.effective.ui.terminal_divider_thickness, 2);
+
+        assert!(
+            loaded
+                .set_setting_from_string(ConfigScope::User, "explorer.divider_thickness", "15")
+                .is_err()
+        );
     }
 
     #[test]

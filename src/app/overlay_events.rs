@@ -671,10 +671,14 @@ fn setting_accepts_character(key: &str, value: &str, character: char) -> bool {
         "editor.autosave_interval_seconds",
         "workspace.minimum_pane_width",
         "workspace.minimum_pane_height",
+        "workspace.vertical_divider_thickness",
+        "workspace.horizontal_divider_thickness",
         "explorer.width",
+        "explorer.divider_thickness",
         "explorer.refresh_interval_seconds",
         "terminal.scrollback_lines",
         "ui.bottom_terminal_height",
+        "ui.terminal_divider_thickness",
     ];
     if INTEGER_SETTINGS.contains(&key) {
         return character.is_ascii_digit() || (character == '-' && value.is_empty());

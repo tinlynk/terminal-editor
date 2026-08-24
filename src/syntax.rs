@@ -79,10 +79,18 @@ fn syntax_for_path(path: &Path) -> Option<&'static syntect::parsing::SyntaxRefer
         .flatten()
         .filter(|syntax| syntax.name != "Plain Text")
         .or_else(|| {
-            let syntax_name = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            let syntax_name = if path
+                .file_name()?
+                .to_str()?
+                .eq_ignore_ascii_case("Vagrantfile")
+            {
+                "Ruby"
+            } else {
+                match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
                 "md" | "markdown" | "mdown" | "mkdn" | "mdx" => "Markdown",
                 "ts" | "tsx" | "mts" | "cts" => "JavaScript",
                 _ => return None,
+                }
             };
             SYNTAX_SET.find_syntax_by_name(syntax_name)
         })
@@ -182,6 +190,11 @@ fn build_syntax_theme(palette: SyntaxPalette) -> Theme {
             ("entity.name.type", palette.type_name),
             ("entity.name.function", palette.function),
             ("variable", palette.variable),
+            ("markup.heading", palette.keyword),
+            ("markup.italic", palette.variable),
+            ("markup.bold", palette.type_name),
+            ("markup.underline.link", palette.function),
+            ("markup.raw.inline", palette.string),
         ]
         .into_iter()
         .map(|(scope, color)| ThemeItem {
@@ -240,12 +253,25 @@ mod tests {
     fn markdown_and_typescript_paths_produce_syntax_spans() {
         for path in ["README.md", "guide.mdx"] {
             let mut markdown = SyntaxHighlighter::for_path(Path::new(path)).unwrap();
-            assert!(!markdown.highlight_line("# Heading").is_empty());
+            assert!(markdown
+                .highlight_line("# Heading with *emphasis* and `code`")
+                .iter()
+                .any(|span| span.color != default_palette().foreground));
         }
         for path in ["app.ts", "view.tsx", "module.mts", "legacy.cts"] {
             let mut typescript = SyntaxHighlighter::for_path(Path::new(path)).unwrap();
             assert!(!typescript.highlight_line("const value: number = 1;").is_empty());
         }
+    }
+
+    #[test]
+    fn vagrantfile_paths_use_ruby_highlighting() {
+        let mut highlighter = SyntaxHighlighter::for_path(Path::new("Vagrantfile")).unwrap();
+
+        assert!(highlighter
+            .highlight_line("Vagrant.configure(\"2\") do |config|")
+            .iter()
+            .any(|span| span.color != default_palette().foreground));
     }
 
     #[test]

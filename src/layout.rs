@@ -68,9 +68,18 @@ impl LayoutNode {
         area: Rect,
         minimum_width: u16,
         minimum_height: u16,
+        vertical_splitter_thickness: u16,
+        horizontal_splitter_thickness: u16,
     ) -> CalculatedLayout {
         let mut result = CalculatedLayout::default();
-        self.calculate_into(area, minimum_width, minimum_height, &mut result);
+        self.calculate_into(
+            area,
+            minimum_width,
+            minimum_height,
+            vertical_splitter_thickness,
+            horizontal_splitter_thickness,
+            &mut result,
+        );
         result
     }
 
@@ -79,6 +88,8 @@ impl LayoutNode {
         area: Rect,
         minimum_width: u16,
         minimum_height: u16,
+        vertical_splitter_thickness: u16,
+        horizontal_splitter_thickness: u16,
         result: &mut CalculatedLayout,
     ) {
         match self {
@@ -92,16 +103,34 @@ impl LayoutNode {
                 first,
                 second,
             } => {
+                let splitter_thickness = match direction {
+                    SplitDirection::Vertical => vertical_splitter_thickness,
+                    SplitDirection::Horizontal => horizontal_splitter_thickness,
+                };
                 let (first_area, splitter, second_area) =
-                    split_rect(area, *direction, *ratio, minimum_width, minimum_height);
-                first.calculate_into(first_area, minimum_width, minimum_height, result);
+                    split_rect(area, *direction, *ratio, minimum_width, minimum_height, splitter_thickness);
+                first.calculate_into(
+                    first_area,
+                    minimum_width,
+                    minimum_height,
+                    vertical_splitter_thickness,
+                    horizontal_splitter_thickness,
+                    result,
+                );
                 result.splitters.push(SplitterRect {
                     id: *id,
                     direction: *direction,
                     rect: splitter,
                     container: area,
                 });
-                second.calculate_into(second_area, minimum_width, minimum_height, result);
+                second.calculate_into(
+                    second_area,
+                    minimum_width,
+                    minimum_height,
+                    vertical_splitter_thickness,
+                    horizontal_splitter_thickness,
+                    result,
+                );
             }
         }
     }
@@ -190,12 +219,14 @@ fn split_rect(
     ratio: f32,
     minimum_width: u16,
     minimum_height: u16,
+    splitter_thickness: u16,
 ) -> (Rect, Rect, Rect) {
     let (origin, total, minimum) = match direction {
         SplitDirection::Vertical => (area.x, area.width, minimum_width),
         SplitDirection::Horizontal => (area.y, area.height, minimum_height),
     };
-    let available = total.saturating_sub(1);
+    let effective_thickness = splitter_thickness.min(total);
+    let available = total.saturating_sub(effective_thickness);
     let desired = (f32::from(available) * ratio.clamp(0.0, 1.0)).round() as u16;
     let lower = minimum.min(available);
     let upper = available.saturating_sub(minimum).max(lower);
@@ -210,11 +241,11 @@ fn split_rect(
             },
             Rect {
                 x: divider,
-                width: u16::from(total > 0),
+                width: effective_thickness,
                 ..area
             },
             Rect {
-                x: divider.saturating_add(u16::from(total > 0)),
+                x: divider.saturating_add(effective_thickness),
                 width: second_size,
                 ..area
             },
@@ -226,11 +257,11 @@ fn split_rect(
             },
             Rect {
                 y: divider,
-                height: u16::from(total > 0),
+                height: effective_thickness,
                 ..area
             },
             Rect {
-                y: divider.saturating_add(u16::from(total > 0)),
+                y: divider.saturating_add(effective_thickness),
                 height: second_size,
                 ..area
             },
@@ -307,10 +338,60 @@ mod tests {
             },
             10,
             3,
+            3,
+            5,
         );
         assert_eq!(calculated.panes.len(), 3);
         assert_eq!(calculated.splitters.len(), 2);
-        assert_eq!(calculated.panes[&PaneId(1)].width, 40);
+        assert_eq!(calculated.panes[&PaneId(1)].width, 39);
+        assert_eq!(calculated.splitters[0].rect.width, 3);
+        assert_eq!(calculated.splitters[1].rect.height, 5);
+    }
+
+    #[test]
+    fn layout_calculation_supports_custom_and_zero_splitter_thickness() {
+        let tree = LayoutNode::Split {
+            id: SplitId(1),
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane(PaneId(1))),
+            second: Box::new(LayoutNode::Pane(PaneId(2))),
+        };
+        let thick = tree.calculate(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 83,
+                height: 25,
+            },
+            10,
+            3,
+            3,
+            3,
+        );
+        assert_eq!(thick.panes[&PaneId(1)].width, 40);
+        assert_eq!(thick.splitters[0].rect.x, 40);
+        assert_eq!(thick.splitters[0].rect.width, 3);
+        assert_eq!(thick.panes[&PaneId(2)].x, 43);
+        assert_eq!(thick.panes[&PaneId(2)].width, 40);
+
+        let zero = tree.calculate(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 25,
+            },
+            10,
+            3,
+            0,
+            0,
+        );
+        assert_eq!(zero.panes[&PaneId(1)].width, 40);
+        assert_eq!(zero.splitters[0].rect.x, 40);
+        assert_eq!(zero.splitters[0].rect.width, 0);
+        assert_eq!(zero.panes[&PaneId(2)].x, 40);
+        assert_eq!(zero.panes[&PaneId(2)].width, 40);
     }
 
     #[test]
