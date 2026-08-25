@@ -32,10 +32,13 @@ pub struct RecoveryRecord {
     pub text: String,
 }
 
-pub fn recovery_directory(user_config_path: &Path) -> Result<PathBuf> {
+pub fn recovery_directory(user_config_path: &Path, workspace_root: &Path) -> Result<PathBuf> {
+    let workspace_root = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_owned());
+    let mut hasher = DefaultHasher::new();
+    workspace_root.hash(&mut hasher);
     user_config_path
         .parent()
-        .map(|directory| directory.join("recovery"))
+        .map(|directory| directory.join("recovery").join(format!("{:016x}", hasher.finish())))
         .ok_or_else(|| AppError::Arguments("user configuration path has no parent".to_owned()))
 }
 
@@ -695,6 +698,33 @@ mod tests {
 
         remove_recovery_record(&recovery, id, registry.get(id)).unwrap();
         assert!(load_recovery_records(&recovery).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_directories_are_scoped_to_canonical_workspace_roots() {
+        let directory = tempdir().unwrap();
+        let user_config = directory.path().join("config.toml");
+        let first_workspace = directory.path().join("first");
+        let second_workspace = directory.path().join("second");
+        fs::create_dir_all(&first_workspace).unwrap();
+        fs::create_dir_all(&second_workspace).unwrap();
+
+        let first_recovery = recovery_directory(&user_config, &first_workspace).unwrap();
+        let second_recovery = recovery_directory(&user_config, &second_workspace).unwrap();
+
+        assert_ne!(first_recovery, second_recovery);
+        assert_eq!(
+            first_recovery,
+            recovery_directory(&user_config, &fs::canonicalize(&first_workspace).unwrap()).unwrap()
+        );
+
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        let document_id = registry.new_untitled();
+        registry.get_mut(document_id).insert(0, "first workspace changes");
+        write_recovery_record(&first_recovery, document_id, registry.get(document_id)).unwrap();
+
+        assert_eq!(load_recovery_records(&first_recovery).unwrap().len(), 1);
+        assert!(load_recovery_records(&second_recovery).unwrap().is_empty());
     }
 
     #[test]

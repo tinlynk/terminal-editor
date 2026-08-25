@@ -459,18 +459,19 @@ mod tests {
         let directory = tempdir().unwrap();
         let selected_path = directory.path().join("middle.txt");
         fs::write(&selected_path, "middle").unwrap();
+        let canonical_selected_path = fs::canonicalize(&selected_path).unwrap();
         fs::write(directory.path().join("z-last.txt"), "last").unwrap();
         let mut explorer = Explorer::new(directory.path().to_owned(), true, &[]).unwrap();
         explorer.selected = explorer
             .entries()
             .iter()
-            .position(|entry| entry.path == selected_path)
+            .position(|entry| entry.path == canonical_selected_path)
             .unwrap();
 
         fs::write(directory.path().join("a-first.txt"), "first").unwrap();
         explorer.refresh().unwrap();
 
-        assert_eq!(explorer.selected_entry().unwrap().path, selected_path);
+        assert_eq!(explorer.selected_entry().unwrap().path, canonical_selected_path);
     }
 
     #[test]
@@ -525,7 +526,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             explorer.toggle_selected().unwrap(),
-            Some(directory.path().join("linked"))
+            Some(explorer.root.join("linked"))
         );
         assert!(explorer.entries().iter().all(|entry| entry.depth == 0));
     }

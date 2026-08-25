@@ -154,6 +154,7 @@ pub struct Application {
     saved_editor_views: BTreeMap<crate::document::DocumentId, crate::editor::EditorView>,
     pending_terminal_control: Vec<u8>,
     pending_close_document: Option<crate::document::DocumentId>,
+    quit_in_progress: bool,
     pending_mouse_capture: Option<bool>,
     running: bool,
     input: InputMapper,
@@ -201,7 +202,7 @@ impl Application {
             .map_err(|error| AppError::io("could not determine current directory", error))?;
         let explorer_root = root_for_startup(startup_path.as_deref(), &current_directory);
         let config = LoadedConfig::load(&explorer_root)?;
-        let recovery_directory = recovery_directory(&config.user_path)?;
+        let recovery_directory = recovery_directory(&config.user_path, &explorer_root)?;
         let recovery_records = load_recovery_records(&recovery_directory).unwrap_or_default();
         let theme_registry = ThemeRegistry::load_for_config(&config.user_path)?;
         let (theme, theme_message) = theme_registry.resolve(&config.effective.theme.active);
@@ -258,6 +259,7 @@ impl Application {
             saved_editor_views: BTreeMap::new(),
             pending_terminal_control: Vec::new(),
             pending_close_document: None,
+            quit_in_progress: false,
             pending_mouse_capture: None,
             running: true,
             input,
@@ -322,6 +324,7 @@ impl Application {
             saved_editor_views: BTreeMap::new(),
             pending_terminal_control: Vec::new(),
             pending_close_document: None,
+            quit_in_progress: false,
             pending_mouse_capture: None,
             running: true,
             input: InputMapper::default(),
@@ -1084,14 +1087,16 @@ impl Application {
         }
         match command {
             Command::Quit => {
-                if self
+                if self.config.effective.editor.check_modified_files_on_quit
+                    && self
                     .documents
                     .iter()
                     .any(|(_, document)| document.is_modified())
                 {
-                    self.overlay = Some(Overlay::ConfirmQuit);
-                    self.focus_owner = FocusOwner::Overlay;
+                    self.quit_in_progress = true;
+                    self.continue_quit_sequence()?;
                 } else {
+                    self.quit_in_progress = false;
                     self.request_quit();
                 }
             }
@@ -1514,6 +1519,27 @@ impl Application {
         }
     }
 
+    fn continue_quit_sequence(&mut self) -> Result<()> {
+        let Some(document_id) = self
+            .documents
+            .iter()
+            .find_map(|(id, document)| document.is_modified().then_some(id))
+        else {
+            self.quit_in_progress = false;
+            self.request_quit();
+            return Ok(());
+        };
+        if let Some((pane_id, _)) = self.workspace.panes.iter().find(|(_, pane)| {
+            matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
+        }) {
+            self.workspace.focused = *pane_id;
+        } else {
+            self.switch_editor_document(self.workspace.focused, document_id);
+        }
+        self.focus_owner = FocusOwner::Workspace;
+        self.request_close()
+    }
+
     fn refresh_explorer_if_due(&mut self, now: Instant) -> bool {
         let interval = self.config.effective.explorer.refresh_interval_seconds;
         if !self.explorer.visible
@@ -1622,11 +1648,15 @@ impl Application {
         }
     }
 
-    fn restore_recovery_record(&mut self, record: RecoveryRecord) {
-        let document_id = self.documents.new_untitled();
+    fn restore_recovery_record(&mut self, record: RecoveryRecord) -> Result<()> {
+        let document_id = match record.path {
+            Some(path) => self.documents.new_at_path(path)?,
+            None => self.documents.new_untitled(),
+        };
         self.documents.get_mut(document_id).insert(0, &record.text);
         let pane_id = self.workspace.focused;
         self.switch_editor_document(pane_id, document_id);
+        Ok(())
     }
 
     fn remove_recovery_for_document(&mut self, document_id: DocumentId) -> Result<()> {
@@ -1860,10 +1890,7 @@ impl Application {
         };
         match result {
             Ok(()) => {
-                if !matches!(
-                    self.overlay,
-                    Some(Overlay::ConfirmSaveAsOverwrite { .. } | Overlay::ConfirmUnsafeOpen { .. })
-                ) {
+                if matches!(self.overlay, Some(Overlay::FileDialog { .. })) {
                     self.overlay = None;
                     self.focus_owner = FocusOwner::Workspace;
                 }
@@ -2245,7 +2272,7 @@ pub(super) fn explorer_create_dialog(directory: &Path, create_directory: bool) -
     }
 }
 
-pub(crate) const SETTINGS_KEYS: [&str; 40] = [
+pub(crate) const SETTINGS_KEYS: [&str; 41] = [
     "editor.indent_width",
     "editor.insert_spaces",
     "editor.default_line_ending",
@@ -2257,6 +2284,7 @@ pub(crate) const SETTINGS_KEYS: [&str; 40] = [
     "editor.syntax_highlighting_max_file_size_kib",
     "editor.autosave_interval_seconds",
     "editor.header_style",
+    "editor.check_modified_files_on_quit",
     "workspace.minimum_pane_width",
     "workspace.minimum_pane_height",
     "workspace.initial_split_ratio",
@@ -2434,8 +2462,74 @@ mod tests {
         let mut application = Application::new_for_test();
         application.apply(Command::Insert("x".to_owned())).unwrap();
         application.apply(Command::Quit).unwrap();
-        assert_eq!(application.overlay, Some(Overlay::ConfirmQuit));
+        assert_eq!(application.overlay, Some(Overlay::ConfirmDocumentClose));
         assert!(application.running);
+    }
+
+    #[test]
+    fn quitting_checks_each_modified_document_before_exiting() {
+        let mut application = Application::new_for_test();
+        let first_document = application.focused_document_id().unwrap();
+        application.apply(Command::Insert("first".to_owned())).unwrap();
+        let second_document = application.documents.new_untitled();
+        application.switch_editor_document(application.workspace.focused, second_document);
+        application.apply(Command::Insert("second".to_owned())).unwrap();
+        application.switch_editor_document(application.workspace.focused, first_document);
+        let path = application.explorer.root.join("first.txt");
+
+        application.apply(Command::Quit).unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let Some(Overlay::FileDialog { input, .. }) = application.overlay.as_mut() else {
+            panic!("expected Save As dialog");
+        };
+        *input = path.display().to_string();
+        application.submit_file_dialog().unwrap();
+
+        assert_eq!(application.focused_document_id(), Some(second_document));
+        assert_eq!(application.overlay, Some(Overlay::ConfirmDocumentClose));
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert!(!application.running);
+    }
+
+    #[test]
+    fn quitting_skips_modified_file_checks_when_disabled() {
+        let mut application = Application::new_for_test();
+        application.config.effective.editor.check_modified_files_on_quit = false;
+        application.apply(Command::Insert("x".to_owned())).unwrap();
+
+        application.apply(Command::Quit).unwrap();
+
+        assert!(application.overlay.is_none());
+        assert!(!application.running);
+    }
+
+    #[test]
+    fn escaping_a_quit_document_confirmation_cancels_the_quit_sequence() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        application.apply(Command::Insert("unsaved".to_owned())).unwrap();
+
+        application.apply(Command::Quit).unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert!(application.running);
+        assert!(application.overlay.is_none());
+        assert!(application.documents.get(document_id).is_modified());
     }
 
     #[test]
@@ -3559,6 +3653,36 @@ mod tests {
     }
 
     #[test]
+    fn saving_during_close_prompts_for_the_next_dirty_document() {
+        let mut application = Application::new_for_test();
+        let first_document = application.focused_document_id().unwrap();
+        application.apply(Command::Insert("first".to_owned())).unwrap();
+        let second_document = application.documents.new_untitled();
+        application.switch_editor_document(application.workspace.focused, second_document);
+        application.apply(Command::Insert("second".to_owned())).unwrap();
+        application.switch_editor_document(application.workspace.focused, first_document);
+        let path = application.explorer.root.join("first.txt");
+
+        application.request_close().unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let Some(Overlay::FileDialog { input, .. }) = application.overlay.as_mut() else {
+            panic!("expected Save As dialog");
+        };
+        *input = path.display().to_string();
+        application.submit_file_dialog().unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "first");
+        assert_eq!(application.focused_document_id(), Some(second_document));
+        assert_eq!(application.overlay, Some(Overlay::ConfirmDocumentClose));
+        assert_eq!(application.focus_owner, FocusOwner::Overlay);
+    }
+
+    #[test]
     fn save_as_existing_file_waits_for_overwrite_and_escape_preserves_both() {
         let mut application = Application::new_for_test();
         application
@@ -3843,6 +3967,8 @@ mod tests {
         fn recovery_overlay_restores_discards_and_defers_records() {
             let mut application = Application::new_for_test();
             let document_id = application.focused_document_id().unwrap();
+            let source_path = application.explorer.root.join("recovered.txt");
+            application.documents.get_mut(document_id).path = Some(source_path.clone());
             application.documents.get_mut(document_id).insert(0, "unsaved");
             let path = write_recovery_record(
                 &application.recovery_directory,
@@ -3878,6 +4004,13 @@ mod tests {
                     .text(),
                 "unsaved"
             );
+            assert_eq!(
+                application
+                    .documents
+                    .get(application.focused_document_id().unwrap())
+                    .path,
+                Some(source_path)
+            );
 
             let deferred_path = application.recovery_directory.join("deferred.toml");
         fs::write(&deferred_path, toml::to_string(&deferred_record).unwrap()).unwrap();
@@ -3904,6 +4037,20 @@ mod tests {
                 )))
                 .unwrap();
             assert!(!deferred_path.exists());
+
+            let untitled_record = RecoveryRecord {
+                format_version: 1,
+                path: None,
+                revision: 1,
+                captured_at_unix_seconds: 1,
+                text: "untitled".to_owned(),
+            };
+            application.restore_recovery_record(untitled_record).unwrap();
+            assert!(application
+                .documents
+                .get(application.focused_document_id().unwrap())
+                .path
+                .is_none());
         }
 
         #[test]

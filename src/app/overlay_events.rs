@@ -170,8 +170,10 @@ impl Application {
                 Some(Overlay::FileDialog { save_as: true, .. })
                     | Some(Overlay::SaveConflict)
                     | Some(Overlay::ConfirmSaveAsOverwrite { .. })
+                    | Some(Overlay::ConfirmDocumentClose)
             ) {
                 self.pending_close_document = None;
+                self.quit_in_progress = false;
             }
             if let Some(Overlay::Settings { editing, .. }) = self.overlay.as_mut()
                 && editing.is_some()
@@ -191,7 +193,7 @@ impl Application {
                 Some((path.clone(), record.clone()))
             })
         {
-            self.restore_recovery_record(record);
+            self.restore_recovery_record(record)?;
             remove_recovery_path(&path)?;
             self.overlay = None;
             self.focus_owner = FocusOwner::Workspace;
@@ -625,6 +627,9 @@ impl Application {
                 self.discard_focused_document();
                 self.overlay = None;
                 self.focus_owner = FocusOwner::Workspace;
+                if self.quit_in_progress {
+                    self.continue_quit_sequence()?;
+                }
             }
             Overlay::ConfirmDocumentClose if key.code == KeyCode::Char('s') => {
                 self.pending_close_document = self.focused_editor().map(|(id, _)| id);
@@ -692,7 +697,8 @@ fn setting_accepts_character(key: &str, value: &str, character: char) -> bool {
 pub(crate) fn setting_options(key: &str) -> Option<&'static [&'static str]> {
     match key {
         "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar"
-        | "editor.soft_wrap" | "editor.syntax_highlighting" | "explorer.visible"
+        | "editor.soft_wrap" | "editor.syntax_highlighting"
+        | "editor.check_modified_files_on_quit" | "explorer.visible"
         | "mouse.enabled" | "clipboard.osc52"
         | "terminal.allow_child_osc52_write" | "ui.bottom_terminal_visible" => {
             Some(&["true", "false"])

@@ -13,7 +13,7 @@ const CONFIG_RELATIVE_PATH: &str = ".tinlynk/terminal-editor/config.toml";
 const DEFAULT_UNDO_LIMIT_MIB: usize = 32;
 const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 const DEFAULT_SYNTAX_HIGHLIGHTING_MAX_FILE_SIZE_KIB: usize = 1024;
-const DEFAULT_AUTOSAVE_INTERVAL_SECONDS: i64 = 30;
+const DEFAULT_AUTOSAVE_INTERVAL_SECONDS: i64 = 10;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,6 +45,7 @@ pub struct EditorConfig {
     pub syntax_highlighting_max_file_size_kib: usize,
     pub autosave_interval_seconds: i64,
     pub header_style: EditorHeaderStyle,
+    pub check_modified_files_on_quit: bool,
 }
 
 impl Default for EditorConfig {
@@ -61,6 +62,7 @@ impl Default for EditorConfig {
             syntax_highlighting_max_file_size_kib: DEFAULT_SYNTAX_HIGHLIGHTING_MAX_FILE_SIZE_KIB,
             autosave_interval_seconds: DEFAULT_AUTOSAVE_INTERVAL_SECONDS,
             header_style: EditorHeaderStyle::Tabs,
+            check_modified_files_on_quit: true,
         }
     }
 }
@@ -242,6 +244,9 @@ impl Config {
                 EditorHeaderStyle::Tabs => "tabs".to_owned(),
                 EditorHeaderStyle::Breadcrumbs => "breadcrumbs".to_owned(),
             },
+            "editor.check_modified_files_on_quit" => {
+                self.editor.check_modified_files_on_quit.to_string()
+            }
             "workspace.minimum_pane_width" => self.workspace.minimum_pane_width.to_string(),
             "workspace.minimum_pane_height" => self.workspace.minimum_pane_height.to_string(),
             "workspace.initial_split_ratio" => self.workspace.initial_split_ratio.to_string(),
@@ -334,6 +339,7 @@ struct PartialEditorConfig {
     syntax_highlighting_max_file_size_kib: Option<usize>,
     autosave_interval_seconds: Option<i64>,
     header_style: Option<EditorHeaderStyle>,
+    check_modified_files_on_quit: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -629,7 +635,7 @@ fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
     let trimmed = value.trim();
     match dotted_key {
         "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar" | "editor.soft_wrap"
-        | "editor.syntax_highlighting"
+        | "editor.syntax_highlighting" | "editor.check_modified_files_on_quit"
         | "explorer.visible" | "mouse.enabled" | "clipboard.osc52" | "terminal.allow_child_osc52_write"
         | "ui.bottom_terminal_visible" => {
             match trimmed {
@@ -865,6 +871,14 @@ fn parse_partial_config(
                     diagnostics,
                 ),
                 header_style: config_value(table, "header_style", "editor", path, scope, diagnostics),
+                check_modified_files_on_quit: config_value(
+                    table,
+                    "check_modified_files_on_quit",
+                    "editor",
+                    path,
+                    scope,
+                    diagnostics,
+                ),
             }
         }),
         workspace: config_table(root, "workspace", path, scope, diagnostics).map(|table| {
@@ -1157,6 +1171,10 @@ fn apply_scope(
             );
         }
         assign(&mut config.editor.header_style, editor.header_style);
+        assign(
+            &mut config.editor.check_modified_files_on_quit,
+            editor.check_modified_files_on_quit,
+        );
         provenance.insert("editor".to_owned(), scope);
     }
     if let Some(workspace) = partial.workspace {
@@ -1404,6 +1422,7 @@ mod tests {
         assert_eq!(config.editor.undo_limit_mib, 32);
         assert!(!config.editor.soft_wrap);
         assert_eq!(config.editor.header_style, EditorHeaderStyle::Tabs);
+        assert!(config.editor.check_modified_files_on_quit);
         assert_eq!(config.explorer.refresh_interval_seconds, 5);
         assert_eq!(config.explorer.divider_thickness, 1);
         assert_eq!(config.workspace.vertical_divider_thickness, 1);
@@ -1480,6 +1499,30 @@ mod tests {
             EditorHeaderStyle::Breadcrumbs
         );
         assert_eq!(loaded.provenance["editor"], ConfigScope::User);
+    }
+
+    #[test]
+    fn modified_file_quit_check_can_be_configured_and_mutated() {
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        fs::write(
+            &user_path,
+            "[editor]\ncheck_modified_files_on_quit = false\n",
+        )
+        .unwrap();
+
+        let mut loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
+
+        assert!(!loaded.effective.editor.check_modified_files_on_quit);
+        loaded
+            .set_setting_from_string(
+                ConfigScope::User,
+                "editor.check_modified_files_on_quit",
+                "true",
+            )
+            .unwrap();
+        assert!(loaded.effective.editor.check_modified_files_on_quit);
     }
 
     #[test]

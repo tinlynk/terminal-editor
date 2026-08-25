@@ -11,7 +11,7 @@ use syntect::{
     highlighting::{
         Color as SyntectColor, Style, StyleModifier, Theme, ThemeItem, ThemeSettings,
     },
-    parsing::SyntaxSet,
+    parsing::{SyntaxReference, SyntaxSet},
     highlighting::ScopeSelectors,
 };
 
@@ -37,11 +37,25 @@ pub struct SyntaxSpan {
     pub color: Color,
 }
 
-pub struct SyntaxHighlighter {
+enum SyntaxHighlighter {
+    Standard {
+        lines: HighlightLines<'static>,
+    },
+    Markdown {
+        lines: HighlightLines<'static>,
+        theme: &'static Theme,
+        fence: Option<CodeFence>,
+    },
+}
+
+struct CodeFence {
+    delimiter: char,
+    length: usize,
     lines: HighlightLines<'static>,
 }
 
 impl SyntaxHighlighter {
+    #[cfg(test)]
     pub fn for_path(path: &Path) -> Option<Self> {
         Self::for_path_with_palette(path, default_palette())
     }
@@ -51,25 +65,94 @@ impl SyntaxHighlighter {
         if syntax.name == "Plain Text" {
             return None;
         }
-        Some(Self {
-            lines: HighlightLines::new(syntax, syntax_theme(palette)),
+        let theme = syntax_theme(palette);
+        let lines = HighlightLines::new(syntax, theme);
+        Some(if syntax.name == "Markdown" {
+            Self::Markdown {
+                lines,
+                theme,
+                fence: None,
+            }
+        } else {
+            Self::Standard { lines }
         })
     }
 
     pub fn highlight_line(&mut self, line: &str) -> Vec<SyntaxSpan> {
-        self.lines
-            .highlight_line(line, &SYNTAX_SET)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(style, text)| {
-                let start = text.as_ptr() as usize - line.as_ptr() as usize;
-                SyntaxSpan {
-                    range: start..start + text.len(),
-                    color: color(style),
+        match self {
+            Self::Standard { lines } => highlight_spans(lines, line),
+            Self::Markdown { lines, theme, fence } => {
+                if let Some(active_fence) = fence {
+                    if closes_fence(line, active_fence) {
+                        *fence = None;
+                        return highlight_spans(lines, line);
+                    }
+                    return highlight_spans(&mut active_fence.lines, line);
                 }
-            })
-            .collect()
+
+                let spans = highlight_spans(lines, line);
+                if let Some((delimiter, length, language)) = opens_fence(line)
+                    && let Some(syntax) = syntax_for_fence(language)
+                {
+                    *fence = Some(CodeFence {
+                        delimiter,
+                        length,
+                        lines: HighlightLines::new(syntax, theme),
+                    });
+                }
+                spans
+            }
+        }
     }
+}
+
+fn highlight_spans(lines: &mut HighlightLines<'static>, line: &str) -> Vec<SyntaxSpan> {
+    lines
+        .highlight_line(line, &SYNTAX_SET)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(style, text)| {
+            let start = text.as_ptr() as usize - line.as_ptr() as usize;
+            SyntaxSpan {
+                range: start..start + text.len(),
+                color: color(style),
+            }
+        })
+        .collect()
+}
+
+fn opens_fence(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let delimiter = trimmed.chars().next()?;
+    if delimiter != '`' && delimiter != '~' {
+        return None;
+    }
+    let length = trimmed.chars().take_while(|character| *character == delimiter).count();
+    if length < 3 {
+        return None;
+    }
+    let language = trimmed[length..].split_whitespace().next()?;
+    Some((delimiter, length, language))
+}
+
+fn closes_fence(line: &str, fence: &CodeFence) -> bool {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let length = trimmed
+        .chars()
+        .take_while(|character| *character == fence.delimiter)
+        .count();
+    length >= fence.length && trimmed[length..].trim().is_empty()
+}
+
+fn syntax_for_fence(language: &str) -> Option<&'static SyntaxReference> {
+    let token = language.to_ascii_lowercase();
+    let token = match token.as_str() {
+        "shell" => "sh",
+        value => value,
+    };
+    SYNTAX_SET.find_syntax_by_token(token).or_else(|| {
+        ["bash", "zsh", "fish"].contains(&token).then(|| SYNTAX_SET.find_syntax_by_token("sh"))?
+    })
 }
 
 fn syntax_for_path(path: &Path) -> Option<&'static syntect::parsing::SyntaxReference> {
@@ -147,6 +230,7 @@ impl SyntaxCache {
     }
 }
 
+#[cfg(test)]
 fn default_palette() -> SyntaxPalette {
     SyntaxPalette {
         foreground: Color::White,
@@ -275,6 +359,46 @@ mod tests {
     }
 
     #[test]
+    fn markdown_fenced_blocks_use_their_language_syntax() {
+        for (language, code) in [
+            ("rust", "let value = \"text\";"),
+            ("toml", "value = \"text\""),
+            ("java", "String value = \"text\";"),
+            ("sh", "echo \"$HOME\""),
+            ("bash", "echo \"$HOME\""),
+            ("zsh", "echo \"$HOME\""),
+            ("fish", "echo \"$HOME\""),
+        ] {
+            let mut highlighter = SyntaxHighlighter::for_path(Path::new("README.md")).unwrap();
+
+            highlighter.highlight_line(&format!("```{language}"));
+            assert!(highlighter
+                .highlight_line(code)
+                .iter()
+                .any(|span| span.color != default_palette().foreground));
+            highlighter.highlight_line("```");
+            assert!(highlighter
+                .highlight_line("# Markdown heading")
+                .iter()
+                .any(|span| span.color != default_palette().foreground));
+        }
+    }
+
+    #[test]
+    fn unknown_markdown_fence_tags_restore_markdown_after_closing() {
+        let mut highlighter = SyntaxHighlighter::for_path(Path::new("README.md")).unwrap();
+
+        highlighter.highlight_line("```unknown-language");
+        highlighter.highlight_line("unparsed content");
+        highlighter.highlight_line("```");
+
+        assert!(highlighter
+            .highlight_line("# Markdown heading")
+            .iter()
+            .any(|span| span.color != default_palette().foreground));
+    }
+
+    #[test]
     fn plain_text_paths_are_not_highlighted() {
         assert!(SyntaxHighlighter::for_path(Path::new("notes.txt")).is_none());
         assert!(SyntaxHighlighter::for_path(Path::new("Untitled")).is_none());
@@ -330,5 +454,29 @@ mod tests {
             line,
         );
         assert_eq!(calls.get(), 6);
+    }
+
+    #[test]
+    fn cache_revision_change_resets_markdown_fence_state() {
+        let mut cache = SyntaxCache::default();
+
+        cache.highlight_line(
+            Some(Path::new("README.md")),
+            1,
+            default_palette(),
+            1,
+            |index| ["```rust", "let value = \"text\";"][index].to_owned(),
+        );
+        let spans = cache.highlight_line(
+            Some(Path::new("README.md")),
+            2,
+            default_palette(),
+            0,
+            |_| "# Markdown heading".to_owned(),
+        );
+
+        assert!(spans
+            .iter()
+            .any(|span| span.color != default_palette().foreground));
     }
 }

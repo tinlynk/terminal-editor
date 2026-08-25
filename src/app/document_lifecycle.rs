@@ -37,6 +37,9 @@ pub(super) fn request_close(application: &mut Application) -> Result<()> {
                 application.focus_owner = FocusOwner::Overlay;
             } else {
                 application.close_focused_editor_view();
+                if application.quit_in_progress {
+                    application.continue_quit_sequence()?;
+                }
             }
         }
     }
@@ -143,6 +146,11 @@ pub(super) fn finish_successful_save(
         application.close_focused_editor_view();
         application.overlay = None;
         application.focus_owner = FocusOwner::Workspace;
+        if application.quit_in_progress {
+            application.continue_quit_sequence()?;
+        } else {
+            request_close(application)?;
+        }
     }
     Ok(())
 }

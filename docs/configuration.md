@@ -25,6 +25,7 @@ syntax_highlighting = true
 syntax_highlighting_max_file_size_kib = 1024
 autosave_interval_seconds = 30
 header_style = "tabs"
+check_modified_files_on_quit = true
 
 [workspace]
 minimum_pane_width = 12
@@ -64,6 +65,8 @@ active = "default"
 Syntax highlighting is enabled by default for recognized source files. Set `editor.syntax_highlighting = false` to disable it, or change `editor.syntax_highlighting_max_file_size_kib` from its 1024 KiB default to control the largest file parsed for highlighting.
 
 Modified documents are written to user-local recovery records every 30 seconds. Set `editor.autosave_interval_seconds` to `0` or a negative value to disable recovery autosave. Recovery records are stored under `$HOME/.tinlynk/terminal-editor/recovery/` and are offered at the next startup after an unclean exit.
+
+Set `editor.check_modified_files_on_quit = false` to quit without prompting to save or discard modified open documents. It defaults to `true`; with the default enabled, quitting prompts once for each modified document.
 
 Divider thicknesses can be customized between panels: `explorer.divider_thickness` controls the width of the vertical divider between the Explorer and editor panes, `ui.terminal_divider_thickness` controls the height of the horizontal divider above the bottom terminal panel, `workspace.vertical_divider_thickness` controls dividers in side-by-side editor pane splits, and `workspace.horizontal_divider_thickness` controls dividers in stacked editor pane splits. Thickness values accept integers from `0` to `10`; the workspace settings default to `0`. Setting thickness to `0` removes the separator gap and places panels flush against each other. Replace the legacy `workspace.divider_thickness` setting with both workspace directional settings.
 
