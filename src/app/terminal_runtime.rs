@@ -187,8 +187,8 @@ impl Application {
         if count == 0 {
             return;
         }
-        self.active_bottom_terminal = (self.active_bottom_terminal as isize + delta)
-            .rem_euclid(count as isize) as usize;
+        self.active_bottom_terminal =
+            (self.active_bottom_terminal as isize + delta).rem_euclid(count as isize) as usize;
         self.bottom_terminal_visible = true;
         self.focus_owner = FocusOwner::BottomTerminal;
     }

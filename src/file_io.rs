@@ -33,12 +33,17 @@ pub struct RecoveryRecord {
 }
 
 pub fn recovery_directory(user_config_path: &Path, workspace_root: &Path) -> Result<PathBuf> {
-    let workspace_root = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_owned());
+    let workspace_root =
+        fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_owned());
     let mut hasher = DefaultHasher::new();
     workspace_root.hash(&mut hasher);
     user_config_path
         .parent()
-        .map(|directory| directory.join("recovery").join(format!("{:016x}", hasher.finish())))
+        .map(|directory| {
+            directory
+                .join("recovery")
+                .join(format!("{:016x}", hasher.finish()))
+        })
         .ok_or_else(|| AppError::Arguments("user configuration path has no parent".to_owned()))
 }
 
@@ -62,22 +67,29 @@ pub fn write_recovery_record(
     if text.len() as u64 > MAX_RECOVERY_RECORD_BYTES {
         return Err(AppError::Arguments(format!(
             "recovery data for {} exceeds the {} MiB limit",
-            document
-                .path
-                .as_deref()
-                .map_or_else(|| "untitled document".to_owned(), |path| path.display().to_string()),
+            document.path.as_deref().map_or_else(
+                || "untitled document".to_owned(),
+                |path| path.display().to_string()
+            ),
             MAX_RECOVERY_RECORD_BYTES / (1024 * 1024)
         )));
     }
     atomic_write(&path, text.as_bytes())?;
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-        AppError::io(format!("could not protect recovery record {}", path.display()), error)
+        AppError::io(
+            format!("could not protect recovery record {}", path.display()),
+            error,
+        )
     })?;
     Ok(path)
 }
 
-pub fn remove_recovery_record(directory: &Path, document_id: DocumentId, document: &Document) -> Result<()> {
+pub fn remove_recovery_record(
+    directory: &Path,
+    document_id: DocumentId,
+    document: &Document,
+) -> Result<()> {
     let path = recovery_record_path(directory, document_id, document);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -104,7 +116,9 @@ pub fn load_recovery_records(directory: &Path) -> Result<Vec<(PathBuf, RecoveryR
     for entry in entries.filter_map(std::result::Result::ok) {
         let path = entry.path();
         if path.extension().is_none_or(|extension| extension != "toml")
-            || entry.metadata().map_or(true, |metadata| metadata.len() > MAX_RECOVERY_RECORD_BYTES)
+            || entry
+                .metadata()
+                .map_or(true, |metadata| metadata.len() > MAX_RECOVERY_RECORD_BYTES)
         {
             continue;
         }
@@ -250,7 +264,13 @@ impl DocumentRegistry {
         let id = self.allocate_id();
         self.documents.insert(
             id,
-            Document::new("", None, self.default_line_ending, self.history_limit, "UTF-8"),
+            Document::new(
+                "",
+                None,
+                self.default_line_ending,
+                self.history_limit,
+                "UTF-8",
+            ),
         );
         id
     }
@@ -720,7 +740,9 @@ mod tests {
 
         let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
         let document_id = registry.new_untitled();
-        registry.get_mut(document_id).insert(0, "first workspace changes");
+        registry
+            .get_mut(document_id)
+            .insert(0, "first workspace changes");
         write_recovery_record(&first_recovery, document_id, registry.get(document_id)).unwrap();
 
         assert_eq!(load_recovery_records(&first_recovery).unwrap().len(), 1);

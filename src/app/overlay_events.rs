@@ -12,6 +12,37 @@ use super::{
     move_settings_selection,
 };
 
+#[derive(Clone, Copy)]
+enum HelpScrollMovement {
+    Up(usize),
+    Down(usize),
+}
+
+fn mouse_help_scroll(kind: MouseEventKind) -> Option<HelpScrollMovement> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(HelpScrollMovement::Up(3)),
+        MouseEventKind::ScrollDown => Some(HelpScrollMovement::Down(3)),
+        _ => None,
+    }
+}
+
+fn key_help_scroll(code: KeyCode) -> Option<HelpScrollMovement> {
+    match code {
+        KeyCode::Up => Some(HelpScrollMovement::Up(1)),
+        KeyCode::Down => Some(HelpScrollMovement::Down(1)),
+        KeyCode::PageUp => Some(HelpScrollMovement::Up(10)),
+        KeyCode::PageDown => Some(HelpScrollMovement::Down(10)),
+        _ => None,
+    }
+}
+
+fn apply_help_scroll(scroll: &mut usize, movement: HelpScrollMovement, maximum: usize) {
+    match movement {
+        HelpScrollMovement::Up(amount) => *scroll = scroll.saturating_sub(amount),
+        HelpScrollMovement::Down(amount) => *scroll = scroll.saturating_add(amount).min(maximum),
+    }
+}
+
 impl Application {
     fn help_maximum_scroll(&self) -> Result<usize> {
         let (columns, rows) = crossterm::terminal::size()
@@ -25,7 +56,10 @@ impl Application {
             },
             self.overlay.as_ref().expect("help overlay exists"),
         );
-        Ok(render::help_line_count(self).saturating_sub(usize::from(area.height.saturating_sub(2))))
+        Ok(
+            render::help_line_count(self)
+                .saturating_sub(usize::from(area.height.saturating_sub(2))),
+        )
     }
 
     pub(super) fn handle_overlay_event(&mut self, event: Event) -> Result<()> {
@@ -50,14 +84,10 @@ impl Application {
                 None
             };
             if matches!(self.overlay, Some(Overlay::Help { .. })) {
-                let maximum = self.help_maximum_scroll()?;
-                if let Some(Overlay::Help { scroll }) = self.overlay.as_mut() {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
-                        MouseEventKind::ScrollDown => {
-                            *scroll = scroll.saturating_add(3).min(maximum)
-                        }
-                        _ => {}
+                if let Some(movement) = mouse_help_scroll(mouse.kind) {
+                    let maximum = self.help_maximum_scroll()?;
+                    if let Some(Overlay::Help { scroll }) = self.overlay.as_mut() {
+                        apply_help_scroll(scroll, movement, maximum);
                     }
                 }
                 return Ok(());
@@ -96,18 +126,20 @@ impl Application {
                 return self.activate_file_dialog_selection();
             }
             // Extract query before mutable borrow to avoid conflict
-            let query: String = self.overlay.as_ref().and_then(|o| {
-                if let Overlay::Settings { query, .. } = o {
-                    Some(query.to_lowercase())
-                } else {
-                    None
-                }
-            }).unwrap_or_default();
+            let query: String = self
+                .overlay
+                .as_ref()
+                .and_then(|o| {
+                    if let Overlay::Settings { query, .. } = o {
+                        Some(query.to_lowercase())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
 
             if let Some(Overlay::Settings {
-                selected,
-                editing,
-                ..
+                selected, editing, ..
             }) = self.overlay.as_mut()
             {
                 match mouse.kind {
@@ -137,8 +169,10 @@ impl Application {
                             let start = (*selected)
                                 .saturating_sub(10)
                                 .min(visible_keys.len().saturating_sub(visible_count));
-                            if let Some(index) = visible_keys.get(start.saturating_add(clicked_line as usize))
-                                && let Some(setting_index) = SETTINGS_KEYS.iter().position(|key| *key == *index)
+                            if let Some(index) =
+                                visible_keys.get(start.saturating_add(clicked_line as usize))
+                                && let Some(setting_index) =
+                                    SETTINGS_KEYS.iter().position(|key| *key == *index)
                             {
                                 *selected = setting_index;
                             }
@@ -239,7 +273,8 @@ impl Application {
                     document_id,
                     missing,
                     ..
-                } = overlay else {
+                } = overlay
+                else {
                     return None;
                 };
                 Some((*document_id, *missing))
@@ -247,7 +282,8 @@ impl Application {
         {
             if missing {
                 self.documents.accept_external_file_state(document_id)?;
-                self.message = Some("The missing file was kept open with local contents".to_owned());
+                self.message =
+                    Some("The missing file was kept open with local contents".to_owned());
             } else {
                 self.reload_document(document_id)?;
             }
@@ -267,7 +303,9 @@ impl Application {
                 self.activate_file_dialog_selection()
             };
         }
-        if key.code == KeyCode::Enter && matches!(self.overlay, Some(Overlay::ExplorerCreate { .. })) {
+        if key.code == KeyCode::Enter
+            && matches!(self.overlay, Some(Overlay::ExplorerCreate { .. }))
+        {
             return self.submit_explorer_create();
         }
         if key.code == KeyCode::Char('o')
@@ -359,21 +397,21 @@ impl Application {
             return Ok(());
         }
         if matches!(self.overlay, Some(Overlay::Help { .. })) {
-            let maximum = self.help_maximum_scroll()?;
-            if let Some(Overlay::Help { scroll }) = self.overlay.as_mut() {
-                match key.code {
-                    KeyCode::Up => *scroll = scroll.saturating_sub(1),
-                    KeyCode::Down => *scroll = scroll.saturating_add(1).min(maximum),
-                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
-                    KeyCode::PageDown => *scroll = scroll.saturating_add(10).min(maximum),
-                    _ => {}
+            if let Some(movement) = key_help_scroll(key.code) {
+                let maximum = self.help_maximum_scroll()?;
+                if let Some(Overlay::Help { scroll }) = self.overlay.as_mut() {
+                    apply_help_scroll(scroll, movement, maximum);
                 }
             }
             return Ok(());
         }
         if key.code == KeyCode::Enter
             && let Some(Overlay::Settings {
-                scope, selected, editing, new_value, ..
+                scope,
+                selected,
+                editing,
+                new_value,
+                ..
             }) = self.overlay.as_mut()
         {
             // If editing a value, confirm it
@@ -417,26 +455,38 @@ impl Application {
             }
             return Ok(());
         }
-        if let Some((scope, current_key, replacement_key)) = self.overlay.as_ref().and_then(|overlay| {
-            let Overlay::Settings {
-                scope,
-                editing: Some(setting_index),
-                ..
-            } = overlay else {
-                return None;
-            };
-            SETTINGS_KEYS[*setting_index]
-                .strip_prefix("keybindings.")
-                .map(|current_key| (*scope, current_key.to_owned()))
-        }).and_then(|(scope, current_key)| {
-            key_sequence(key).map(|replacement_key| (scope, current_key, replacement_key))
-        }) {
+        if let Some((scope, current_key, replacement_key)) = self
+            .overlay
+            .as_ref()
+            .and_then(|overlay| {
+                let Overlay::Settings {
+                    scope,
+                    editing: Some(setting_index),
+                    ..
+                } = overlay
+                else {
+                    return None;
+                };
+                SETTINGS_KEYS[*setting_index]
+                    .strip_prefix("keybindings.")
+                    .map(|current_key| (*scope, current_key.to_owned()))
+            })
+            .and_then(|(scope, current_key)| {
+                key_sequence(key).map(|replacement_key| (scope, current_key, replacement_key))
+            })
+        {
             let previous_mouse = self.config.effective.mouse.enabled;
-            match self.config.rebind_keybinding(scope, &current_key, &replacement_key) {
+            match self
+                .config
+                .rebind_keybinding(scope, &current_key, &replacement_key)
+            {
                 Ok(()) => self.apply_effective_config(previous_mouse)?,
                 Err(error) => self.message = Some(format!("Invalid keybinding: {error}")),
             }
-            if let Some(Overlay::Settings { editing, new_value, .. }) = self.overlay.as_mut() {
+            if let Some(Overlay::Settings {
+                editing, new_value, ..
+            }) = self.overlay.as_mut()
+            {
                 *editing = None;
                 *new_value = String::new();
             }
@@ -498,6 +548,7 @@ impl Application {
                         self.overlay = Some(file_dialog(&parent, save_as, &self.explorer));
                     }
                 }
+
                 KeyCode::Backspace => {
                     input.pop();
                 }
@@ -530,17 +581,41 @@ impl Application {
                 }
                 _ => {}
             },
-            Overlay::ExplorerCreate { directory, name, entries, selected, create_directory, .. } => match key.code {
-                KeyCode::Backspace => { name.pop(); }
+            Overlay::ExplorerCreate {
+                directory,
+                name,
+                entries,
+                selected,
+                create_directory,
+                ..
+            } => match key.code {
+                KeyCode::Backspace => {
+                    name.pop();
+                }
                 KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Down => *selected = selected.saturating_add(1).min(entries.len().saturating_sub(1)),
+                KeyCode::Down => {
+                    *selected = selected
+                        .saturating_add(1)
+                        .min(entries.len().saturating_sub(1))
+                }
                 KeyCode::Right => {
-                    if let Some(path) = entries.get(*selected) { self.overlay = Some(explorer_create_dialog(path, *create_directory)); }
+                    if let Some(path) = entries.get(*selected) {
+                        self.overlay = Some(explorer_create_dialog(path, *create_directory));
+                    }
                 }
                 KeyCode::Left => {
-                    if let Some(parent) = directory.parent().filter(|parent| parent.starts_with(&self.explorer.root)) { self.overlay = Some(explorer_create_dialog(parent, *create_directory)); }
+                    if let Some(parent) = directory
+                        .parent()
+                        .filter(|parent| parent.starts_with(&self.explorer.root))
+                    {
+                        self.overlay = Some(explorer_create_dialog(parent, *create_directory));
+                    }
                 }
-                KeyCode::Char(character) if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => name.push(character),
+                KeyCode::Char(character)
+                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                {
+                    name.push(character)
+                }
                 _ => {}
             },
             Overlay::Settings {
@@ -567,12 +642,14 @@ impl Application {
                             new_value.pop();
                         }
                         KeyCode::Char(character)
-                            if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
-                                && setting_accepts_character(
-                                    SETTINGS_KEYS[editing.expect("editing state exists")],
-                                    new_value,
-                                    character,
-                                ) =>
+                            if matches!(
+                                key.modifiers,
+                                KeyModifiers::NONE | KeyModifiers::SHIFT
+                            ) && setting_accepts_character(
+                                SETTINGS_KEYS[editing.expect("editing state exists")],
+                                new_value,
+                                character,
+                            ) =>
                         {
                             new_value.push(character);
                         }
@@ -586,7 +663,10 @@ impl Application {
                             move_settings_selection(query, selected, 0);
                         }
                         KeyCode::Char(character)
-                            if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                            if matches!(
+                                key.modifiers,
+                                KeyModifiers::NONE | KeyModifiers::SHIFT
+                            ) =>
                         {
                             query.push(character);
                             move_settings_selection(query, selected, 0);
@@ -640,7 +720,9 @@ impl Application {
                 self.pending_close_document = self.focused_editor().map(|(id, _)| id);
                 self.save_focused()?;
             }
-            Overlay::ConfirmUnsafeOpen { .. } | Overlay::Recovery { .. } | Overlay::ExternalFileChange { .. } => {}
+            Overlay::ConfirmUnsafeOpen { .. }
+            | Overlay::Recovery { .. }
+            | Overlay::ExternalFileChange { .. } => {}
             Overlay::SaveConflict if key.code == KeyCode::Char('o') => {
                 let document_id = self.focused_editor().map(|(id, _)| id);
                 if let Some(document_id) = document_id {
@@ -701,13 +783,17 @@ fn setting_accepts_character(key: &str, value: &str, character: char) -> bool {
 
 pub(crate) fn setting_options(key: &str) -> Option<&'static [&'static str]> {
     match key {
-        "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar"
-        | "editor.soft_wrap" | "editor.syntax_highlighting"
-        | "editor.check_modified_files_on_quit" | "explorer.visible"
-        | "mouse.enabled" | "clipboard.osc52"
-        | "terminal.allow_child_osc52_write" | "ui.bottom_terminal_visible" => {
-            Some(&["true", "false"])
-        }
+        "editor.insert_spaces"
+        | "editor.line_numbers"
+        | "editor.scrollbar"
+        | "editor.soft_wrap"
+        | "editor.syntax_highlighting"
+        | "editor.check_modified_files_on_quit"
+        | "explorer.visible"
+        | "mouse.enabled"
+        | "clipboard.osc52"
+        | "terminal.allow_child_osc52_write"
+        | "ui.bottom_terminal_visible" => Some(&["true", "false"]),
         "editor.default_line_ending" => Some(&["lf", "crlf"]),
         "editor.header_style" => Some(&["tabs", "breadcrumbs"]),
         _ => None,
@@ -718,7 +804,55 @@ fn cycle_setting_option(key: &str, value: &mut String, direction: isize) {
     let Some(options) = setting_options(key) else {
         return;
     };
-    let index = options.iter().position(|option| *option == value).unwrap_or(0);
-    let next = index.saturating_add_signed(direction).min(options.len().saturating_sub(1));
+    let index = options
+        .iter()
+        .position(|option| *option == value)
+        .unwrap_or(0);
+    let next = index
+        .saturating_add_signed(direction)
+        .min(options.len().saturating_sub(1));
     *value = options[next].to_owned();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_help_scroll_adjustments_are_bounded() {
+        let mut scroll = 0;
+        apply_help_scroll(
+            &mut scroll,
+            mouse_help_scroll(MouseEventKind::ScrollDown).unwrap(),
+            4,
+        );
+        assert_eq!(scroll, 3);
+
+        apply_help_scroll(
+            &mut scroll,
+            mouse_help_scroll(MouseEventKind::ScrollDown).unwrap(),
+            4,
+        );
+        assert_eq!(scroll, 4);
+
+        apply_help_scroll(
+            &mut scroll,
+            mouse_help_scroll(MouseEventKind::ScrollUp).unwrap(),
+            4,
+        );
+        assert_eq!(scroll, 1);
+    }
+
+    #[test]
+    fn keyboard_help_scroll_uses_line_and_page_steps() {
+        let mut scroll = 0;
+        apply_help_scroll(&mut scroll, key_help_scroll(KeyCode::PageDown).unwrap(), 8);
+        assert_eq!(scroll, 8);
+
+        apply_help_scroll(&mut scroll, key_help_scroll(KeyCode::Up).unwrap(), 8);
+        assert_eq!(scroll, 7);
+
+        apply_help_scroll(&mut scroll, key_help_scroll(KeyCode::PageUp).unwrap(), 8);
+        assert_eq!(scroll, 0);
+    }
 }

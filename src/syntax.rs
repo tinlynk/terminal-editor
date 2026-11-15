@@ -8,11 +8,9 @@ use std::{
 use ratatui::style::Color;
 use syntect::{
     easy::HighlightLines,
-    highlighting::{
-        Color as SyntectColor, Style, StyleModifier, Theme, ThemeItem, ThemeSettings,
-    },
-    parsing::{SyntaxReference, SyntaxSet},
     highlighting::ScopeSelectors,
+    highlighting::{Color as SyntectColor, Style, StyleModifier, Theme, ThemeItem, ThemeSettings},
+    parsing::{SyntaxReference, SyntaxSet},
 };
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
@@ -44,7 +42,7 @@ enum SyntaxHighlighter {
     Markdown {
         lines: HighlightLines<'static>,
         theme: &'static Theme,
-        fence: Option<CodeFence>,
+        fence: Option<Box<CodeFence>>,
     },
 }
 
@@ -81,7 +79,11 @@ impl SyntaxHighlighter {
     pub fn highlight_line(&mut self, line: &str) -> Vec<SyntaxSpan> {
         match self {
             Self::Standard { lines } => highlight_spans(lines, line),
-            Self::Markdown { lines, theme, fence } => {
+            Self::Markdown {
+                lines,
+                theme,
+                fence,
+            } => {
                 if let Some(active_fence) = fence {
                     if closes_fence(line, active_fence) {
                         *fence = None;
@@ -94,11 +96,11 @@ impl SyntaxHighlighter {
                 if let Some((delimiter, length, language)) = opens_fence(line)
                     && let Some(syntax) = syntax_for_fence(language)
                 {
-                    *fence = Some(CodeFence {
+                    *fence = Some(Box::new(CodeFence {
                         delimiter,
                         length,
                         lines: HighlightLines::new(syntax, theme),
-                    });
+                    }));
                 }
                 spans
             }
@@ -127,7 +129,10 @@ fn opens_fence(line: &str) -> Option<(char, usize, &str)> {
     if delimiter != '`' && delimiter != '~' {
         return None;
     }
-    let length = trimmed.chars().take_while(|character| *character == delimiter).count();
+    let length = trimmed
+        .chars()
+        .take_while(|character| *character == delimiter)
+        .count();
     if length < 3 {
         return None;
     }
@@ -151,7 +156,9 @@ fn syntax_for_fence(language: &str) -> Option<&'static SyntaxReference> {
         value => value,
     };
     SYNTAX_SET.find_syntax_by_token(token).or_else(|| {
-        ["bash", "zsh", "fish"].contains(&token).then(|| SYNTAX_SET.find_syntax_by_token("sh"))?
+        ["bash", "zsh", "fish"]
+            .contains(&token)
+            .then(|| SYNTAX_SET.find_syntax_by_token("sh"))?
     })
 }
 
@@ -170,9 +177,9 @@ fn syntax_for_path(path: &Path) -> Option<&'static syntect::parsing::SyntaxRefer
                 "Ruby"
             } else {
                 match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-                "md" | "markdown" | "mdown" | "mkdn" | "mdx" => "Markdown",
-                "ts" | "tsx" | "mts" | "cts" => "JavaScript",
-                _ => return None,
+                    "md" | "markdown" | "mdown" | "mkdn" | "mdx" => "Markdown",
+                    "ts" | "tsx" | "mts" | "cts" => "JavaScript",
+                    _ => return None,
                 }
             };
             SYNTAX_SET.find_syntax_by_name(syntax_name)
@@ -224,7 +231,8 @@ impl SyntaxCache {
         };
         let mut line = line;
         while self.spans.len() <= line_index {
-            self.spans.push(highlighter.highlight_line(&line(self.spans.len())));
+            self.spans
+                .push(highlighter.highlight_line(&line(self.spans.len())));
         }
         self.spans[line_index].clone()
     }
@@ -245,7 +253,9 @@ fn default_palette() -> SyntaxPalette {
 }
 
 fn syntax_theme(palette: SyntaxPalette) -> &'static Theme {
-    let mut themes = SYNTAX_THEMES.lock().expect("syntax theme cache lock is available");
+    let mut themes = SYNTAX_THEMES
+        .lock()
+        .expect("syntax theme cache lock is available");
     if let Some((_, theme)) = themes
         .iter()
         .find(|(cached_palette, _)| *cached_palette == palette)
@@ -296,23 +306,108 @@ fn build_syntax_theme(palette: SyntaxPalette) -> Theme {
 fn syntect_color(color: Color) -> SyntectColor {
     match color {
         Color::Rgb(r, g, b) => SyntectColor { r, g, b, a: 0xFF },
-        Color::Black => SyntectColor { r: 0, g: 0, b: 0, a: 0xFF },
-        Color::Red => SyntectColor { r: 0xCD, g: 0x31, b: 0x31, a: 0xFF },
-        Color::Green => SyntectColor { r: 0x0D, g: 0xBC, b: 0x79, a: 0xFF },
-        Color::Yellow => SyntectColor { r: 0xE5, g: 0xE5, b: 0x10, a: 0xFF },
-        Color::Blue => SyntectColor { r: 0x24, g: 0x78, b: 0xDB, a: 0xFF },
-        Color::Magenta => SyntectColor { r: 0xBC, g: 0x3F, b: 0xBC, a: 0xFF },
-        Color::Cyan => SyntectColor { r: 0x11, g: 0xA8, b: 0xCD, a: 0xFF },
-        Color::Gray => SyntectColor { r: 0xCC, g: 0xCC, b: 0xCC, a: 0xFF },
-        Color::DarkGray => SyntectColor { r: 0x76, g: 0x76, b: 0x76, a: 0xFF },
-        Color::LightRed => SyntectColor { r: 0xF1, g: 0x4C, b: 0x4C, a: 0xFF },
-        Color::LightGreen => SyntectColor { r: 0x23, g: 0xD1, b: 0x8B, a: 0xFF },
-        Color::LightYellow => SyntectColor { r: 0xF5, g: 0xF5, b: 0x43, a: 0xFF },
-        Color::LightBlue => SyntectColor { r: 0x3B, g: 0x8E, b: 0xEA, a: 0xFF },
-        Color::LightMagenta => SyntectColor { r: 0xD6, g: 0x70, b: 0xD6, a: 0xFF },
-        Color::LightCyan => SyntectColor { r: 0x29, g: 0xB8, b: 0xDB, a: 0xFF },
-        Color::White => SyntectColor { r: 0xFF, g: 0xFF, b: 0xFF, a: 0xFF },
-        Color::Reset | Color::Indexed(_) => SyntectColor { r: 0xFF, g: 0xFF, b: 0xFF, a: 0xFF },
+        Color::Black => SyntectColor {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0xFF,
+        },
+        Color::Red => SyntectColor {
+            r: 0xCD,
+            g: 0x31,
+            b: 0x31,
+            a: 0xFF,
+        },
+        Color::Green => SyntectColor {
+            r: 0x0D,
+            g: 0xBC,
+            b: 0x79,
+            a: 0xFF,
+        },
+        Color::Yellow => SyntectColor {
+            r: 0xE5,
+            g: 0xE5,
+            b: 0x10,
+            a: 0xFF,
+        },
+        Color::Blue => SyntectColor {
+            r: 0x24,
+            g: 0x78,
+            b: 0xDB,
+            a: 0xFF,
+        },
+        Color::Magenta => SyntectColor {
+            r: 0xBC,
+            g: 0x3F,
+            b: 0xBC,
+            a: 0xFF,
+        },
+        Color::Cyan => SyntectColor {
+            r: 0x11,
+            g: 0xA8,
+            b: 0xCD,
+            a: 0xFF,
+        },
+        Color::Gray => SyntectColor {
+            r: 0xCC,
+            g: 0xCC,
+            b: 0xCC,
+            a: 0xFF,
+        },
+        Color::DarkGray => SyntectColor {
+            r: 0x76,
+            g: 0x76,
+            b: 0x76,
+            a: 0xFF,
+        },
+        Color::LightRed => SyntectColor {
+            r: 0xF1,
+            g: 0x4C,
+            b: 0x4C,
+            a: 0xFF,
+        },
+        Color::LightGreen => SyntectColor {
+            r: 0x23,
+            g: 0xD1,
+            b: 0x8B,
+            a: 0xFF,
+        },
+        Color::LightYellow => SyntectColor {
+            r: 0xF5,
+            g: 0xF5,
+            b: 0x43,
+            a: 0xFF,
+        },
+        Color::LightBlue => SyntectColor {
+            r: 0x3B,
+            g: 0x8E,
+            b: 0xEA,
+            a: 0xFF,
+        },
+        Color::LightMagenta => SyntectColor {
+            r: 0xD6,
+            g: 0x70,
+            b: 0xD6,
+            a: 0xFF,
+        },
+        Color::LightCyan => SyntectColor {
+            r: 0x29,
+            g: 0xB8,
+            b: 0xDB,
+            a: 0xFF,
+        },
+        Color::White => SyntectColor {
+            r: 0xFF,
+            g: 0xFF,
+            b: 0xFF,
+            a: 0xFF,
+        },
+        Color::Reset | Color::Indexed(_) => SyntectColor {
+            r: 0xFF,
+            g: 0xFF,
+            b: 0xFF,
+            a: 0xFF,
+        },
     }
 }
 
@@ -337,14 +432,20 @@ mod tests {
     fn markdown_and_typescript_paths_produce_syntax_spans() {
         for path in ["README.md", "guide.mdx"] {
             let mut markdown = SyntaxHighlighter::for_path(Path::new(path)).unwrap();
-            assert!(markdown
-                .highlight_line("# Heading with *emphasis* and `code`")
-                .iter()
-                .any(|span| span.color != default_palette().foreground));
+            assert!(
+                markdown
+                    .highlight_line("# Heading with *emphasis* and `code`")
+                    .iter()
+                    .any(|span| span.color != default_palette().foreground)
+            );
         }
         for path in ["app.ts", "view.tsx", "module.mts", "legacy.cts"] {
             let mut typescript = SyntaxHighlighter::for_path(Path::new(path)).unwrap();
-            assert!(!typescript.highlight_line("const value: number = 1;").is_empty());
+            assert!(
+                !typescript
+                    .highlight_line("const value: number = 1;")
+                    .is_empty()
+            );
         }
     }
 
@@ -352,10 +453,12 @@ mod tests {
     fn vagrantfile_paths_use_ruby_highlighting() {
         let mut highlighter = SyntaxHighlighter::for_path(Path::new("Vagrantfile")).unwrap();
 
-        assert!(highlighter
-            .highlight_line("Vagrant.configure(\"2\") do |config|")
-            .iter()
-            .any(|span| span.color != default_palette().foreground));
+        assert!(
+            highlighter
+                .highlight_line("Vagrant.configure(\"2\") do |config|")
+                .iter()
+                .any(|span| span.color != default_palette().foreground)
+        );
     }
 
     #[test]
@@ -372,15 +475,19 @@ mod tests {
             let mut highlighter = SyntaxHighlighter::for_path(Path::new("README.md")).unwrap();
 
             highlighter.highlight_line(&format!("```{language}"));
-            assert!(highlighter
-                .highlight_line(code)
-                .iter()
-                .any(|span| span.color != default_palette().foreground));
+            assert!(
+                highlighter
+                    .highlight_line(code)
+                    .iter()
+                    .any(|span| span.color != default_palette().foreground)
+            );
             highlighter.highlight_line("```");
-            assert!(highlighter
-                .highlight_line("# Markdown heading")
-                .iter()
-                .any(|span| span.color != default_palette().foreground));
+            assert!(
+                highlighter
+                    .highlight_line("# Markdown heading")
+                    .iter()
+                    .any(|span| span.color != default_palette().foreground)
+            );
         }
     }
 
@@ -392,10 +499,12 @@ mod tests {
         highlighter.highlight_line("unparsed content");
         highlighter.highlight_line("```");
 
-        assert!(highlighter
-            .highlight_line("# Markdown heading")
-            .iter()
-            .any(|span| span.color != default_palette().foreground));
+        assert!(
+            highlighter
+                .highlight_line("# Markdown heading")
+                .iter()
+                .any(|span| span.color != default_palette().foreground)
+        );
     }
 
     #[test]
@@ -431,28 +540,12 @@ mod tests {
             format!("// {index}")
         };
 
-        cache.highlight_line(
-            Some(Path::new("main.rs")),
-            1,
-            default_palette(),
-            2,
-            line,
-        );
+        cache.highlight_line(Some(Path::new("main.rs")), 1, default_palette(), 2, line);
         assert_eq!(calls.get(), 3);
-        cache.highlight_line(
-            Some(Path::new("main.rs")),
-            1,
-            default_palette(),
-            2,
-            |_| panic!("cached line should not be reparsed"),
-        );
-        cache.highlight_line(
-            Some(Path::new("main.rs")),
-            2,
-            default_palette(),
-            2,
-            line,
-        );
+        cache.highlight_line(Some(Path::new("main.rs")), 1, default_palette(), 2, |_| {
+            panic!("cached line should not be reparsed")
+        });
+        cache.highlight_line(Some(Path::new("main.rs")), 2, default_palette(), 2, line);
         assert_eq!(calls.get(), 6);
     }
 
@@ -475,8 +568,10 @@ mod tests {
             |_| "# Markdown heading".to_owned(),
         );
 
-        assert!(spans
-            .iter()
-            .any(|span| span.color != default_palette().foreground));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.color != default_palette().foreground)
+        );
     }
 }

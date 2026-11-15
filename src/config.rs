@@ -240,9 +240,7 @@ impl Config {
                 .editor
                 .syntax_highlighting_max_file_size_kib
                 .to_string(),
-            "editor.autosave_interval_seconds" => {
-                self.editor.autosave_interval_seconds.to_string()
-            }
+            "editor.autosave_interval_seconds" => self.editor.autosave_interval_seconds.to_string(),
             "editor.header_style" => match self.editor.header_style {
                 EditorHeaderStyle::Tabs => "tabs".to_owned(),
                 EditorHeaderStyle::Breadcrumbs => "breadcrumbs".to_owned(),
@@ -253,16 +251,27 @@ impl Config {
             "workspace.minimum_pane_width" => self.workspace.minimum_pane_width.to_string(),
             "workspace.minimum_pane_height" => self.workspace.minimum_pane_height.to_string(),
             "workspace.initial_split_ratio" => self.workspace.initial_split_ratio.to_string(),
-            "workspace.vertical_divider_thickness" => self.workspace.vertical_divider_thickness.to_string(),
-            "workspace.horizontal_divider_thickness" => self.workspace.horizontal_divider_thickness.to_string(),
+            "workspace.vertical_divider_thickness" => {
+                self.workspace.vertical_divider_thickness.to_string()
+            }
+            "workspace.horizontal_divider_thickness" => {
+                self.workspace.horizontal_divider_thickness.to_string()
+            }
             "explorer.visible" => self.explorer.visible.to_string(),
             "explorer.width" => self.explorer.width.to_string(),
             "explorer.exclusions" => self.explorer.exclusions.join(", "),
-            "explorer.refresh_interval_seconds" => self.explorer.refresh_interval_seconds.to_string(),
+            "explorer.refresh_interval_seconds" => {
+                self.explorer.refresh_interval_seconds.to_string()
+            }
             "explorer.divider_thickness" => self.explorer.divider_thickness.to_string(),
             "mouse.enabled" => self.mouse.enabled.to_string(),
             "clipboard.osc52" => self.clipboard.osc52.to_string(),
-            "terminal.shell" => self.terminal.shell.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            "terminal.shell" => self
+                .terminal
+                .shell
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             "terminal.arguments" => self.terminal.arguments.join(", "),
             "terminal.scrollback_lines" => self.terminal.scrollback_lines.to_string(),
             "terminal.allow_child_osc52_write" => self.terminal.allow_child_osc52_write.to_string(),
@@ -561,14 +570,18 @@ impl LoadedConfig {
         Ok(())
     }
 
-    pub fn set_setting_from_string(&mut self, scope: ConfigScope, dotted_key: &str, value: &str) -> Result<()> {
+    pub fn set_setting_from_string(
+        &mut self,
+        scope: ConfigScope,
+        dotted_key: &str,
+        value: &str,
+    ) -> Result<()> {
         if scope == ConfigScope::Default {
             return Err(AppError::Arguments(
                 "default settings cannot be modified".to_owned(),
             ));
         }
-        if (dotted_key.starts_with("terminal.")
-            || dotted_key == "editor.autosave_interval_seconds")
+        if (dotted_key.starts_with("terminal.") || dotted_key == "editor.autosave_interval_seconds")
             && scope == ConfigScope::Workspace
         {
             return Err(AppError::Arguments(
@@ -603,14 +616,17 @@ impl LoadedConfig {
         let segments: Vec<&str> = dotted_key.split('.').collect();
         let mut table = document.as_table_mut();
         for segment in &segments[..segments.len() - 1] {
-            let item = table.entry(segment)
+            let item = table
+                .entry(segment)
                 .or_insert_with(|| Item::Table(Table::new()));
             table = item.as_table_mut().ok_or_else(|| AppError::Config {
                 path: path.clone(),
                 message: format!("`{segment}` must be a table"),
             })?;
         }
-        let leaf = *segments.last().ok_or_else(|| AppError::Arguments("setting key must not be empty".to_owned()))?;
+        let leaf = *segments
+            .last()
+            .ok_or_else(|| AppError::Arguments("setting key must not be empty".to_owned()))?;
         table[leaf] = value;
         atomic_config_write(&path, document.to_string().as_bytes())?;
         *self = Self::load_paths(self.user_path.clone(), self.workspace_path.clone())?;
@@ -628,7 +644,9 @@ impl LoadedConfig {
             .keybindings
             .get(current_key)
             .cloned()
-            .ok_or_else(|| AppError::Arguments(format!("no command is bound to `{current_key}`")))?;
+            .ok_or_else(|| {
+                AppError::Arguments(format!("no command is bound to `{current_key}`"))
+            })?;
         self.set_setting_from_string(scope, &format!("keybindings.{current_key}"), "disabled")?;
         self.set_setting_from_string(scope, &format!("keybindings.{replacement_key}"), &command)
     }
@@ -637,30 +655,36 @@ impl LoadedConfig {
 fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
     let trimmed = value.trim();
     match dotted_key {
-        "editor.insert_spaces" | "editor.line_numbers" | "editor.scrollbar" | "editor.soft_wrap"
-        | "editor.syntax_highlighting" | "editor.check_modified_files_on_quit"
-        | "explorer.visible" | "mouse.enabled" | "clipboard.osc52" | "terminal.allow_child_osc52_write"
-        | "ui.bottom_terminal_visible" => {
-            match trimmed {
-                "true" | "yes" | "1" => Ok(Value::from(true)),
-                "false" | "no" | "0" => Ok(Value::from(false)),
-                _ => Err(AppError::Arguments(format!(
-                    "expected boolean value for `{dotted_key}`, got `{trimmed}`"
-                ))),
-            }
-        }
-        "editor.indent_width" => {
-            trimmed.parse::<i64>().map(Value::from).map_err(|_| {
-                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
-            })
-        }
-        "editor.undo_limit_mib" | "editor.syntax_highlighting_max_file_size_kib"
+        "editor.insert_spaces"
+        | "editor.line_numbers"
+        | "editor.scrollbar"
+        | "editor.soft_wrap"
+        | "editor.syntax_highlighting"
+        | "editor.check_modified_files_on_quit"
+        | "explorer.visible"
+        | "mouse.enabled"
+        | "clipboard.osc52"
+        | "terminal.allow_child_osc52_write"
+        | "ui.bottom_terminal_visible" => match trimmed {
+            "true" | "yes" | "1" => Ok(Value::from(true)),
+            "false" | "no" | "0" => Ok(Value::from(false)),
+            _ => Err(AppError::Arguments(format!(
+                "expected boolean value for `{dotted_key}`, got `{trimmed}`"
+            ))),
+        },
+        "editor.indent_width" => trimmed.parse::<i64>().map(Value::from).map_err(|_| {
+            AppError::Arguments(format!(
+                "expected number for `{dotted_key}`, got `{trimmed}`"
+            ))
+        }),
+        "editor.undo_limit_mib"
+        | "editor.syntax_highlighting_max_file_size_kib"
         | "editor.autosave_interval_seconds"
-        | "terminal.scrollback_lines" => {
-            trimmed.parse::<i64>().map(Value::from).map_err(|_| {
-                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
-            })
-        }
+        | "terminal.scrollback_lines" => trimmed.parse::<i64>().map(Value::from).map_err(|_| {
+            AppError::Arguments(format!(
+                "expected number for `{dotted_key}`, got `{trimmed}`"
+            ))
+        }),
         "workspace.minimum_pane_width"
         | "workspace.minimum_pane_height"
         | "workspace.vertical_divider_thickness"
@@ -670,9 +694,17 @@ fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
         | "ui.bottom_terminal_height"
         | "ui.terminal_divider_thickness" => {
             let parsed = trimmed.parse::<i64>().map_err(|_| {
-                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
+                AppError::Arguments(format!(
+                    "expected number for `{dotted_key}`, got `{trimmed}`"
+                ))
             })?;
-            if ["workspace.vertical_divider_thickness", "workspace.horizontal_divider_thickness", "explorer.divider_thickness", "ui.terminal_divider_thickness"].contains(&dotted_key)
+            if [
+                "workspace.vertical_divider_thickness",
+                "workspace.horizontal_divider_thickness",
+                "explorer.divider_thickness",
+                "ui.terminal_divider_thickness",
+            ]
+            .contains(&dotted_key)
                 && !(0..=10).contains(&parsed)
             {
                 return Err(AppError::Arguments(format!(
@@ -681,33 +713,35 @@ fn parsed_setting_value(dotted_key: &str, value: &str) -> Result<Value> {
             }
             Ok(Value::from(parsed))
         }
-        "workspace.initial_split_ratio" => {
-            trimmed.parse::<f64>().map(Value::from).map_err(|_| {
-                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
-            })
-        }
+        "workspace.initial_split_ratio" => trimmed.parse::<f64>().map(Value::from).map_err(|_| {
+            AppError::Arguments(format!(
+                "expected number for `{dotted_key}`, got `{trimmed}`"
+            ))
+        }),
         "explorer.refresh_interval_seconds" => {
             trimmed.parse::<i64>().map(Value::from).map_err(|_| {
-                AppError::Arguments(format!("expected number for `{dotted_key}`, got `{trimmed}`"))
+                AppError::Arguments(format!(
+                    "expected number for `{dotted_key}`, got `{trimmed}`"
+                ))
             })
         }
-        "editor.default_line_ending" => {
-            match trimmed {
-                "lf" | "LF" => Ok(Value::from("lf")),
-                "crlf" | "CRLF" => Ok(Value::from("crlf")),
-                _ => Ok(Value::from(trimmed)),
-            }
-        }
-        "editor.header_style" => {
-            match trimmed {
-                "tabs" | "Tabs" => Ok(Value::from("tabs")),
-                "breadcrumbs" | "Breadcrumbs" => Ok(Value::from("breadcrumbs")),
-                _ => Ok(Value::from(trimmed)),
-            }
-        }
+        "editor.default_line_ending" => match trimmed {
+            "lf" | "LF" => Ok(Value::from("lf")),
+            "crlf" | "CRLF" => Ok(Value::from("crlf")),
+            _ => Ok(Value::from(trimmed)),
+        },
+        "editor.header_style" => match trimmed {
+            "tabs" | "Tabs" => Ok(Value::from("tabs")),
+            "breadcrumbs" | "Breadcrumbs" => Ok(Value::from("breadcrumbs")),
+            _ => Ok(Value::from(trimmed)),
+        },
         "explorer.exclusions" | "terminal.arguments" => {
             let mut array = Array::new();
-            for item in trimmed.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+            for item in trimmed
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+            {
                 array.push(item);
             }
             Ok(Value::Array(array))
@@ -757,7 +791,9 @@ fn atomic_config_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(&temporary)
-        .map_err(|error| AppError::io(format!("could not create {}", temporary.display()), error))?;
+        .map_err(|error| {
+            AppError::io(format!("could not create {}", temporary.display()), error)
+        })?;
     let write_result = (|| -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -1348,7 +1384,8 @@ fn validate(config: &mut Config, diagnostics: &mut Vec<ConfigDiagnostic>) {
         config.workspace.horizontal_divider_thickness > 10,
         "workspace.horizontal_divider_thickness must be between 0 and 10; the default was used",
     ) {
-        config.workspace.horizontal_divider_thickness = defaults.workspace.horizontal_divider_thickness;
+        config.workspace.horizontal_divider_thickness =
+            defaults.workspace.horizontal_divider_thickness;
     }
     if fallback(
         config.explorer.divider_thickness > 10,
@@ -1570,11 +1607,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let user_path = directory.path().join("user.toml");
         let workspace_path = directory.path().join("workspace.toml");
-        fs::write(
-            &user_path,
-            "[editor]\nautosave_interval_seconds = -1\n",
-        )
-        .unwrap();
+        fs::write(&user_path, "[editor]\nautosave_interval_seconds = -1\n").unwrap();
 
         let loaded = LoadedConfig::load_paths(user_path, workspace_path).unwrap();
 
@@ -1808,11 +1841,7 @@ mod tests {
         let workspace_path = directory.path().join("workspace.toml");
         let target = directory.path().join("outside.txt");
         fs::write(&target, "preserve this").unwrap();
-        symlink(
-            &target,
-            workspace_path.with_extension("toml.tinlynk.tmp"),
-        )
-        .unwrap();
+        symlink(&target, workspace_path.with_extension("toml.tinlynk.tmp")).unwrap();
         let mut loaded = LoadedConfig::load_paths(user_path, workspace_path.clone()).unwrap();
 
         loaded

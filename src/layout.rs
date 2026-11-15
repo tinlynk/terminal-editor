@@ -107,8 +107,14 @@ impl LayoutNode {
                     SplitDirection::Vertical => vertical_splitter_thickness,
                     SplitDirection::Horizontal => horizontal_splitter_thickness,
                 };
-                let (first_area, splitter, second_area) =
-                    split_rect(area, *direction, *ratio, minimum_width, minimum_height, splitter_thickness);
+                let (first_area, splitter, second_area) = split_rect(
+                    area,
+                    *direction,
+                    *ratio,
+                    minimum_width,
+                    minimum_height,
+                    splitter_thickness,
+                );
                 first.calculate_into(
                     first_area,
                     minimum_width,

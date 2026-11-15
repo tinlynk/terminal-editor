@@ -941,9 +941,9 @@ mod tests {
         assert_eq!(default.theme.icons.file_default, "•");
         assert_eq!(default.theme.icons.git_branch, "⎇");
         assert_eq!(default.theme.icons.scrollbar_horizontal, "▀");
-        assert_eq!(default.theme.icons.explorer_new_file, "F");
-        assert_eq!(default.theme.icons.explorer_new_folder, "D");
-        assert_eq!(default.theme.icons.explorer_refresh, "R");
+        assert_eq!(default.theme.icons.explorer_new_file, "+");
+        assert_eq!(default.theme.icons.explorer_new_folder, "⊞");
+        assert_eq!(default.theme.icons.explorer_refresh, "↺");
         assert!(default.diagnostics.is_empty());
     }
 
@@ -954,7 +954,10 @@ mod tests {
         let nerd_font = registry.get(NERD_FONT_THEME_ID).unwrap();
 
         assert_eq!(nerd_font.source, ThemeSource::Embedded);
-        assert_eq!(nerd_font.theme.meta.name, "TinLynk Terminal Editor - Nerd Font");
+        assert_eq!(
+            nerd_font.theme.meta.name,
+            "TinLynk Terminal Editor - Nerd Font"
+        );
         assert_eq!(nerd_font.theme.icons.left_panel_visible, "\u{ebf3}");
         assert_eq!(nerd_font.theme.icons.left_panel_hidden, "\u{ec02}");
         assert_eq!(nerd_font.theme.icons.bottom_panel_visible, "\u{ebf2}");

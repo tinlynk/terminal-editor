@@ -141,9 +141,7 @@ impl Explorer {
             entry.ignored = ignored.contains(&entry.path);
         }
         self.entries = entries;
-        self.viewport_row = self
-            .viewport_row
-            .min(self.entries.len().saturating_sub(1));
+        self.viewport_row = self.viewport_row.min(self.entries.len().saturating_sub(1));
         self.selected = selected_path
             .and_then(|path| self.entries.iter().position(|entry| entry.path == path))
             .unwrap_or_else(|| previous_index.min(self.entries.len().saturating_sub(1)));
@@ -183,25 +181,21 @@ impl Explorer {
         })?;
         let mut children = read_dir
             .filter_map(std::result::Result::ok)
-            .filter_map(|entry| {
-                (!self.is_excluded(&entry.path())).then_some(entry)
-            })
+            .filter_map(|entry| (!self.is_excluded(&entry.path())).then_some(entry))
             .collect::<Vec<_>>();
         children.sort_by(|left, right| {
-            let left_is_directory = left.file_type().is_ok_and(|file_type| {
-                file_type.is_dir() && !file_type.is_symlink()
-            });
-            let right_is_directory = right.file_type().is_ok_and(|file_type| {
-                file_type.is_dir() && !file_type.is_symlink()
-            });
-            right_is_directory
-                .cmp(&left_is_directory)
-                .then_with(|| {
-                    left.file_name()
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .cmp(&right.file_name().to_string_lossy().to_ascii_lowercase())
-                })
+            let left_is_directory = left
+                .file_type()
+                .is_ok_and(|file_type| file_type.is_dir() && !file_type.is_symlink());
+            let right_is_directory = right
+                .file_type()
+                .is_ok_and(|file_type| file_type.is_dir() && !file_type.is_symlink());
+            right_is_directory.cmp(&left_is_directory).then_with(|| {
+                left.file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .cmp(&right.file_name().to_string_lossy().to_ascii_lowercase())
+            })
         });
         for child in children {
             let path = child.path();
@@ -381,7 +375,14 @@ mod tests {
         let names = explorer
             .entries()
             .iter()
-            .map(|entry| entry.path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["Alpha", "zebra", "beta.txt", "zebra.txt"]);
@@ -402,18 +403,24 @@ mod tests {
 
         let explorer = Explorer::new(root.to_owned(), true, &[]).unwrap();
 
-        assert!(explorer
-            .entries()
-            .iter()
-            .any(|entry| entry.path.ends_with("ignored-file") && entry.ignored));
-        assert!(explorer
-            .entries()
-            .iter()
-            .any(|entry| entry.path.ends_with("ignored-folder") && entry.ignored));
-        assert!(explorer
-            .entries()
-            .iter()
-            .any(|entry| entry.path.ends_with("regular-file") && !entry.ignored));
+        assert!(
+            explorer
+                .entries()
+                .iter()
+                .any(|entry| entry.path.ends_with("ignored-file") && entry.ignored)
+        );
+        assert!(
+            explorer
+                .entries()
+                .iter()
+                .any(|entry| entry.path.ends_with("ignored-folder") && entry.ignored)
+        );
+        assert!(
+            explorer
+                .entries()
+                .iter()
+                .any(|entry| entry.path.ends_with("regular-file") && !entry.ignored)
+        );
     }
 
     #[test]
@@ -430,18 +437,22 @@ mod tests {
             .status()
             .unwrap();
         let mut explorer = Explorer::new(root.to_owned(), true, &[]).unwrap();
-        assert!(explorer
-            .entries()
-            .iter()
-            .any(|entry| entry.path.ends_with("tracked-later") && !entry.ignored));
+        assert!(
+            explorer
+                .entries()
+                .iter()
+                .any(|entry| entry.path.ends_with("tracked-later") && !entry.ignored)
+        );
 
         fs::write(root.join(".gitignore"), "tracked-later\n").unwrap();
         explorer.refresh().unwrap();
 
-        assert!(explorer
-            .entries()
-            .iter()
-            .any(|entry| entry.path.ends_with("tracked-later") && entry.ignored));
+        assert!(
+            explorer
+                .entries()
+                .iter()
+                .any(|entry| entry.path.ends_with("tracked-later") && entry.ignored)
+        );
     }
 
     #[test]
@@ -471,7 +482,10 @@ mod tests {
         fs::write(directory.path().join("a-first.txt"), "first").unwrap();
         explorer.refresh().unwrap();
 
-        assert_eq!(explorer.selected_entry().unwrap().path, canonical_selected_path);
+        assert_eq!(
+            explorer.selected_entry().unwrap().path,
+            canonical_selected_path
+        );
     }
 
     #[test]
