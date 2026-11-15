@@ -156,6 +156,8 @@ impl Application {
             return Ok(());
         }
         if key.code == KeyCode::Esc {
+            let dismissed_recovery =
+                matches!(self.overlay.as_ref(), Some(Overlay::Recovery { .. }));
             if let Some(Overlay::ExternalFileChange {
                 document_id,
                 version,
@@ -183,6 +185,9 @@ impl Application {
             }
             self.overlay = None;
             self.focus_owner = FocusOwner::Workspace;
+            if dismissed_recovery {
+                self.show_next_recovery();
+            }
             return Ok(());
         }
         if key.code == KeyCode::Char('r')
@@ -244,7 +249,7 @@ impl Application {
                 self.documents.accept_external_file_state(document_id)?;
                 self.message = Some("The missing file was kept open with local contents".to_owned());
             } else {
-                self.documents.reload(document_id, true)?;
+                self.reload_document(document_id)?;
             }
             self.deferred_external_changes.remove(&document_id);
             self.overlay = None;

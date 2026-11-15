@@ -16,8 +16,9 @@ use crate::{
     document::DocumentId,
     explorer::{Explorer, root_for_startup},
     file_io::{
-        DocumentRegistry, ExternalFileState, ExternalFileVersion, RecoveryRecord, load_recovery_records,
-        recovery_directory, remove_recovery_record, write_recovery_record,
+        DocumentRegistry, ExternalFileState, ExternalFileVersion, RecoveryRecord,
+        load_recovery_records, open_file_warning, recovery_directory, remove_recovery_record,
+        write_recovery_record,
     },
     input::InputMapper,
     layout::{PaneId, Rect, SplitDirection},
@@ -169,11 +170,35 @@ pub struct Application {
     last_click: Option<(Instant, u16, u16)>,
     click_count: u8,
     syntax_caches: RefCell<BTreeMap<crate::document::DocumentId, SyntaxCache>>,
+    pending_startup_warning: Option<(PathBuf, &'static str)>,
     recovery_directory: PathBuf,
     recovery_records: VecDeque<(PathBuf, RecoveryRecord)>,
     deferred_external_changes: BTreeMap<DocumentId, ExternalFileVersion>,
     last_autosave: Instant,
     last_external_file_check: Instant,
+}
+
+fn startup_workspace(
+    startup_path: Option<&Path>,
+    documents: &mut DocumentRegistry,
+    initial_split_ratio: f32,
+) -> Result<(Workspace, Option<(PathBuf, &'static str)>)> {
+    let workspace = match startup_path {
+        Some(path) if path.is_file() => {
+            if let Some(warning) = open_file_warning(path)? {
+                return Ok((
+                    Workspace::empty(initial_split_ratio),
+                    Some((path.to_owned(), warning.description())),
+                ));
+            }
+            Workspace::with_editor(documents.open(path)?.0, initial_split_ratio)
+        }
+        Some(path) if !path.exists() => {
+            Workspace::with_editor(documents.new_at_path(path.to_owned())?, initial_split_ratio)
+        }
+        _ => Workspace::empty(initial_split_ratio),
+    };
+    Ok((workspace, None))
 }
 
 impl Application {
@@ -214,17 +239,11 @@ impl Application {
             .saturating_mul(1024 * 1024);
         let mut documents =
             DocumentRegistry::new(config.effective.editor.default_line_ending, history_limit);
-        let workspace = match startup_path.as_deref() {
-            Some(path) if path.is_file() => Workspace::with_editor(
-                documents.open(path)?.0,
-                config.effective.workspace.initial_split_ratio,
-            ),
-            Some(path) if !path.exists() => Workspace::with_editor(
-                documents.new_at_path(path.to_owned())?,
-                config.effective.workspace.initial_split_ratio,
-            ),
-            _ => Workspace::empty(config.effective.workspace.initial_split_ratio),
-        };
+        let (workspace, pending_startup_warning) = startup_workspace(
+            startup_path.as_deref(),
+            &mut documents,
+            config.effective.workspace.initial_split_ratio,
+        )?;
         let explorer = Explorer::new(
             explorer_root,
             config.effective.explorer.visible,
@@ -274,6 +293,7 @@ impl Application {
             last_click: None,
             click_count: 0,
             syntax_caches: RefCell::new(BTreeMap::new()),
+            pending_startup_warning,
             recovery_directory,
             recovery_records: recovery_records.into(),
             deferred_external_changes: BTreeMap::new(),
@@ -339,6 +359,7 @@ impl Application {
             last_click: None,
             click_count: 0,
             syntax_caches: RefCell::new(BTreeMap::new()),
+            pending_startup_warning: None,
             recovery_directory: directory.join("recovery"),
             recovery_records: VecDeque::new(),
             deferred_external_changes: BTreeMap::new(),
@@ -888,6 +909,11 @@ impl Application {
                 line_index,
                 |line| document.line(line),
             )
+    }
+
+    fn reload_document(&mut self, document_id: DocumentId) -> Result<()> {
+        self.syntax_caches.borrow_mut().remove(&document_id);
+        self.documents.reload(document_id, true)
     }
 
     fn register_click(&mut self, column: u16, row: u16) -> u8 {
@@ -1614,7 +1640,7 @@ impl Application {
             match state {
                 ExternalFileState::Unchanged => {}
                 ExternalFileState::Changed if !modified => {
-                    if let Err(error) = self.documents.reload(document_id, true) {
+                    if let Err(error) = self.reload_document(document_id) {
                         self.message = Some(format!("Could not reload changed file: {error}"));
                     } else {
                         self.message = Some("Reloaded file changed outside the editor".to_owned());
@@ -1644,6 +1670,15 @@ impl Application {
         }
         if let Some((path, record)) = self.recovery_records.pop_front() {
             self.overlay = Some(Overlay::Recovery { path, record });
+            self.focus_owner = FocusOwner::Overlay;
+            return;
+        }
+        if let Some((path, warning)) = self.pending_startup_warning.take() {
+            self.overlay = Some(Overlay::ConfirmUnsafeOpen {
+                path,
+                split: None,
+                warning,
+            });
             self.focus_owner = FocusOwner::Overlay;
         }
     }
@@ -2384,6 +2419,20 @@ mod tests {
 
     use super::*;
 
+    fn application_with_startup_file(path: &Path) -> Application {
+        let mut application = Application::new_for_test();
+        application.documents = DocumentRegistry::new(crate::config::LineEnding::Lf, 1024);
+        let (workspace, warning) = startup_workspace(
+            Some(path),
+            &mut application.documents,
+            application.config.effective.workspace.initial_split_ratio,
+        )
+        .unwrap();
+        application.workspace = workspace;
+        application.pending_startup_warning = warning;
+        application
+    }
+
     #[test]
     fn git_branch_detection_reads_head_branch_and_commit() {
         let directory = tempfile::tempdir().unwrap();
@@ -2677,6 +2726,103 @@ mod tests {
         let document = application.documents.get(document_id);
 
         assert!(application.syntax_spans(document_id, document, 0).is_empty());
+    }
+
+    #[test]
+    fn reloading_document_invalidates_cached_syntax() {
+        let mut application = Application::new_for_test();
+        let path = application.explorer.root.join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        let (document_id, _) = application.documents.open(&path).unwrap();
+        let document = application.documents.get(document_id);
+        let before = application.syntax_spans(document_id, document, 0);
+
+        fs::write(&path, "// changed externally\n").unwrap();
+        application.reload_document(document_id).unwrap();
+        let document = application.documents.get(document_id);
+        let after = application.syntax_spans(document_id, document, 0);
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn flagged_startup_file_is_opened_only_after_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("binary.dat");
+        fs::write(&path, b"binary\0data").unwrap();
+        let mut application = application_with_startup_file(&path);
+        application.show_next_recovery();
+
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmUnsafeOpen { .. })
+        ));
+        assert!(application.open_document_ids().is_empty());
+
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        let document_id = application.focused_document_id().unwrap();
+        assert_eq!(
+            application.documents.get(document_id).path.as_deref(),
+            Some(fs::canonicalize(path).unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn flagged_startup_file_can_be_canceled_without_opening_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("binary.dat");
+        fs::write(&path, b"binary\0data").unwrap();
+        let mut application = application_with_startup_file(&path);
+        application.show_next_recovery();
+
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert!(application.overlay.is_none());
+        assert!(application.open_document_ids().is_empty());
+        assert!(matches!(application.workspace.focused_pane(), Pane::Empty));
+    }
+
+    #[test]
+    fn startup_warning_waits_until_recovery_prompts_are_dismissed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("binary.dat");
+        fs::write(&path, b"binary\0data").unwrap();
+        let mut application = application_with_startup_file(&path);
+        application.recovery_records.push_back((
+            directory.path().join("recovery.json"),
+            RecoveryRecord {
+                format_version: 1,
+                path: None,
+                revision: 0,
+                captured_at_unix_seconds: 0,
+                text: String::new(),
+            },
+        ));
+
+        application.show_next_recovery();
+        assert!(matches!(application.overlay, Some(Overlay::Recovery { .. })));
+        application
+            .handle_overlay_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmUnsafeOpen { .. })
+        ));
     }
 
     #[test]

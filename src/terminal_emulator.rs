@@ -227,12 +227,14 @@ impl Screen {
     fn resize(&mut self, rows: u16, columns: u16) {
         self.rows = usize::from(rows.max(1));
         self.columns = usize::from(columns.max(1));
-        self.grid.resize_with(self.rows, || blank_row(self.columns));
-        for row in &mut self.grid {
-            row.resize(self.columns, TerminalCell::default());
+        resize_grid(&mut self.grid, self.rows, self.columns);
+        if let Some(primary_grid) = &mut self.primary_grid {
+            resize_grid(primary_grid, self.rows, self.columns);
         }
         self.cursor_row = self.cursor_row.min(self.rows - 1);
         self.cursor_column = self.cursor_column.min(self.columns - 1);
+        self.saved_cursor.0 = self.saved_cursor.0.min(self.rows - 1);
+        self.saved_cursor.1 = self.saved_cursor.1.min(self.columns - 1);
     }
 
     fn line_feed(&mut self) {
@@ -546,6 +548,13 @@ impl Perform for Screen {
     }
 }
 
+fn resize_grid(grid: &mut Vec<Vec<TerminalCell>>, rows: usize, columns: usize) {
+    grid.resize_with(rows, || blank_row(columns));
+    for row in grid {
+        row.resize(columns, TerminalCell::default());
+    }
+}
+
 fn blank_grid(rows: usize, columns: usize) -> Vec<Vec<TerminalCell>> {
     (0..rows).map(|_| blank_row(columns)).collect()
 }
@@ -643,6 +652,19 @@ mod tests {
         terminal.resize(1, 2);
         assert_eq!(terminal.visible_lines(), vec!["界"]);
         assert_eq!(terminal.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn resize_updates_primary_grid_during_alternate_screen() {
+        let mut terminal = TerminalEmulator::new(1, 3, 10, false);
+        terminal.feed(b"pri\x1b[?1049halt");
+
+        terminal.resize(3, 8);
+        terminal.feed(b"\x1b[?1049l");
+
+        assert_eq!(terminal.visible_lines().len(), 3);
+        terminal.feed(b"\x1b[3;8Hx");
+        assert_eq!(terminal.visible_lines()[2], "       x");
     }
 
     #[test]

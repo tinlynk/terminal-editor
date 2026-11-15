@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -14,6 +16,7 @@ const DEFAULT_UNDO_LIMIT_MIB: usize = 32;
 const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 const DEFAULT_SYNTAX_HIGHLIGHTING_MAX_FILE_SIZE_KIB: usize = 1024;
 const DEFAULT_AUTOSAVE_INTERVAL_SECONDS: i64 = 10;
+static CONFIG_TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -741,11 +744,35 @@ fn atomic_config_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })?;
     fs::create_dir_all(parent)
         .map_err(|error| AppError::io(format!("could not create {}", parent.display()), error))?;
-    let temporary = path.with_extension("toml.tinlynk.tmp");
-    fs::write(&temporary, bytes)
-        .map_err(|error| AppError::io(format!("could not write {}", temporary.display()), error))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| AppError::io(format!("could not replace {}", path.display()), error))
+    let counter = CONFIG_TEMPORARY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let temporary = parent.join(format!(
+        ".{file_name}.tinlynk-{}-{counter}.tmp",
+        std::process::id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| AppError::io(format!("could not create {}", temporary.display()), error))?;
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(AppError::io(
+            format!("could not safely replace {}", path.display()),
+            error,
+        ));
+    }
+    Ok(())
 }
 
 fn user_config_path() -> Result<PathBuf> {
@@ -1769,5 +1796,30 @@ mod tests {
         let text = fs::read_to_string(user_path).unwrap();
         assert!(text.contains("\"ctrl+s\" = \"disabled\""));
         assert!(text.contains("\"ctrl+k\" = \"save\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_write_does_not_follow_the_legacy_temporary_path_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let user_path = directory.path().join("user.toml");
+        let workspace_path = directory.path().join("workspace.toml");
+        let target = directory.path().join("outside.txt");
+        fs::write(&target, "preserve this").unwrap();
+        symlink(
+            &target,
+            workspace_path.with_extension("toml.tinlynk.tmp"),
+        )
+        .unwrap();
+        let mut loaded = LoadedConfig::load_paths(user_path, workspace_path.clone()).unwrap();
+
+        loaded
+            .set_setting_from_string(ConfigScope::Workspace, "editor.indent_width", "2")
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(target).unwrap(), "preserve this");
+        assert_eq!(loaded.effective.editor.indent_width, 2);
     }
 }
