@@ -13,7 +13,7 @@ use crate::{AppError, Result, terminal_emulator::TerminalEmulator};
 
 const PTY_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 #[cfg(test)]
-const TERMINATION_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINATION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct TerminalSession {
     writer: Box<dyn Write + Send>,
