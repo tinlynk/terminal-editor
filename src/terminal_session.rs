@@ -330,7 +330,7 @@ fn process_group_id(process_id: u32) -> Option<u32> {
 #[cfg(unix)]
 fn run_kill(signal: &str, target: &str) -> bool {
     Command::new("/bin/kill")
-        .args([format!("-{signal}"), target.to_owned()])
+        .args([format!("-{signal}"), "--".to_owned(), target.to_owned()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
