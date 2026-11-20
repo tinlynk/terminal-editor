@@ -1,13 +1,13 @@
 # TinLynk Terminal Editor
 
-TinLynk Terminal Editor is a lightweight terminal-native text editor with an integrated terminal for macOS.
+TinLynk Terminal Editor is a lightweight terminal-native text editor with an integrated terminal.
 
 It combines Unicode-aware file editing, tiled editor panes, a file Explorer, and up to eight PTY-backed terminal sessions.
 
 ## Requirements
 
-- macOS.
-- Stable Rust 1.89 or newer.
+- Prebuilt releases: macOS 26+ on Apple Silicon, or GNU/Linux x64/ARM64 with glibc 2.35+.
+- Stable Rust 1.89 or newer when building from source.
 - A terminal emulator with Unicode support.
 
 The optional `nerd-font` theme requires a [Nerd Font](https://www.nerdfonts.com/) configured in the terminal emulator. Use the portable `default` theme when a Nerd Font is unavailable.
@@ -29,6 +29,23 @@ The command accepts zero or one path.
 - A missing file path creates a new document that will be written on save.
 
 Files that appear to be binary data or a supported archive format require confirmation before they are opened as text. Press `O` to continue or Escape to cancel.
+
+## Install a release
+
+Download and review the installer before running it:
+
+```sh
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  -o install.sh https://github.com/tinlynk/terminal-editor/releases/latest/download/install.sh
+# Review install.sh, then install the latest stable release:
+sh install.sh
+# Or install a pinned version without administrator permission:
+sh install.sh --version v0.1.0 --prefix "$HOME/.local"
+```
+
+The default destination is `/usr/local/bin`. Use `--prefix PREFIX` for `PREFIX/bin`, or `--bin-dir DIRECTORY` for an exact destination. The installer detects the platform, verifies the binary's SHA-256 checksum, and requests sudo only when the destination requires it. Put the chosen directory on your `PATH`.
+
+Releases also provide a macOS ARM64 `.pkg` installer and Linux x64/ARM64 `.tar.gz` archives, alongside raw binaries. The macOS package is **unsigned and not notarized**; macOS may warn or block it. See [releases and installation](docs/releases.md) for manual installation, platform limitations, verification, and release-maintainer instructions.
 
 ## Essential controls
 
@@ -73,6 +90,6 @@ See [file handling](docs/file-handling.md) for text encoding, archive/binary con
 
 ## Platform scope
 
-The first release is implemented and validated on macOS.
+Development is validated locally on macOS. Release automation includes native tests, artifact inspection, and packaged-binary PTY smoke checks for macOS ARM64 and Linux x64/ARM64.
 
-The platform boundaries are structured for later Linux support, but this release makes no Linux or Windows compatibility claim.
+Linux artifacts target GNU/Linux with glibc 2.35 or newer, not Alpine/musl. macOS artifacts require macOS 26 or newer on Apple Silicon. No Windows or macOS Intel release artifacts are provided. See [release validation](docs/releases.md#validation) for the checks required before publication.

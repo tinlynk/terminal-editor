@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+      - name: Validate release version
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked |
+            jq -r '.packages[] | select(.name == "tinlynk-terminal-editor") | .version')
+          case "$version" in
+            *+*) echo "Release versions with build metadata are not supported" >&2; exit 1 ;;
+          esac
+          tag="v$version"
+          if [[ "$EVENT_NAME" == push && "$REF_NAME" != "$tag" ]]; then
+            echo "Tag $REF_NAME does not match Cargo version $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    name: Package ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+    env:
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+      - name: Test native target and installer
+        run: |
+          if [[ "$PLATFORM" == macos-arm64 ]]; then
+            export MACOSX_DEPLOYMENT_TARGET=26.0
+          fi
+          cargo test --locked --target "$TARGET"
+          bash scripts/test-install.sh
+      - name: Package release
+        run: bash scripts/package-release.sh "$RELEASE_TAG" "$TARGET" dist
+      - name: Check shipped artifacts and native runtime
+        run: python3 scripts/check-release.py "dist/tinlynk-editor-$RELEASE_TAG-$PLATFORM"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  assemble:
+    needs: [version, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Assemble release and checksums
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          for platform in macos-arm64 linux-x64 linux-arm64; do
+            test -s "dist/tinlynk-editor-$RELEASE_TAG-$platform"
+          done
+          test -s "dist/tinlynk-editor-$RELEASE_TAG-macos-arm64.pkg"
+          test -s "dist/tinlynk-editor-$RELEASE_TAG-linux-x64.tar.gz"
+          test -s "dist/tinlynk-editor-$RELEASE_TAG-linux-arm64.tar.gz"
+          install -m 0755 install.sh dist/install.sh
+          cd dist
+          sha256sum tinlynk-editor-* install.sh > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [version, assemble]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Publish complete release
+        run: |
+          # Create as a draft so a failed upload cannot expose partial assets.
+          args=(--draft --verify-tag --generate-notes --title "$RELEASE_TAG")
+          if [[ "$PRERELEASE" == true ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "${args[@]}" dist/*
+          gh release edit "$RELEASE_TAG" --draft=false

@@ -23,6 +23,8 @@ jobs:
             os: ubuntu-24.04
           - name: Ubuntu 26.04
             os: ubuntu-26.04
+          - name: Ubuntu 22.04 (ARM64)
+            os: ubuntu-22.04-arm
 
     steps:
       - name: Check out repository
@@ -36,6 +38,12 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Check release scripts
+        run: |
+          sh -n install.sh
+          bash -n scripts/package-release.sh scripts/test-install.sh
+          bash scripts/test-install.sh
 
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
