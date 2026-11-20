@@ -34,6 +34,8 @@ Use Up and Down to select an entry. Enter or Right opens a file or expands a fol
 
 Select the workspace root or Open Editors header and press Enter or Right to collapse or expand it. The Explorer root action icons create a file, create a folder, or refresh the tree. `Ctrl+W` closes the active open editor.
 
+Press Backspace or forward Delete on a selected entry, then `D` to confirm permanent deletion or Escape to cancel. On most Mac keyboards, the key labeled Delete sends Backspace; Fn+Delete sends forward Delete. Deleting a folder recursively removes all its contents, including hidden and Explorer-excluded items. Symbolic links are deleted without deleting their targets. The workspace root cannot be deleted.
+
 ## File dialogs
 
 In Open, Up and Down select an item, Enter or Right opens the selected file or folder, and Left moves to the parent folder. Tab copies the selected path. Use `Ctrl+Enter` to submit a manually edited path and Escape to cancel.

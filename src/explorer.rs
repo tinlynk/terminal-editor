@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     io::Write,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -19,6 +20,63 @@ pub struct ExplorerEntry {
     pub is_symlink: bool,
     pub expanded: bool,
     pub ignored: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplorerDeleteTarget {
+    pub path: PathBuf,
+    pub is_directory: bool,
+    pub is_symlink: bool,
+    file_type: fs::FileType,
+    device: u64,
+    inode: u64,
+}
+
+impl ExplorerDeleteTarget {
+    pub fn capture(entry: &ExplorerEntry) -> Result<Self> {
+        let metadata = fs::symlink_metadata(&entry.path).map_err(|error| {
+            AppError::io(format!("could not inspect {}", entry.path.display()), error)
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() != entry.is_directory || file_type.is_symlink() != entry.is_symlink {
+            return Err(AppError::Arguments(format!(
+                "{} changed; refresh the Explorer before deleting it",
+                entry.path.display()
+            )));
+        }
+        Ok(Self {
+            path: entry.path.clone(),
+            is_directory: file_type.is_dir(),
+            is_symlink: file_type.is_symlink(),
+            file_type,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    pub fn delete(&self) -> Result<()> {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+            AppError::io(format!("could not inspect {}", self.path.display()), error)
+        })?;
+        let file_type = metadata.file_type();
+        if metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || file_type != self.file_type
+        {
+            return Err(AppError::Arguments(format!(
+                "{} was replaced; deletion cancelled",
+                self.path.display()
+            )));
+        }
+        let result = if self.is_directory {
+            fs::remove_dir_all(&self.path)
+        } else {
+            fs::remove_file(&self.path)
+        };
+        result.map_err(|error| {
+            AppError::io(format!("could not delete {}", self.path.display()), error)
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +203,29 @@ impl Explorer {
         self.selected = selected_path
             .and_then(|path| self.entries.iter().position(|entry| entry.path == path))
             .unwrap_or_else(|| previous_index.min(self.entries.len().saturating_sub(1)));
+        Ok(())
+    }
+
+    pub fn prune_deleted_expansions(&mut self, target: &Path) -> Result<()> {
+        let mut removed = Vec::new();
+        for path in self.expanded.iter().filter(|path| path.starts_with(target)) {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if !metadata.file_type().is_dir() => removed.push(path.clone()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removed.push(path.clone());
+                }
+                Err(error) => {
+                    return Err(AppError::io(
+                        format!("could not inspect {}", path.display()),
+                        error,
+                    ));
+                }
+            }
+        }
+        for path in removed {
+            self.expanded.remove(&path);
+        }
         Ok(())
     }
 
@@ -518,6 +599,27 @@ mod tests {
         assert_eq!(explorer.viewport_column, 5);
         explorer.scroll_horizontal(-10);
         assert_eq!(explorer.viewport_column, 0);
+    }
+
+    #[test]
+    fn pruning_deleted_expansions_preserves_surviving_directories() {
+        let directory = tempdir().unwrap();
+        let folder = directory.path().join("folder");
+        let nested = folder.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let mut explorer = Explorer::new(directory.path().to_owned(), true, &[]).unwrap();
+        let folder = explorer.root.join("folder");
+        explorer.toggle_selected().unwrap();
+        explorer.selected = 1;
+        explorer.toggle_selected().unwrap();
+        fs::remove_dir(&nested).unwrap();
+
+        explorer.prune_deleted_expansions(&folder).unwrap();
+        fs::create_dir(&nested).unwrap();
+        explorer.refresh().unwrap();
+
+        assert!(explorer.entries()[0].expanded);
+        assert!(!explorer.entries()[1].expanded);
     }
 
     #[cfg(unix)]

@@ -1686,6 +1686,32 @@ fn draw_overlay(frame: &mut Frame<'_>, application: &Application, screen: Rect) 
                 )),
             )
         }
+        Overlay::ConfirmExplorerDelete {
+            target,
+            modified_documents,
+        } => (
+            " Permanently Delete ",
+            Text::from(format!(
+                "{}\n\n{}{}\nPress D to permanently delete, or Esc to cancel.",
+                target.path.display(),
+                if target.is_directory {
+                    "This removes the folder and ALL contents, including hidden and excluded items.\n"
+                } else {
+                    ""
+                },
+                if *modified_documents > 0 {
+                    format!(
+                        "{modified_documents} modified open document(s) will be kept; saving may recreate files.\n"
+                    )
+                } else {
+                    String::new()
+                }
+            )),
+        ),
+        Overlay::ExplorerDeleteError { message } => (
+            " Explorer Deletion Failed ",
+            Text::from(format!("{message}\n\nPress Esc to return to the Explorer.")),
+        ),
         Overlay::Message { title, message } => (title.as_str(), Text::from(message.clone())),
         Overlay::ConfirmQuit => (
             " Unsaved Changes ",
@@ -1798,7 +1824,7 @@ fn help_text(application: &Application) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+F           Search and Replace\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, N      New terminal session\n  {leader}, [ / ]  Previous / next terminal session\n  {leader}, W      Close active terminal session\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nTerminal sessions\n  Click a tab       Select its session\n  Up to 8 sessions  Keep separate shell state\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
+        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+F           Search and Replace\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  Backspace/Delete Permanently delete entry\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, N      New terminal session\n  {leader}, [ / ]  Previous / next terminal session\n  {leader}, W      Close active terminal session\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nTerminal sessions\n  Click a tab       Select its session\n  Up to 8 sessions  Keep separate shell state\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
     )
 }
 
@@ -1855,6 +1881,9 @@ pub fn overlay_area(screen: Rect, overlay: &Overlay) -> Rect {
             screen.height.saturating_sub(4).clamp(3, 18)
         }
         Overlay::SearchReplace { .. } => 9.min(screen.height),
+        Overlay::ConfirmExplorerDelete { .. } | Overlay::ExplorerDeleteError { .. } => {
+            14.min(screen.height)
+        }
         Overlay::FileDialog { .. } | Overlay::ExplorerCreate { .. } => screen
             .height
             .saturating_sub(4)
@@ -1916,6 +1945,40 @@ mod tests {
             explorer_create_path_label(root, &root.join("src/app")),
             "terminal-editor/src/app/"
         );
+    }
+
+    #[test]
+    fn explorer_delete_confirmation_shows_destructive_warnings() {
+        let mut application = Application::new_for_test();
+        let folder = application.explorer.root.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        application.explorer.refresh().unwrap();
+        let target = crate::explorer::ExplorerDeleteTarget::capture(
+            application.explorer.selected_entry().unwrap(),
+        )
+        .unwrap();
+        application.overlay = Some(Overlay::ConfirmExplorerDelete {
+            target,
+            modified_documents: 1,
+        });
+        application.focus_owner = FocusOwner::Overlay;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &application)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..24)
+            .map(|row| {
+                (0..80)
+                    .map(|column| buffer.cell((column, row)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Permanently Delete"));
+        assert!(text.contains("ALL contents"));
+        assert!(text.contains("hidden"));
+        assert!(text.contains("excluded"));
+        assert!(text.contains("modified open document"));
+        assert!(text.contains("Press D to permanently delete"));
     }
 
     #[test]

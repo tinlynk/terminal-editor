@@ -60,6 +60,11 @@ impl Application {
                 }
             }
             KeyCode::Esc => self.focus_owner = FocusOwner::Workspace,
+            KeyCode::Backspace | KeyCode::Delete
+                if key.modifiers.is_empty() && key.kind == KeyEventKind::Press =>
+            {
+                self.open_explorer_delete();
+            }
             KeyCode::Char('r') => {
                 self.explorer.refresh()?;
                 self.last_explorer_refresh = Instant::now();

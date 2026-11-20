@@ -14,7 +14,7 @@ use crate::{
     command::Command,
     config::{ConfigScope, LoadedConfig},
     document::DocumentId,
-    explorer::{Explorer, root_for_startup},
+    explorer::{Explorer, ExplorerDeleteTarget, root_for_startup},
     file_io::{
         DocumentRegistry, ExternalFileState, ExternalFileVersion, RecoveryRecord,
         load_recovery_records, open_file_warning, recovery_directory, remove_recovery_record,
@@ -33,6 +33,7 @@ use crate::{
 mod config_runtime;
 mod document_lifecycle;
 mod events;
+mod explorer_delete;
 mod overlay_events;
 mod terminal_runtime;
 
@@ -107,6 +108,13 @@ pub enum Overlay {
         selected: usize,
         create_directory: bool,
         error: Option<String>,
+    },
+    ConfirmExplorerDelete {
+        target: ExplorerDeleteTarget,
+        modified_documents: usize,
+    },
+    ExplorerDeleteError {
+        message: String,
     },
     Message {
         title: String,
@@ -4069,6 +4077,296 @@ mod tests {
 
         assert_eq!(application.focus_owner, FocusOwner::Explorer);
         assert!(!application.explorer.selected_entry().unwrap().expanded);
+    }
+
+    fn explorer_delete_key(application: &mut Application, code: KeyCode) {
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+    }
+
+    fn select_explorer_path(application: &mut Application, path: &Path) {
+        application.explorer.refresh().unwrap();
+        application.explorer.selected = application
+            .explorer
+            .entries()
+            .iter()
+            .position(|entry| entry.path == path)
+            .unwrap();
+        application.focus_owner = FocusOwner::Explorer;
+    }
+
+    #[test]
+    fn explorer_delete_requires_entry_and_confirmation() {
+        let mut application = Application::new_for_test();
+        application.focus_owner = FocusOwner::Explorer;
+        explorer_delete_key(&mut application, KeyCode::Delete);
+        assert!(application.overlay.is_none());
+
+        let path = application.explorer.root.join("file");
+        fs::write(&path, "text").unwrap();
+        select_explorer_path(&mut application, &path);
+        for root_header in [true, false] {
+            application.explorer.root_header_selected = root_header;
+            application.explorer.open_editors_header_selected = !root_header;
+            explorer_delete_key(&mut application, KeyCode::Delete);
+            assert!(application.overlay.is_none());
+            assert!(path.exists());
+        }
+        application.explorer.open_editors_header_selected = false;
+        explorer_delete_key(&mut application, KeyCode::Delete);
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmExplorerDelete { .. })
+        ));
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            )))
+            .unwrap();
+        assert!(path.exists());
+        explorer_delete_key(&mut application, KeyCode::Esc);
+        assert!(path.exists());
+        assert!(application.overlay.is_none());
+        assert_eq!(application.focus_owner, FocusOwner::Explorer);
+    }
+
+    #[test]
+    fn explorer_backspace_opens_delete_confirmation() {
+        let mut application = Application::new_for_test();
+        let path = application.explorer.root.join("file");
+        fs::write(&path, "text").unwrap();
+        select_explorer_path(&mut application, &path);
+
+        for key in [
+            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            ),
+        ] {
+            application.handle_event(Event::Key(key)).unwrap();
+            assert!(application.overlay.is_none());
+            assert!(path.exists());
+        }
+        explorer_delete_key(&mut application, KeyCode::Backspace);
+
+        assert!(path.exists());
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmExplorerDelete { .. })
+        ));
+        explorer_delete_key(&mut application, KeyCode::Char('d'));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn editor_backspace_still_deletes_text() {
+        let mut application = Application::new_for_test();
+        let document_id = application.focused_document_id().unwrap();
+        application
+            .apply(Command::Insert("text".to_owned()))
+            .unwrap();
+
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert_eq!(application.documents.get(document_id).text(), "tex");
+        assert!(application.overlay.is_none());
+    }
+
+    #[test]
+    fn explorer_delete_keeps_modified_document_and_reports_missing_file() {
+        let mut application = Application::new_for_test();
+        let path = application.explorer.root.join("file");
+        fs::write(&path, "original").unwrap();
+        let (document_id, _) = application.documents.open(&path).unwrap();
+        application
+            .documents
+            .get_mut(document_id)
+            .insert(8, " edited");
+        select_explorer_path(&mut application, &path);
+        explorer_delete_key(&mut application, KeyCode::Delete);
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmExplorerDelete {
+                modified_documents: 1,
+                ..
+            })
+        ));
+
+        explorer_delete_key(&mut application, KeyCode::Char('d'));
+        assert!(!path.exists());
+        assert_eq!(
+            application.documents.get(document_id).text(),
+            "original edited"
+        );
+        assert!(application.documents.get(document_id).is_modified());
+        assert!(application.explorer.entries().is_empty());
+        assert_eq!(application.focus_owner, FocusOwner::Explorer);
+
+        let now = Instant::now();
+        application.last_external_file_check = now - Duration::from_secs(2);
+        assert!(application.refresh_document_lifecycle(now));
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ExternalFileChange {
+                document_id: id,
+                missing: true,
+                ..
+            }) if id == document_id
+        ));
+    }
+
+    #[test]
+    fn explorer_delete_recurses_into_hidden_and_excluded_contents() {
+        let mut application = Application::new_for_test();
+        let folder = application.explorer.root.join("folder");
+        let nested = folder.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join(".hidden"), "text").unwrap();
+        fs::create_dir(folder.join(".git")).unwrap();
+        fs::write(folder.join(".git").join("secret"), "text").unwrap();
+        for path in [nested.join(".hidden"), folder.join(".git").join("secret")] {
+            let (id, _) = application.documents.open(&path).unwrap();
+            application.documents.get_mut(id).insert(4, " edited");
+        }
+        application
+            .explorer
+            .set_exclusions(&["**/.git".to_owned(), "**/.git/**".to_owned()])
+            .unwrap();
+        select_explorer_path(&mut application, &folder);
+        application.explorer.toggle_selected().unwrap();
+        select_explorer_path(&mut application, &nested);
+        application.explorer.toggle_selected().unwrap();
+        select_explorer_path(&mut application, &folder);
+
+        explorer_delete_key(&mut application, KeyCode::Delete);
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmExplorerDelete {
+                modified_documents: 2,
+                ..
+            })
+        ));
+        explorer_delete_key(&mut application, KeyCode::Char('d'));
+
+        assert!(!folder.exists());
+        assert!(application.explorer.entries().is_empty());
+        fs::create_dir_all(&nested).unwrap();
+        application.explorer.refresh().unwrap();
+        assert!(!application.explorer.entries()[0].expanded);
+        application.explorer.toggle_selected().unwrap();
+        assert!(!application.explorer.entries()[1].expanded);
+    }
+
+    #[test]
+    fn explorer_delete_symlinks_preserves_targets_and_does_not_warn_for_them() {
+        use std::os::unix::fs::symlink;
+
+        let mut application = Application::new_for_test();
+        let external = tempfile::tempdir().unwrap();
+        let file = external.path().join("file");
+        fs::write(&file, "original").unwrap();
+        let (document_id, _) = application.documents.open(&file).unwrap();
+        application
+            .documents
+            .get_mut(document_id)
+            .insert(8, " edited");
+        for (name, target) in [
+            ("file-link", &file),
+            ("folder-link", &external.path().to_owned()),
+        ] {
+            let link = application.explorer.root.join(name);
+            symlink(target, &link).unwrap();
+            select_explorer_path(&mut application, &link);
+            explorer_delete_key(&mut application, KeyCode::Delete);
+            assert!(matches!(
+                application.overlay,
+                Some(Overlay::ConfirmExplorerDelete {
+                    modified_documents: 0,
+                    ..
+                })
+            ));
+            explorer_delete_key(&mut application, KeyCode::Char('d'));
+            assert!(fs::symlink_metadata(&link).is_err());
+            assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+        }
+        assert_eq!(
+            application.documents.get(document_id).text(),
+            "original edited"
+        );
+    }
+
+    #[test]
+    fn explorer_delete_rejects_replaced_or_missing_targets_and_refreshes() {
+        for replace in [false, true] {
+            let mut application = Application::new_for_test();
+            let path = application.explorer.root.join("file");
+            let old = application.explorer.root.join("old");
+            fs::write(&path, "original").unwrap();
+            select_explorer_path(&mut application, &path);
+            explorer_delete_key(&mut application, KeyCode::Delete);
+            fs::rename(&path, &old).unwrap();
+            if replace {
+                fs::write(&path, "replacement").unwrap();
+            }
+            explorer_delete_key(&mut application, KeyCode::Char('d'));
+            assert!(matches!(
+                application.overlay,
+                Some(Overlay::ExplorerDeleteError { .. })
+            ));
+            assert_eq!(fs::read_to_string(&old).unwrap(), "original");
+            if replace {
+                assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+            }
+            assert!(
+                application
+                    .explorer
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path == old)
+            );
+            explorer_delete_key(&mut application, KeyCode::Esc);
+            assert_eq!(application.focus_owner, FocusOwner::Explorer);
+        }
+    }
+
+    #[test]
+    fn explorer_delete_reports_deletion_and_refresh_failures() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("file");
+        fs::write(&path, "text").unwrap();
+        let mut application = Application::new_for_test();
+        application.explorer = Explorer::new(root.clone(), true, &[]).unwrap();
+        let path = application.explorer.root.join("file");
+        select_explorer_path(&mut application, &path);
+        explorer_delete_key(&mut application, KeyCode::Delete);
+        fs::rename(&root, parent.path().join("moved")).unwrap();
+
+        explorer_delete_key(&mut application, KeyCode::Char('d'));
+
+        let Some(Overlay::ExplorerDeleteError { message }) = &application.overlay else {
+            panic!("expected deletion error");
+        };
+        assert!(message.contains("could not inspect"));
+        assert!(message.contains("Explorer refresh failed"));
+        assert_eq!(
+            fs::read_to_string(parent.path().join("moved/file")).unwrap(),
+            "text"
+        );
     }
 
     #[test]

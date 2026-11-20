@@ -14,6 +14,8 @@ Modified documents are captured in local recovery records every 30 seconds by de
 
 The editor also checks open named files for external changes every two seconds. A pristine document reloads automatically. For a modified document, press `R` to reload and discard local edits, `K` to keep local edits and acknowledge the external version, or Escape to defer that version. A later external version or deletion prompts again. When a file is removed, `R` acknowledges the removal while retaining the local contents. Saving a changed file still offers overwrite or cancellation and leaves the external file untouched until confirmation. LF and CRLF content is preserved, and inserted lines use the detected document convention.
 
+Deleting an Explorer entry is permanent and requires confirmation. Deleting a folder recursively removes its contents, including hidden and Explorer-excluded items. Open documents remain available, including unsaved edits; the missing-file workflow applies, and saving a retained document may recreate its file. Explorer deletion removes a symbolic link itself, not its target.
+
 ## Terminal and clipboard security
 
 The internal clipboard is always available for editor operations. Bracketed paste imports text supplied by the outer terminal.

@@ -190,6 +190,10 @@ impl Application {
             return Ok(());
         }
         if key.code == KeyCode::Esc {
+            let explorer_delete = matches!(
+                self.overlay,
+                Some(Overlay::ConfirmExplorerDelete { .. } | Overlay::ExplorerDeleteError { .. })
+            );
             let dismissed_recovery =
                 matches!(self.overlay.as_ref(), Some(Overlay::Recovery { .. }));
             if let Some(Overlay::ExternalFileChange {
@@ -218,7 +222,11 @@ impl Application {
                 return Ok(());
             }
             self.overlay = None;
-            self.focus_owner = FocusOwner::Workspace;
+            self.focus_owner = if explorer_delete {
+                FocusOwner::Explorer
+            } else {
+                FocusOwner::Workspace
+            };
             if dismissed_recovery {
                 self.show_next_recovery();
             }
@@ -307,6 +315,14 @@ impl Application {
             && matches!(self.overlay, Some(Overlay::ExplorerCreate { .. }))
         {
             return self.submit_explorer_create();
+        }
+        if key.kind == KeyEventKind::Press
+            && key.modifiers == KeyModifiers::NONE
+            && key.code == KeyCode::Char('d')
+            && matches!(self.overlay, Some(Overlay::ConfirmExplorerDelete { .. }))
+        {
+            self.confirm_explorer_delete();
+            return Ok(());
         }
         if key.code == KeyCode::Char('o')
             && let Some((path, split)) = self.overlay.as_ref().and_then(|overlay| {
@@ -743,6 +759,8 @@ impl Application {
                 self.finish_successful_save(document_id)?;
             }
             Overlay::Message { .. }
+            | Overlay::ConfirmExplorerDelete { .. }
+            | Overlay::ExplorerDeleteError { .. }
             | Overlay::Help { .. }
             | Overlay::ConfirmQuit
             | Overlay::ConfirmTerminateAll
