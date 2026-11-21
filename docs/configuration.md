@@ -32,7 +32,7 @@ minimum_pane_width = 12
 minimum_pane_height = 4
 initial_split_ratio = 0.5
 vertical_divider_thickness = 1
-horizontal_divider_thickness = 1
+horizontal_divider_thickness = 0
 
 [explorer]
 visible = true
@@ -68,6 +68,6 @@ Modified documents are written to user-local recovery records every 30 seconds. 
 
 Set `editor.check_modified_files_on_quit = false` to quit without prompting to save or discard modified open documents. It defaults to `true`; with the default enabled, quitting prompts once for each modified document.
 
-Divider thicknesses can be customized between panels: `explorer.divider_thickness` controls the width of the vertical divider between the Explorer and editor panes, `ui.terminal_divider_thickness` controls the height of the horizontal divider above the bottom terminal panel, `workspace.vertical_divider_thickness` controls dividers in side-by-side editor pane splits, and `workspace.horizontal_divider_thickness` controls dividers in stacked editor pane splits. Thickness values accept integers from `0` to `10`; the workspace settings default to `0`. Setting thickness to `0` removes the separator gap and places panels flush against each other. Replace the legacy `workspace.divider_thickness` setting with both workspace directional settings.
+Divider thicknesses can be customized between panels: `explorer.divider_thickness` controls the width of the vertical divider between the Explorer and editor panes, `ui.terminal_divider_thickness` controls the height of the horizontal divider above the bottom terminal panel, `workspace.vertical_divider_thickness` controls dividers in side-by-side editor pane splits, and `workspace.horizontal_divider_thickness` controls dividers in stacked editor pane splits. Thickness values accept integers from `0` to `10`; the workspace vertical divider defaults to `1` and the horizontal divider defaults to `0`. Setting thickness to `0` removes the separator gap and places panels flush against each other. Replace the legacy `workspace.divider_thickness` setting with both workspace directional settings.
 
 Use [theme authoring](themes.md) for `theme.active` and custom theme behavior.
