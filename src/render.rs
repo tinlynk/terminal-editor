@@ -244,17 +244,24 @@ pub fn explorer_rows(area: Rect, open_editor_count: usize, expanded: bool) -> Ex
 
 pub fn editor_tab_at(
     application: &Application,
+    pane_id: crate::layout::PaneId,
     pane_area: Rect,
     x: u16,
     y: u16,
 ) -> Option<crate::document::DocumentId> {
-    if y != pane_area.y {
+    if y != pane_area.y
+        || pane_area.height == 0
+        || x <= pane_area.x
+        || x >= pane_area
+            .x
+            .saturating_add(pane_area.width.saturating_sub(1))
+    {
         return None;
     }
     if application.config.effective.editor.header_style != crate::config::EditorHeaderStyle::Tabs {
         return None;
     }
-    let open_ids = application.open_document_ids();
+    let open_ids = &application.workspace.tabs[&pane_id];
     if open_ids.is_empty() {
         return None;
     }
@@ -816,12 +823,13 @@ fn draw_workspace(frame: &mut Frame<'_>, application: &Application, layout: &Cal
 
 fn editor_header_title<'a>(
     application: &Application,
+    pane_id: crate::layout::PaneId,
     current_doc_id: crate::document::DocumentId,
 ) -> Line<'a> {
     match application.config.effective.editor.header_style {
         crate::config::EditorHeaderStyle::Tabs => {
             let mut spans = Vec::new();
-            let open_ids = application.open_document_ids();
+            let open_ids = &application.workspace.tabs[&pane_id];
             if open_ids.is_empty() {
                 let doc = application.documents.get(current_doc_id);
                 let name = doc
@@ -915,7 +923,7 @@ fn draw_editor(
     view: &crate::editor::EditorView,
     document_id: crate::document::DocumentId,
 ) {
-    let title = editor_header_title(application, document_id);
+    let title = editor_header_title(application, pane_id, document_id);
     let content = editor_content_geometry(application, area, document);
     let inner_height = content.height;
     let viewport_line = view.clamped_viewport_line(document, inner_height);
@@ -1826,7 +1834,7 @@ fn help_text(application: &Application) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+F           Search and Replace\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  Backspace/Delete Permanently delete entry\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, N      New terminal session\n  {leader}, [ / ]  Previous / next terminal session\n  {leader}, W      Close active terminal session\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nTerminal sessions\n  Click a tab       Select its session\n  Up to 8 sessions  Keep separate shell state\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
+        "Keybindings\n\n{bindings}\n\nGlobal\n  Ctrl+F           Search and Replace\n  Ctrl+H           Help\n  Ctrl+G           Settings\n  Ctrl+T           Toggle bottom terminal\n  Esc              Close dialog\n\nEditor\n  Arrow keys       Move cursor\n  Home / End       Start / end of line\n  Page Up / Down   Move by page\n  Click a tab      Select its document\n  Drag a tab       Move tab to another pane\n\nExplorer\n  Up / Down        Select entry\n  Enter / Right    Open file or expand folder\n  Left             Collapse expanded folder\n  Backspace/Delete Permanently delete entry\n  R                Refresh\n  Esc              Return to editor\n\nLeader ({leader})\n  {leader}, V      Split vertically\n  {leader}, H      Split horizontally\n  {leader}, Arrows Move editor focus\n  {leader}, Q      Quit (terminal focus)\n  {leader}, N      New terminal session\n  {leader}, [ / ]  Previous / next terminal session\n  {leader}, W      Close active terminal session\n  {leader}, Page Up/Down  Scroll terminal output\n  {leader}, C      Copy terminal selection\n\nTerminal sessions\n  Click a tab       Select its session\n  Up to 8 sessions  Keep separate shell state\n\nEditing\n  Ctrl+C           Copy selection\n  Ctrl+X           Cut selection\n  Ctrl+V           Paste\n  Enter            New line\n  Backspace        Delete backward\n  Delete           Delete forward\n  Tab              Indent\n  Shift+Tab        Unindent\n\nHelp\n  Up / Down        Scroll\n  Page Up / Down   Scroll by page\n  Mouse wheel      Scroll\n  Esc              Close"
     )
 }
 
@@ -3130,7 +3138,8 @@ mod tests {
             application.config.effective.editor.header_style,
             crate::config::EditorHeaderStyle::Tabs
         );
-        let tab_line = editor_header_title(&application, document_id);
+        let tab_line =
+            editor_header_title(&application, application.workspace.focused, document_id);
         assert!(!tab_line.spans.is_empty());
         assert!(
             tab_line
@@ -3149,9 +3158,42 @@ mod tests {
         // Configured: Breadcrumbs
         application.config.effective.editor.header_style =
             crate::config::EditorHeaderStyle::Breadcrumbs;
-        let breadcrumb_line = editor_header_title(&application, document_id);
+        let breadcrumb_line =
+            editor_header_title(&application, application.workspace.focused, document_id);
         assert!(breadcrumb_line.spans[0].content.contains("›"));
         assert!(breadcrumb_line.spans[0].content.contains("Untitled"));
+    }
+
+    #[test]
+    fn editor_headers_and_hit_tests_use_each_panes_tabs() {
+        let mut application = Application::new_for_test();
+        let first = application.focused_document_id().unwrap();
+        let source = application.workspace.focused;
+        let second = application.documents.new_untitled();
+        application
+            .workspace
+            .tabs
+            .get_mut(&source)
+            .unwrap()
+            .push(second);
+        let target = application
+            .workspace
+            .split_contextual(crate::layout::SplitDirection::Vertical);
+        let source_title = editor_header_title(&application, source, first);
+        let target_title = editor_header_title(&application, target, first);
+        assert_eq!(source_title.spans.len(), 3);
+        assert_eq!(target_title.spans.len(), 1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        assert_eq!(
+            editor_tab_at(&application, source, area, 15, 0),
+            Some(second)
+        );
+        assert_eq!(editor_tab_at(&application, target, area, 15, 0), None);
     }
 
     #[test]

@@ -17,11 +17,13 @@ Open the in-app Help view with `Ctrl+H` to see the active configurable keybindin
 | `Ctrl+Q` | Exit with required confirmations. |
 
 `Ctrl+T` and `Ctrl+G` remain application shortcuts while the terminal is focused.
-Closing a document shows another open document in the same pane, if available. Otherwise, a split pane closes; the last pane remains empty.
+Closing a tab affects only its pane and shows another tab in that pane, if available. Otherwise, a split pane closes; the last pane remains empty. A modified document is confirmed before its last tab closes.
 
 ## Editor
 
 Arrow keys move the cursor. Home and End move to the start and end of the line, while Page Up and Page Down move by a page. Use Shift with arrows, Home, End, Page Up, or Page Down to extend a selection when the terminal reports those modified keys.
+
+Each pane has its own tabs. A new split starts with only the active document. Click a tab to select it in its pane. Drag a tab onto a different editor pane to move it there; if it is already open there, its existing view is preserved. Moving the last tab closes the source split. Document contents are shared between panes, but each pane has its own view. Drops elsewhere or onto the source pane cancel.
 
 `Ctrl+C`, `Ctrl+X`, and `Ctrl+V` copy, cut, and paste through the internal clipboard. Enter inserts a line, Backspace and Delete remove text, Tab indents, and Shift+Tab unindents.
 
