@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -322,26 +322,37 @@ fn git_ignored_paths(root: &Path, entries: &[ExplorerEntry]) -> BTreeSet<PathBuf
         Ok(child) => child,
         Err(_) => return BTreeSet::new(),
     };
-    let input = paths.iter().fold(Vec::new(), |mut input, path| {
-        input.extend_from_slice(path.to_string_lossy().as_bytes());
-        input.push(0);
-        input
-    });
     let Some(mut stdin) = child.stdin.take() else {
         return BTreeSet::new();
     };
-    if stdin.write_all(&input).is_err() {
-        return BTreeSet::new();
-    }
-    drop(stdin);
-    let Ok(output) = child.wait_with_output() else {
+    let Some(mut stdout) = child.stdout.take() else {
         return BTreeSet::new();
     };
-    if !output.status.success() && output.status.code() != Some(1) {
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let mut write_failed = false;
+    for path in paths {
+        if stdin
+            .write_all(path.to_string_lossy().as_bytes())
+            .and_then(|()| stdin.write_all(&[0]))
+            .is_err()
+        {
+            write_failed = true;
+            break;
+        }
+    }
+    drop(stdin);
+    let status = child.wait();
+    let output = reader.join();
+    let (Ok(status), Ok(Ok(output))) = (status, output) else {
+        return BTreeSet::new();
+    };
+    if write_failed || (!status.success() && status.code() != Some(1)) {
         return BTreeSet::new();
     }
     output
-        .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .map(|path| root.join(String::from_utf8_lossy(path).as_ref()))
@@ -534,6 +545,29 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path.ends_with("tracked-later") && entry.ignored)
         );
+    }
+
+    #[test]
+    fn git_ignore_pipe_handles_large_input_and_output() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        Command::new("git")
+            .args(["init", "-q", root.to_str().unwrap()])
+            .status()
+            .unwrap();
+        fs::write(root.join(".gitignore"), "ignored-*\n").unwrap();
+        let entries = (0..8_000)
+            .map(|index| ExplorerEntry {
+                path: root.join(format!("ignored-entry-{index:05}.txt")),
+                depth: 0,
+                is_directory: false,
+                is_symlink: false,
+                expanded: false,
+                ignored: false,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(git_ignored_paths(root, &entries).len(), entries.len());
     }
 
     #[test]

@@ -4,10 +4,31 @@ use std::{
 };
 
 use ropey::Rope;
+use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::LineEnding;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EncodingState {
+    #[default]
+    Utf8,
+    LossyUtf8,
+}
+
+impl EncodingState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::LossyUtf8 => "Lossy UTF-8 (read-only)",
+        }
+    }
+
+    pub fn is_lossy(self) -> bool {
+        self == Self::LossyUtf8
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DocumentId(pub u64);
@@ -47,7 +68,7 @@ impl Edit {
 pub struct Document {
     text: Rope,
     line_width_frequencies: BTreeMap<usize, usize>,
-    pub encoding: &'static str,
+    pub encoding: EncodingState,
     pub path: Option<PathBuf>,
     pub line_ending: LineEnding,
     revision: u64,
@@ -66,7 +87,7 @@ impl Document {
         path: Option<PathBuf>,
         default_line_ending: LineEnding,
         history_limit: usize,
-        encoding: &'static str,
+        encoding: EncodingState,
     ) -> Self {
         let line_ending = detect_line_ending(text).unwrap_or(default_line_ending);
         Self {
@@ -168,6 +189,10 @@ impl Document {
 
     pub fn char_to_line(&self, char_index: usize) -> usize {
         self.text.char_to_line(char_index.min(self.len_chars()))
+    }
+
+    pub fn char_at(&self, char_index: usize) -> Option<char> {
+        (char_index < self.len_chars()).then(|| self.text.char(char_index))
     }
 
     pub fn insert(&mut self, char_index: usize, text: &str) -> usize {
@@ -398,7 +423,7 @@ mod tests {
     use super::*;
 
     fn document(text: &str) -> Document {
-        Document::new(text, None, LineEnding::Lf, 1024, "UTF-8")
+        Document::new(text, None, LineEnding::Lf, 1024, EncodingState::Utf8)
     }
 
     #[test]
@@ -461,7 +486,7 @@ mod tests {
 
     #[test]
     fn oversized_latest_edit_is_retained_alone() {
-        let mut document = Document::new("", None, LineEnding::Lf, 2, "UTF-8");
+        let mut document = Document::new("", None, LineEnding::Lf, 2, EncodingState::Utf8);
         document.insert(0, "small");
         assert_eq!(document.undo(), Some(0));
         assert!(document.is_empty());
@@ -469,7 +494,13 @@ mod tests {
 
     #[test]
     fn detects_crlf_without_normalizing_content() {
-        let document = Document::new("one\r\ntwo\r\n", None, LineEnding::Lf, 1024, "UTF-8");
+        let document = Document::new(
+            "one\r\ntwo\r\n",
+            None,
+            LineEnding::Lf,
+            1024,
+            EncodingState::Utf8,
+        );
         assert_eq!(document.line_ending, LineEnding::Crlf);
         assert_eq!(document.text(), "one\r\ntwo\r\n");
     }

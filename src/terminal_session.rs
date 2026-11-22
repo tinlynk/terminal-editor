@@ -184,7 +184,7 @@ impl TerminalSession {
             let line = cells[from.min(cells.len())..to.min(cells.len())]
                 .iter()
                 .filter(|cell| !cell.continuation)
-                .map(|cell| cell.character)
+                .map(|cell| format!("{}{}", cell.character, cell.combining))
                 .collect::<String>()
                 .trim_end()
                 .to_owned();

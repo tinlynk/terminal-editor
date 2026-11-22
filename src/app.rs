@@ -184,6 +184,19 @@ pub struct Application {
     deferred_external_changes: BTreeMap<DocumentId, ExternalFileVersion>,
     last_autosave: Instant,
     last_external_file_check: Instant,
+    external_file_poll_cursor: usize,
+}
+
+fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + if bracketed { 12 } else { 0 });
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[201~");
+    }
+    bytes
 }
 
 fn startup_workspace(
@@ -307,6 +320,7 @@ impl Application {
             deferred_external_changes: BTreeMap::new(),
             last_autosave: Instant::now(),
             last_external_file_check: Instant::now(),
+            external_file_poll_cursor: 0,
         };
         if !application.recovery_records.is_empty() {
             application.overlay = None;
@@ -375,6 +389,7 @@ impl Application {
             deferred_external_changes: BTreeMap::new(),
             last_autosave: Instant::now(),
             last_external_file_check: Instant::now(),
+            external_file_poll_cursor: 0,
         }
     }
 
@@ -1201,7 +1216,7 @@ impl Application {
                 let clipboard = self.clipboard.clone();
                 self.insert_text(&clipboard)?;
             }
-            Command::Paste(text) => self.insert_text(&text)?,
+            Command::Paste(text) => self.paste_text(&text)?,
             Command::Insert(text) => self.insert_typed_text(&text)?,
             Command::Undo => self.edit_focused(|document, view| {
                 if let Some(cursor) = document.undo() {
@@ -1660,12 +1675,19 @@ impl Application {
             return redraw;
         }
         self.last_external_file_check = now;
-        for (document_id, modified) in self
+        const EXTERNAL_FILE_POLL_BATCH: usize = 8;
+        let named_documents = self
             .documents
             .iter()
+            .filter(|(_, document)| document.path.is_some())
             .map(|(id, document)| (id, document.is_modified()))
-            .collect::<Vec<_>>()
-        {
+            .collect::<Vec<_>>();
+        if named_documents.is_empty() {
+            return redraw;
+        }
+        let start = self.external_file_poll_cursor % named_documents.len();
+        for index in 0..named_documents.len().min(EXTERNAL_FILE_POLL_BATCH) {
+            let (document_id, modified) = named_documents[(start + index) % named_documents.len()];
             let (state, version) = match self.documents.external_file_state_and_version(document_id)
             {
                 Ok(state) => state,
@@ -1698,10 +1720,13 @@ impl Application {
                         version,
                     });
                     self.focus_owner = FocusOwner::Overlay;
+                    self.external_file_poll_cursor = (start + index + 1) % named_documents.len();
                     return true;
                 }
             }
         }
+        self.external_file_poll_cursor =
+            (start + named_documents.len().min(EXTERNAL_FILE_POLL_BATCH)) % named_documents.len();
         redraw
     }
 
@@ -1729,6 +1754,7 @@ impl Application {
             Some(path) => self.documents.new_at_path(path)?,
             None => self.documents.new_untitled(),
         };
+        self.documents.get_mut(document_id).encoding = record.encoding;
         self.documents.get_mut(document_id).insert(0, &record.text);
         let pane_id = self.workspace.focused;
         self.switch_editor_document(pane_id, document_id);
@@ -1875,6 +1901,20 @@ impl Application {
             return Ok(());
         }
         self.edit_focused(|document, view| view.insert(document, text));
+        Ok(())
+    }
+
+    fn paste_text(&mut self, text: &str) -> Result<()> {
+        if self.focus_owner != FocusOwner::BottomTerminal {
+            return self.insert_text(text);
+        }
+        let bracketed = self
+            .active_bottom_terminal()
+            .is_some_and(|session| session.modes().bracketed_paste);
+        let bytes = terminal_paste_bytes(text, bracketed);
+        if let Some(session) = self.active_bottom_terminal_mut() {
+            session.write(&bytes)?;
+        }
         Ok(())
     }
 
@@ -2090,7 +2130,7 @@ impl Application {
                     crate::config::LineEnding::Lf => "LF",
                     crate::config::LineEnding::Crlf => "CRLF",
                 };
-                let encoding = document.encoding;
+                let encoding = document.encoding.label();
                 let horizontal_offset =
                     if !self.config.effective.editor.soft_wrap && view.viewport_column > 0 {
                         format!("  HScroll {}", view.viewport_column)
@@ -2493,6 +2533,10 @@ mod tests {
     use super::*;
 
     fn application_with_startup_file(path: &Path) -> Application {
+        application_with_startup_path(path)
+    }
+
+    fn application_with_startup_path(path: &Path) -> Application {
         let mut application = Application::new_for_test();
         application.documents = DocumentRegistry::new(crate::config::LineEnding::Lf, 1024);
         let (workspace, warning) = startup_workspace(
@@ -2557,7 +2601,7 @@ mod tests {
     #[test]
     fn directory_startup_has_no_untitled_document() {
         let directory = tempfile::tempdir().unwrap();
-        let application = Application::new(Some(directory.path().to_owned())).unwrap();
+        let application = application_with_startup_path(directory.path());
 
         assert!(matches!(application.workspace.focused_pane(), Pane::Empty));
         assert!(application.open_document_ids().is_empty());
@@ -2567,7 +2611,7 @@ mod tests {
     #[test]
     fn typing_in_an_empty_editor_creates_one_untitled_document() {
         let directory = tempfile::tempdir().unwrap();
-        let mut application = Application::new(Some(directory.path().to_owned())).unwrap();
+        let mut application = application_with_startup_path(directory.path());
         application.overlay = None;
         application.focus_owner = FocusOwner::Workspace;
 
@@ -2906,6 +2950,7 @@ mod tests {
                 path: None,
                 revision: 0,
                 captured_at_unix_seconds: 0,
+                encoding: crate::document::EncodingState::Utf8,
                 text: String::new(),
             },
         ));
@@ -3097,7 +3142,7 @@ mod tests {
     #[test]
     fn terminal_input_does_not_create_an_untitled_document() {
         let directory = tempfile::tempdir().unwrap();
-        let mut application = Application::new(Some(directory.path().to_owned())).unwrap();
+        let mut application = application_with_startup_path(directory.path());
         application.overlay = None;
         application.focus_owner = FocusOwner::BottomTerminal;
 
@@ -3110,6 +3155,15 @@ mod tests {
 
         assert!(matches!(application.workspace.focused_pane(), Pane::Empty));
         assert!(application.open_document_ids().is_empty());
+    }
+
+    #[test]
+    fn terminal_paste_wraps_data_only_when_bracketed_paste_is_enabled() {
+        assert_eq!(
+            terminal_paste_bytes("line\n", true),
+            b"\x1b[200~line\n\x1b[201~"
+        );
+        assert_eq!(terminal_paste_bytes("line\n", false), b"line\n");
     }
 
     #[test]
@@ -3908,7 +3962,42 @@ mod tests {
     }
 
     #[test]
-    fn saving_during_close_prompts_for_the_next_dirty_document() {
+    fn saving_one_document_does_not_close_the_next_pristine_document() {
+        let mut application = Application::new_for_test();
+        let first_document = application.focused_document_id().unwrap();
+        application
+            .apply(Command::Insert("saved".to_owned()))
+            .unwrap();
+        let second_document = application.documents.new_untitled();
+        application.switch_editor_document(application.workspace.focused, second_document);
+        application.switch_editor_document(application.workspace.focused, first_document);
+        let path = application.explorer.root.join("saved-first.txt");
+
+        application.request_close().unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let Some(Overlay::FileDialog { input, .. }) = application.overlay.as_mut() else {
+            panic!("expected Save As dialog");
+        };
+        *input = path.display().to_string();
+        application.submit_file_dialog().unwrap();
+
+        assert_eq!(application.focused_document_id(), Some(second_document));
+        assert!(
+            application
+                .documents
+                .iter()
+                .any(|(id, _)| id == second_document)
+        );
+        assert!(application.overlay.is_none());
+    }
+
+    #[test]
+    fn saving_during_close_does_not_close_or_prompt_for_the_next_document() {
         let mut application = Application::new_for_test();
         let first_document = application.focused_document_id().unwrap();
         application
@@ -3937,8 +4026,9 @@ mod tests {
 
         assert_eq!(fs::read_to_string(path).unwrap(), "first");
         assert_eq!(application.focused_document_id(), Some(second_document));
-        assert_eq!(application.overlay, Some(Overlay::ConfirmDocumentClose));
-        assert_eq!(application.focus_owner, FocusOwner::Overlay);
+        assert!(application.overlay.is_none());
+        assert_eq!(application.focus_owner, FocusOwner::Workspace);
+        assert!(application.documents.get(second_document).is_modified());
     }
 
     #[test]
@@ -4037,6 +4127,103 @@ mod tests {
 
         assert_ne!(application.focused_document_id(), Some(first_document));
         assert!(matches!(application.workspace.focused_pane(), Pane::Empty));
+    }
+
+    #[test]
+    fn closing_a_file_in_a_split_shows_another_open_file_in_the_same_pane() {
+        for direction in [SplitDirection::Vertical, SplitDirection::Horizontal] {
+            let directory = tempfile::tempdir().unwrap();
+            let first_path = directory.path().join("first.txt");
+            let second_path = directory.path().join("second.txt");
+            fs::write(&first_path, "first").unwrap();
+            fs::write(&second_path, "second").unwrap();
+            let mut application = application_with_startup_path(directory.path());
+            application.apply(Command::Open(first_path)).unwrap();
+            let first_document = application.focused_document_id().unwrap();
+            application.apply(Command::Split(direction)).unwrap();
+            let split_pane = application.workspace.focused;
+            application.apply(Command::Open(second_path)).unwrap();
+            let second_document = application.focused_document_id().unwrap();
+
+            application
+                .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('w'),
+                    KeyModifiers::CONTROL,
+                )))
+                .unwrap();
+
+            assert_eq!(application.workspace.panes.len(), 2);
+            assert_eq!(application.workspace.focused, split_pane);
+            assert_eq!(application.focused_document_id(), Some(first_document));
+            assert_eq!(application.open_document_ids(), vec![first_document]);
+            assert!(!application.open_document_ids().contains(&second_document));
+
+            application.apply(Command::ClosePane).unwrap();
+            assert_eq!(application.workspace.panes.len(), 1);
+            assert_eq!(application.focused_document_id(), Some(first_document));
+        }
+    }
+
+    #[test]
+    fn closing_a_modified_split_document_waits_for_confirmation() {
+        let mut application = Application::new_for_test();
+        let first_document = application.focused_document_id().unwrap();
+        application
+            .apply(Command::Split(SplitDirection::Vertical))
+            .unwrap();
+        let split_pane = application.workspace.focused;
+        let second_document = application.documents.new_untitled();
+        application.switch_editor_document(split_pane, second_document);
+        application
+            .apply(Command::Insert("modified".to_owned()))
+            .unwrap();
+
+        application.apply(Command::ClosePane).unwrap();
+        assert_eq!(application.overlay, Some(Overlay::ConfirmDocumentClose));
+        assert_eq!(application.focused_document_id(), Some(second_document));
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(application.workspace.panes.len(), 2);
+        assert_eq!(application.focused_document_id(), Some(second_document));
+
+        application.apply(Command::ClosePane).unwrap();
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(application.workspace.panes.len(), 2);
+        assert_eq!(application.workspace.focused, split_pane);
+        assert_eq!(application.focused_document_id(), Some(first_document));
+        assert_eq!(application.open_document_ids(), vec![first_document]);
+    }
+
+    #[test]
+    fn closing_one_of_multiple_views_keeps_the_shared_modified_document() {
+        let mut application = Application::new_for_test();
+        let shared_document = application.focused_document_id().unwrap();
+        application
+            .apply(Command::Insert("modified".to_owned()))
+            .unwrap();
+        let other_document = application.documents.new_untitled();
+        application
+            .apply(Command::Split(SplitDirection::Vertical))
+            .unwrap();
+        let split_pane = application.workspace.focused;
+
+        application.apply(Command::ClosePane).unwrap();
+
+        assert!(application.overlay.is_none());
+        assert_eq!(application.workspace.panes.len(), 2);
+        assert_eq!(application.workspace.focused, split_pane);
+        assert_eq!(application.focused_document_id(), Some(other_document));
+        assert!(application.documents.get(shared_document).is_modified());
+        assert!(application.open_document_ids().contains(&shared_document));
     }
 
     #[test]
@@ -4580,6 +4767,7 @@ mod tests {
             path: None,
             revision: 1,
             captured_at_unix_seconds: 1,
+            encoding: crate::document::EncodingState::Utf8,
             text: "untitled".to_owned(),
         };
         application

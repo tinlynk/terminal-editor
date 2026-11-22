@@ -24,7 +24,13 @@ impl Application {
             return self.handle_explorer_event(event);
         }
         let terminal_focused = self.focus_owner == FocusOwner::BottomTerminal;
-        let command = self.input.map(event, terminal_focused);
+        let application_cursor = terminal_focused
+            && self
+                .active_bottom_terminal()
+                .is_some_and(|session| session.modes().application_cursor);
+        let command =
+            self.input
+                .map_with_application_cursor(event, terminal_focused, application_cursor);
         self.apply(command)
     }
 

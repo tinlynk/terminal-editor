@@ -32,7 +32,31 @@ impl InputMapper {
         self.map_at(event, terminal_focused, Instant::now())
     }
 
+    pub fn map_with_application_cursor(
+        &mut self,
+        event: Event,
+        terminal_focused: bool,
+        application_cursor: bool,
+    ) -> Command {
+        self.map_at_with_application_cursor(
+            event,
+            terminal_focused,
+            application_cursor,
+            Instant::now(),
+        )
+    }
+
     fn map_at(&mut self, event: Event, terminal_focused: bool, now: Instant) -> Command {
+        self.map_at_with_application_cursor(event, terminal_focused, false, now)
+    }
+
+    fn map_at_with_application_cursor(
+        &mut self,
+        event: Event,
+        terminal_focused: bool,
+        application_cursor: bool,
+        now: Instant,
+    ) -> Command {
         if self
             .leader_pending_since
             .is_some_and(|started| now.saturating_duration_since(started) >= LEADER_TIMEOUT)
@@ -45,7 +69,7 @@ impl InputMapper {
                 Command::Paste(text)
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                self.map_key(key, terminal_focused, now)
+                self.map_key(key, terminal_focused, application_cursor, now)
             }
             Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Mouse(_) => {
                 self.cancel_leader();
@@ -74,7 +98,13 @@ impl InputMapper {
         expired
     }
 
-    fn map_key(&mut self, key: KeyEvent, terminal_focused: bool, now: Instant) -> Command {
+    fn map_key(
+        &mut self,
+        key: KeyEvent,
+        terminal_focused: bool,
+        application_cursor: bool,
+        now: Instant,
+    ) -> Command {
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('t') {
             self.cancel_leader();
             return Command::ToggleBottomTerminal;
@@ -96,14 +126,14 @@ impl InputMapper {
             if key.code == KeyCode::Esc {
                 return Command::NoOp;
             }
-            return self.map_leader_key(key, terminal_focused);
+            return self.map_leader_key(key, terminal_focused, application_cursor);
         }
         if self.matches_leader(key) {
             self.leader_pending_since = Some(now);
             return Command::NoOp;
         }
         if terminal_focused {
-            return Command::Insert(key_to_terminal_bytes(key));
+            return Command::Insert(key_to_terminal_bytes(key, application_cursor));
         }
         if let Some(sequence) = key_sequence(key)
             && let Some(command) = self.bindings.get(&sequence)
@@ -146,10 +176,15 @@ impl InputMapper {
         }
     }
 
-    fn map_leader_key(&self, key: KeyEvent, terminal_focused: bool) -> Command {
+    fn map_leader_key(
+        &self,
+        key: KeyEvent,
+        terminal_focused: bool,
+        application_cursor: bool,
+    ) -> Command {
         if terminal_focused {
             if self.matches_leader(key) {
-                return Command::Insert(key_to_terminal_bytes(key));
+                return Command::Insert(key_to_terminal_bytes(key, application_cursor));
             }
             match key.code {
                 KeyCode::Char('q') => Command::Quit,
@@ -273,18 +308,30 @@ fn valid_key_name(value: &str) -> bool {
         )
 }
 
-fn key_to_terminal_bytes(key: KeyEvent) -> String {
+fn key_to_terminal_bytes(key: KeyEvent, application_cursor: bool) -> String {
     match key.code {
         KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let value =
                 u32::from(character.to_ascii_lowercase()).saturating_sub(u32::from('a')) + 1;
             char::from_u32(value).map_or_else(String::new, |value| value.to_string())
         }
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::ALT) => {
+            format!("\u{1b}{character}")
+        }
         KeyCode::Char(character) => character.to_string(),
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => "\u{1b}\r".to_owned(),
         KeyCode::Enter => "\r".to_owned(),
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::ALT) => "\u{1b}\t".to_owned(),
         KeyCode::Tab => "\t".to_owned(),
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+            "\u{1b}\u{7f}".to_owned()
+        }
         KeyCode::Backspace => "\u{7f}".to_owned(),
         KeyCode::Esc => "\u{1b}".to_owned(),
+        KeyCode::Up if application_cursor => "\u{1b}OA".to_owned(),
+        KeyCode::Down if application_cursor => "\u{1b}OB".to_owned(),
+        KeyCode::Right if application_cursor => "\u{1b}OC".to_owned(),
+        KeyCode::Left if application_cursor => "\u{1b}OD".to_owned(),
         KeyCode::Up => "\u{1b}[A".to_owned(),
         KeyCode::Down => "\u{1b}[B".to_owned(),
         KeyCode::Right => "\u{1b}[C".to_owned(),
@@ -294,6 +341,62 @@ fn key_to_terminal_bytes(key: KeyEvent) -> String {
         KeyCode::Delete => "\u{1b}[3~".to_owned(),
         KeyCode::PageUp => "\u{1b}[5~".to_owned(),
         KeyCode::PageDown => "\u{1b}[6~".to_owned(),
+        KeyCode::F(number) => terminal_function_key(number, key.modifiers),
+        _ => String::new(),
+    }
+}
+
+fn terminal_function_key(number: u8, modifiers: KeyModifiers) -> String {
+    let modifier = if modifiers.contains(KeyModifiers::SHIFT)
+        && modifiers.contains(KeyModifiers::ALT)
+    {
+        4
+    } else if modifiers.contains(KeyModifiers::CONTROL) && modifiers.contains(KeyModifiers::ALT) {
+        7
+    } else if modifiers.contains(KeyModifiers::CONTROL) {
+        5
+    } else if modifiers.contains(KeyModifiers::ALT) {
+        3
+    } else if modifiers.contains(KeyModifiers::SHIFT) {
+        2
+    } else {
+        1
+    };
+    match number {
+        1..=4 => {
+            let final_byte = match number {
+                1 => 'P',
+                2 => 'Q',
+                3 => 'R',
+                _ => 'S',
+            };
+            if modifier == 1 {
+                format!("\u{1b}O{final_byte}")
+            } else {
+                format!("\u{1b}[1;{modifier}{final_byte}")
+            }
+        }
+        5..=12 => {
+            let final_number = match number {
+                1 => 11,
+                2 => 12,
+                3 => 13,
+                4 => 14,
+                5 => 15,
+                6 => 17,
+                7 => 18,
+                8 => 19,
+                9 => 20,
+                10 => 21,
+                11 => 23,
+                _ => 24,
+            };
+            if modifier == 1 {
+                format!("\u{1b}[{final_number}~")
+            } else {
+                format!("\u{1b}[1;{modifier}{final_number}")
+            }
+        }
         _ => String::new(),
     }
 }
@@ -354,6 +457,20 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn terminal_arrows_follow_application_cursor_mode() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let mut mapper = InputMapper::default();
+        assert_eq!(
+            mapper.map_with_application_cursor(event.clone(), true, false),
+            Command::Insert("\x1b[A".to_owned())
+        );
+        assert_eq!(
+            mapper.map_with_application_cursor(event, true, true),
+            Command::Insert("\x1bOA".to_owned())
+        );
     }
 
     #[test]

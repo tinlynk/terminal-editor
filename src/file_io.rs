@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use crate::{
     AppError, Result,
     config::LineEnding,
-    document::{Document, DocumentId},
+    document::{Document, DocumentId, EncodingState},
 };
 
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -29,6 +29,8 @@ pub struct RecoveryRecord {
     pub path: Option<PathBuf>,
     pub revision: u64,
     pub captured_at_unix_seconds: u64,
+    #[serde(default)]
+    pub encoding: EncodingState,
     pub text: String,
 }
 
@@ -61,6 +63,7 @@ pub fn write_recovery_record(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        encoding: document.encoding,
         text: document.text(),
     };
     let text = toml::to_string(&record).map_err(|error| AppError::Arguments(error.to_string()))?;
@@ -74,14 +77,7 @@ pub fn write_recovery_record(
             MAX_RECOVERY_RECORD_BYTES / (1024 * 1024)
         )));
     }
-    atomic_write(&path, text.as_bytes())?;
-    #[cfg(unix)]
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-        AppError::io(
-            format!("could not protect recovery record {}", path.display()),
-            error,
-        )
-    })?;
+    atomic_write_private(&path, text.as_bytes())?;
     Ok(path)
 }
 
@@ -90,7 +86,15 @@ pub fn remove_recovery_record(
     document_id: DocumentId,
     document: &Document,
 ) -> Result<()> {
-    let path = recovery_record_path(directory, document_id, document);
+    remove_recovery_record_for_path(directory, document_id, document.path.as_deref())
+}
+
+pub fn remove_recovery_record_for_path(
+    directory: &Path,
+    document_id: DocumentId,
+    document_path: Option<&Path>,
+) -> Result<()> {
+    let path = recovery_record_path_for_identity(directory, document_id, document_path);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -148,7 +152,15 @@ pub fn remove_recovery_path(path: &Path) -> Result<()> {
 }
 
 fn recovery_record_path(directory: &Path, document_id: DocumentId, document: &Document) -> PathBuf {
-    let identity = document.path.as_ref().map_or_else(
+    recovery_record_path_for_identity(directory, document_id, document.path.as_deref())
+}
+
+fn recovery_record_path_for_identity(
+    directory: &Path,
+    document_id: DocumentId,
+    document_path: Option<&Path>,
+) -> PathBuf {
+    let identity = document_path.map_or_else(
         || format!("untitled-{}", document_id.0),
         |path| path.to_string_lossy().into_owned(),
     );
@@ -161,6 +173,7 @@ fn recovery_record_path(directory: &Path, document_id: DocumentId, document: &Do
 pub enum OpenFileWarning {
     Archive(&'static str),
     Binary,
+    InvalidUtf8,
 }
 
 impl OpenFileWarning {
@@ -168,6 +181,7 @@ impl OpenFileWarning {
         match self {
             Self::Archive(format) => format,
             Self::Binary => "binary data",
+            Self::InvalidUtf8 => "invalid UTF-8 data (opened as lossy UTF-8 and read-only)",
         }
     }
 }
@@ -175,31 +189,69 @@ impl OpenFileWarning {
 pub fn open_file_warning(path: &Path) -> Result<Option<OpenFileWarning>> {
     let mut file = File::open(path)
         .map_err(|error| AppError::io(format!("could not inspect {}", path.display()), error))?;
-    let mut bytes = vec![0; OPEN_WARNING_PROBE_BYTES];
+    let mut probe = vec![0; OPEN_WARNING_PROBE_BYTES];
     let length = file
-        .read(&mut bytes)
+        .read(&mut probe)
         .map_err(|error| AppError::io(format!("could not inspect {}", path.display()), error))?;
-    bytes.truncate(length);
+    probe.truncate(length);
 
-    let warning = if bytes.starts_with(b"PK\x03\x04")
-        || bytes.starts_with(b"PK\x05\x06")
-        || bytes.starts_with(b"PK\x07\x08")
+    let warning = if probe.starts_with(b"PK\x03\x04")
+        || probe.starts_with(b"PK\x05\x06")
+        || probe.starts_with(b"PK\x07\x08")
     {
         Some(OpenFileWarning::Archive("a ZIP archive"))
-    } else if bytes.starts_with(b"\x1f\x8b") {
+    } else if probe.starts_with(b"\x1f\x8b") {
         Some(OpenFileWarning::Archive("a gzip archive"))
-    } else if bytes.starts_with(b"Rar!\x1a\x07") {
+    } else if probe.starts_with(b"Rar!\x1a\x07") {
         Some(OpenFileWarning::Archive("a RAR archive"))
-    } else if bytes.starts_with(b"7z\xbc\xaf\x27\x1c") {
+    } else if probe.starts_with(b"7z\xbc\xaf\x27\x1c") {
         Some(OpenFileWarning::Archive("a 7z archive"))
-    } else if bytes.get(257..262) == Some(b"ustar") {
+    } else if probe.get(257..262) == Some(b"ustar") {
         Some(OpenFileWarning::Archive("a tar archive"))
-    } else if bytes.contains(&0) {
+    } else if probe.contains(&0) {
         Some(OpenFileWarning::Binary)
+    } else if file_contains_invalid_utf8(&mut file)? {
+        Some(OpenFileWarning::InvalidUtf8)
     } else {
         None
     };
     Ok(warning)
+}
+
+fn file_contains_invalid_utf8(file: &mut File) -> Result<bool> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| AppError::io("could not inspect file encoding", error))?;
+    let mut bytes = [0; 4096];
+    let mut pending = Vec::new();
+    loop {
+        let length = file
+            .read(&mut bytes)
+            .map_err(|error| AppError::io("could not inspect file encoding", error))?;
+        if length == 0 {
+            return Ok(!pending.is_empty());
+        }
+        pending.extend_from_slice(&bytes[..length]);
+        match std::str::from_utf8(&pending) {
+            Ok(_) => pending.clear(),
+            Err(error) if error.error_len().is_some() => return Ok(true),
+            Err(error) => {
+                let valid = error.valid_up_to();
+                pending.drain(..valid);
+            }
+        }
+    }
+}
+
+fn read_document(path: &Path) -> Result<(String, EncodingState)> {
+    let bytes = fs::read(path)
+        .map_err(|error| AppError::io(format!("could not read {}", path.display()), error))?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok((text, EncodingState::Utf8)),
+        Err(error) => Ok((
+            String::from_utf8_lossy(error.as_bytes()).into_owned(),
+            EncodingState::LossyUtf8,
+        )),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,7 +321,7 @@ impl DocumentRegistry {
                 None,
                 self.default_line_ending,
                 self.history_limit,
-                "UTF-8",
+                EncodingState::Utf8,
             ),
         );
         id
@@ -277,14 +329,15 @@ impl DocumentRegistry {
 
     pub fn new_at_path(&mut self, path: PathBuf) -> Result<DocumentId> {
         let id = self.allocate_id();
+        let absolute = absolute_path(&path)?;
         self.documents.insert(
             id,
             Document::new(
                 "",
-                Some(absolute_path(&path)?),
+                Some(absolute),
                 self.default_line_ending,
                 self.history_limit,
-                "UTF-8",
+                EncodingState::Utf8,
             ),
         );
         Ok(id)
@@ -302,15 +355,7 @@ impl DocumentRegistry {
         if let Some(id) = self.canonical_paths.get(&canonical) {
             return Ok((*id, false));
         }
-        let bytes = fs::read(&canonical).map_err(|error| {
-            AppError::io(format!("could not read {}", canonical.display()), error)
-        })?;
-        let text = String::from_utf8_lossy(&bytes);
-        let encoding = if matches!(text, std::borrow::Cow::Borrowed(_)) {
-            "UTF-8"
-        } else {
-            "Binary"
-        };
+        let (text, encoding) = read_document(&canonical)?;
         let id = self.allocate_id();
         let document = Document::new(
             &text,
@@ -355,6 +400,7 @@ impl DocumentRegistry {
     }
 
     pub fn save(&mut self, id: DocumentId, overwrite_external: bool) -> Result<SaveOutcome> {
+        ensure_saveable(&self.documents[&id])?;
         let path = self.documents[&id]
             .path
             .clone()
@@ -378,6 +424,7 @@ impl DocumentRegistry {
         path: &Path,
         overwrite_existing: bool,
     ) -> Result<SaveAsOutcome> {
+        ensure_saveable(&self.documents[&id])?;
         let absolute = absolute_path(path)?;
         let existing_canonical = fs::canonicalize(&absolute).ok();
         if let Some(owner) = existing_canonical
@@ -423,8 +470,7 @@ impl DocumentRegistry {
         let path = document.path.clone().ok_or_else(|| {
             AppError::Arguments("untitled document cannot be reloaded".to_owned())
         })?;
-        let text = fs::read_to_string(&path)
-            .map_err(|error| AppError::io(format!("could not reload {}", path.display()), error))?;
+        let (text, encoding) = read_document(&path)?;
         self.documents.insert(
             id,
             Document::new(
@@ -432,7 +478,7 @@ impl DocumentRegistry {
                 Some(path.clone()),
                 self.default_line_ending,
                 self.history_limit,
-                "UTF-8",
+                encoding,
             ),
         );
         self.snapshots.insert(id, snapshot(&path)?);
@@ -450,9 +496,9 @@ impl DocumentRegistry {
         let Some(path) = self.documents[&id].path.as_deref() else {
             return Ok((ExternalFileState::Unchanged, None));
         };
-        let current = match snapshot(path) {
-            Ok(current) => current,
-            Err(AppError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let state = if self.snapshots.contains_key(&id) {
                     ExternalFileState::Missing
                 } else {
@@ -460,13 +506,27 @@ impl DocumentRegistry {
                 };
                 return Ok((state, Some(ExternalFileVersion::Missing)));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(AppError::io(
+                    format!("could not inspect {}", path.display()),
+                    error,
+                ));
+            }
         };
-        let state = if self
-            .snapshots
-            .get(&id)
-            .is_some_and(|expected| *expected != current)
-        {
+        let baseline = self.snapshots.get(&id);
+        let metadata_changed = baseline.is_some_and(|baseline| {
+            baseline.modified != metadata.modified().ok() || baseline.length != metadata.len()
+        });
+        let current = if metadata_changed {
+            snapshot(path)?
+        } else {
+            baseline.cloned().unwrap_or_else(|| FileSnapshot {
+                modified: metadata.modified().ok(),
+                length: metadata.len(),
+                content_fingerprint: 0,
+            })
+        };
+        let state = if baseline != Some(&current) {
             ExternalFileState::Changed
         } else {
             ExternalFileState::Unchanged
@@ -505,10 +565,7 @@ impl DocumentRegistry {
             }
             Err(error) => return Err(error),
         };
-        Ok(self
-            .snapshots
-            .get(&id)
-            .is_some_and(|expected| *expected != current))
+        Ok(self.snapshots.get(&id) != Some(&current))
     }
 
     fn allocate_id(&mut self) -> DocumentId {
@@ -532,6 +589,16 @@ fn snapshot(path: &Path) -> Result<FileSnapshot> {
     })
 }
 
+fn ensure_saveable(document: &Document) -> Result<()> {
+    if document.encoding.is_lossy() {
+        return Err(AppError::Arguments(
+            "cannot save a document opened with lossy UTF-8 decoding because its original bytes are unavailable; copy the displayed text to a new UTF-8 document to intentionally convert it"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_owned());
@@ -542,6 +609,14 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with_mode(path, bytes, false)
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with_mode(path, bytes, true)
+}
+
+fn atomic_write_with_mode(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let target = if path.is_symlink() {
         fs::canonicalize(path).map_err(|error| {
             AppError::io(
@@ -566,14 +641,26 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         ".{file_name}.tinlynk-{}-{counter}.tmp",
         std::process::id()
     ));
-    let existing_permissions = fs::metadata(&target)
-        .ok()
-        .map(|metadata| metadata.permissions());
+    let existing_permissions = (!private)
+        .then(|| {
+            fs::metadata(&target)
+                .ok()
+                .map(|metadata| metadata.permissions())
+        })
+        .flatten();
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        #[cfg(unix)]
+        if private {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         if let Some(permissions) = existing_permissions {
             file.set_permissions(permissions)?;
         }
@@ -627,8 +714,66 @@ mod tests {
         let (id, _) = registry.open(&path).unwrap();
 
         let document = registry.get(id);
-        assert_eq!(document.encoding, "Binary");
+        assert_eq!(document.encoding, EncodingState::LossyUtf8);
         assert_eq!(registry.iter().count(), 1);
+    }
+
+    #[test]
+    fn invalid_utf8_is_read_only_for_save_and_save_as() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("invalid.txt");
+        let target = directory.path().join("converted.txt");
+        fs::write(&source, b"before \xff after").unwrap();
+        assert_eq!(
+            open_file_warning(&source).unwrap(),
+            Some(OpenFileWarning::InvalidUtf8)
+        );
+
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        let (id, _) = registry.open(&source).unwrap();
+        assert_eq!(registry.get(id).encoding, EncodingState::LossyUtf8);
+        registry.get_mut(id).insert(0, "edit ");
+        assert!(registry.save(id, true).is_err());
+        assert!(registry.save_as(id, &target, true).is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"before \xff after");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn reload_uses_the_same_lossy_encoding_policy_as_open() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, b"valid").unwrap();
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        let (id, _) = registry.open(&path).unwrap();
+        assert_eq!(registry.get(id).encoding, EncodingState::Utf8);
+
+        fs::write(&path, b"invalid \xfe").unwrap();
+        registry.reload(id, true).unwrap();
+        assert_eq!(registry.get(id).encoding, EncodingState::LossyUtf8);
+
+        fs::write(&path, b"valid again").unwrap();
+        registry.reload(id, true).unwrap();
+        assert_eq!(registry.get(id).encoding, EncodingState::Utf8);
+    }
+
+    #[test]
+    fn utf8_lf_and_crlf_bytes_round_trip_through_save_and_save_as() {
+        let directory = tempdir().unwrap();
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        for (name, bytes) in [
+            ("lf.txt", b"first\nsecond\n".as_slice()),
+            ("crlf.txt", b"first\r\nsecond\r\n".as_slice()),
+        ] {
+            let source = directory.path().join(name);
+            let target = directory.path().join(format!("copy-{name}"));
+            fs::write(&source, bytes).unwrap();
+            let (id, _) = registry.open(&source).unwrap();
+            registry.save(id, false).unwrap();
+            assert_eq!(fs::read(&source).unwrap(), bytes);
+            registry.save_as(id, &target, false).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -720,6 +865,27 @@ mod tests {
         assert!(load_recovery_records(&recovery).unwrap().is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_records_preserve_lossy_state_and_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let recovery = directory.path().join("recovery");
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        let id = registry.new_untitled();
+        registry.get_mut(id).encoding = EncodingState::LossyUtf8;
+        registry.get_mut(id).insert(0, "replacement text");
+
+        let path = write_recovery_record(&recovery, id, registry.get(id)).unwrap();
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let records = load_recovery_records(&recovery).unwrap();
+        let record = &records[0].1;
+        assert_eq!(record.encoding, EncodingState::LossyUtf8);
+        assert_eq!(record.text, "replacement text");
+    }
+
     #[test]
     fn recovery_directories_are_scoped_to_canonical_workspace_roots() {
         let directory = tempdir().unwrap();
@@ -789,6 +955,26 @@ mod tests {
     }
 
     #[test]
+    fn named_documents_without_a_baseline_require_overwrite_confirmation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("created-externally.txt");
+        let mut registry = DocumentRegistry::new(LineEnding::Lf, 1024);
+        let id = registry.new_at_path(path.clone()).unwrap();
+        registry.get_mut(id).insert(0, "local");
+        fs::write(&path, "external").unwrap();
+
+        assert_eq!(
+            registry.external_file_state(id).unwrap(),
+            ExternalFileState::Changed
+        );
+        assert!(matches!(
+            registry.save(id, false).unwrap(),
+            SaveOutcome::ExternalChange
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "external");
+    }
+
+    #[test]
     fn open_file_warning_detects_archives_binary_data_and_text() {
         let directory = tempdir().unwrap();
         let zip = directory.path().join("archive.zip");
@@ -807,6 +993,11 @@ mod tests {
             Some(OpenFileWarning::Binary)
         );
         assert_eq!(open_file_warning(&text).unwrap(), None);
+        fs::write(&binary, b"text\xff").unwrap();
+        assert_eq!(
+            open_file_warning(&binary).unwrap(),
+            Some(OpenFileWarning::InvalidUtf8)
+        );
     }
 
     #[cfg(unix)]

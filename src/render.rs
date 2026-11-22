@@ -1365,7 +1365,9 @@ fn terminal_lines(
                         }) {
                             style = style.bg(selection_background).fg(selection_foreground);
                         }
-                        Span::styled(cell.character.to_string(), style)
+                        let mut glyph = cell.character.to_string();
+                        glyph.push_str(&cell.combining);
+                        Span::styled(glyph, style)
                     })
                     .collect::<Vec<_>>(),
             )

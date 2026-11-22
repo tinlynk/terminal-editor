@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use crate::{
     Result,
     document::DocumentId,
-    file_io::{SaveAsOutcome, SaveOutcome, open_file_warning},
+    file_io::{SaveAsOutcome, SaveOutcome, open_file_warning, remove_recovery_record_for_path},
     layout::SplitDirection,
     workspace::Pane,
 };
@@ -50,27 +50,19 @@ pub(super) fn close_focused_editor_view(application: &mut Application) {
     let Some((document_id, pane_id)) = application.focused_editor() else {
         return;
     };
+    let next_document = application
+        .documents
+        .iter()
+        .find_map(|(id, _)| (id != document_id).then_some(id));
+    if let Some(next_document) = next_document {
+        application.workspace.panes.insert(pane_id, Pane::Empty);
+        application.unload_document_without_views(document_id);
+        application.switch_editor_document(pane_id, next_document);
+        return;
+    }
     if application.workspace.panes.len() == 1 {
         application.workspace.panes.insert(pane_id, Pane::Empty);
-        application.deferred_external_changes.remove(&document_id);
-        if let Err(error) = application.remove_recovery_for_document(document_id) {
-            application.message = Some(format!("Could not remove recovery data: {error}"));
-        }
-        application.documents.remove(document_id);
-        application.saved_editor_views.remove(&document_id);
-        if let Some(next_document) = application.documents.iter().next().map(|(id, _)| id) {
-            let view = application
-                .saved_editor_views
-                .remove(&next_document)
-                .unwrap_or_default();
-            application.workspace.panes.insert(
-                pane_id,
-                Pane::Editor {
-                    document_id: next_document,
-                    view,
-                },
-            );
-        }
+        application.unload_document_without_views(document_id);
     } else {
         application.workspace.close_focused();
         application.unload_document_without_views(document_id);
@@ -90,7 +82,14 @@ pub(super) fn save_focused(application: &mut Application) -> Result<()> {
         application.focus_owner = FocusOwner::Overlay;
         return Ok(());
     }
-    match application.documents.save(document_id, false)? {
+    let outcome = match application.documents.save(document_id, false) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            application.message = Some(format!("Could not save document: {error}"));
+            return Ok(());
+        }
+    };
+    match outcome {
         SaveOutcome::Saved => application.finish_successful_save(document_id)?,
         SaveOutcome::ExternalChange => {
             application.overlay = Some(Overlay::SaveConflict);
@@ -105,8 +104,27 @@ pub(super) fn save_document_as(
     document_id: DocumentId,
     path: &Path,
 ) -> Result<()> {
-    match application.documents.save_as(document_id, path, false)? {
-        SaveAsOutcome::Saved => application.finish_successful_save(document_id),
+    let previous_path = application.documents.get(document_id).path.clone();
+    let outcome = match application.documents.save_as(document_id, path, false) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            application.message = Some(format!("Could not save document: {error}"));
+            return Ok(());
+        }
+    };
+    match outcome {
+        SaveAsOutcome::Saved => {
+            if let Some(previous_path) = previous_path
+                && let Err(error) = remove_recovery_record_for_path(
+                    &application.recovery_directory,
+                    document_id,
+                    Some(&previous_path),
+                )
+            {
+                application.message = Some(format!("Could not remove old recovery data: {error}"));
+            }
+            application.finish_successful_save(document_id)
+        }
         SaveAsOutcome::ExistingTarget => {
             application.overlay = Some(Overlay::ConfirmSaveAsOverwrite {
                 document_id,
@@ -122,7 +140,9 @@ pub(super) fn finish_successful_save(
     application: &mut Application,
     document_id: DocumentId,
 ) -> Result<()> {
-    application.remove_recovery_for_document(document_id)?;
+    if let Err(error) = application.remove_recovery_for_document(document_id) {
+        application.message = Some(format!("Could not remove saved recovery data: {error}"));
+    }
     application.deferred_external_changes.remove(&document_id);
     let saved_path = application.documents.get(document_id).path.clone();
     if saved_path.as_deref().is_some_and(|path| {
@@ -143,13 +163,16 @@ pub(super) fn finish_successful_save(
     }
     if application.pending_close_document == Some(document_id) {
         application.pending_close_document = None;
-        application.close_focused_editor_view();
+        if let Some((pane_id, _)) = application.workspace.panes.iter().find(|(_, pane)| {
+            matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
+        }) {
+            application.workspace.focused = *pane_id;
+            application.close_focused_editor_view();
+        }
         application.overlay = None;
         application.focus_owner = FocusOwner::Workspace;
         if application.quit_in_progress {
             application.continue_quit_sequence()?;
-        } else {
-            request_close(application)?;
         }
     }
     Ok(())

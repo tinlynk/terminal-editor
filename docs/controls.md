@@ -17,6 +17,7 @@ Open the in-app Help view with `Ctrl+H` to see the active configurable keybindin
 | `Ctrl+Q` | Exit with required confirmations. |
 
 `Ctrl+T` and `Ctrl+G` remain application shortcuts while the terminal is focused.
+Closing a document shows another open document in the same pane, if available. Otherwise, a split pane closes; the last pane remains empty.
 
 ## Editor
 
@@ -44,7 +45,7 @@ In Save As, type a filename after the initial directory and press Enter to save.
 
 ## Terminal and leader
 
-Ordinary keyboard and paste input is sent to the terminal child process. The default configurable leader is `Ctrl+B`. A pending leader cancels after 1.5 seconds, Escape, paste, mouse input, or a focus change.
+Ordinary keyboard and paste input is sent to the terminal child process. Paste is wrapped in bracketed-paste markers when the child has enabled that mode. The default configurable leader is `Ctrl+B`. A pending leader cancels after 1.5 seconds, Escape, paste, mouse input, or a focus change.
 
 | Control | Action |
 | --- | --- |

@@ -123,6 +123,12 @@ impl EditorView {
         let line_start = document.line_to_char(line);
         if self.cursor == line_start {
             self.cursor -= 1;
+            if self.cursor > 0
+                && document.char_at(self.cursor - 1) == Some('\r')
+                && document.char_at(self.cursor) == Some('\n')
+            {
+                self.cursor -= 1;
+            }
         } else {
             let prefix = document.slice(line_start, self.cursor);
             let previous = prefix
@@ -137,6 +143,22 @@ impl EditorView {
     pub fn move_right(&mut self, document: &Document, selecting: bool) {
         self.prepare_selection(selecting);
         if self.cursor >= document.len_chars() {
+            return;
+        }
+        if self.cursor > 0
+            && document.char_at(self.cursor - 1) == Some('\r')
+            && document.char_at(self.cursor) == Some('\n')
+        {
+            self.cursor += 1;
+            self.preferred_column = None;
+            return;
+        }
+        if document.char_at(self.cursor) == Some('\r')
+            && self.cursor + 1 < document.len_chars()
+            && document.char_at(self.cursor + 1) == Some('\n')
+        {
+            self.cursor += 2;
+            self.preferred_column = None;
             return;
         }
         let suffix = document.slice(self.cursor, document.len_chars());
@@ -223,6 +245,7 @@ impl EditorView {
     }
 
     pub fn insert(&mut self, document: &mut Document, text: &str) {
+        self.normalize_crlf_cursor(document);
         if let Some(selection) = self.selection() {
             self.cursor = document.replace(selection.start, selection.end, text);
         } else {
@@ -233,6 +256,7 @@ impl EditorView {
     }
 
     pub fn insert_typed(&mut self, document: &mut Document, text: &str) {
+        self.normalize_crlf_cursor(document);
         if self.selection().is_some() {
             self.insert(document, text);
             return;
@@ -251,6 +275,7 @@ impl EditorView {
     }
 
     pub fn delete_backward(&mut self, document: &mut Document) {
+        self.normalize_crlf_cursor(document);
         if let Some(selection) = self.selection() {
             self.cursor = selection.start;
             document.delete(selection.start, selection.end);
@@ -263,6 +288,7 @@ impl EditorView {
     }
 
     pub fn delete_forward(&mut self, document: &mut Document) {
+        self.normalize_crlf_cursor(document);
         if let Some(selection) = self.selection() {
             self.cursor = selection.start;
             document.delete(selection.start, selection.end);
@@ -390,6 +416,16 @@ impl EditorView {
             self.selection_anchor.get_or_insert(self.cursor);
         } else {
             self.clear_selection();
+        }
+    }
+
+    fn normalize_crlf_cursor(&mut self, document: &Document) {
+        if self.cursor > 0
+            && self.cursor < document.len_chars()
+            && document.char_at(self.cursor - 1) == Some('\r')
+            && document.char_at(self.cursor) == Some('\n')
+        {
+            self.cursor -= 1;
         }
     }
 }
@@ -597,9 +633,10 @@ pub fn char_at_display_column(document: &Document, line: usize, target: usize) -
 mod tests {
     use super::*;
     use crate::config::LineEnding;
+    use crate::document::EncodingState;
 
     fn document(text: &str) -> Document {
-        Document::new(text, None, LineEnding::Lf, 1024, "UTF-8")
+        Document::new(text, None, LineEnding::Lf, 1024, EncodingState::Utf8)
     }
 
     #[test]
@@ -616,6 +653,53 @@ mod tests {
         view.move_left(&document, false);
         view.move_left(&document, false);
         assert_eq!(document.slice(view.cursor, view.cursor + 2), "e\u{301}");
+    }
+
+    #[test]
+    fn crlf_navigation_and_deletion_treat_line_ending_as_one_boundary() {
+        let mut first_document = document("a\r\nb");
+        let mut view = EditorView {
+            cursor: 1,
+            ..EditorView::default()
+        };
+        view.move_right(&first_document, false);
+        assert_eq!(view.cursor, 3);
+        view.move_left(&first_document, false);
+        assert_eq!(view.cursor, 1);
+
+        view.cursor = 3;
+        view.delete_backward(&mut first_document);
+        assert_eq!(first_document.text(), "ab");
+        assert_eq!(view.cursor, 1);
+
+        let mut second_document = document("a\r\nb");
+        let mut view = EditorView {
+            cursor: 1,
+            ..EditorView::default()
+        };
+        view.delete_forward(&mut second_document);
+        assert_eq!(second_document.text(), "ab");
+        assert_eq!(view.cursor, 1);
+    }
+
+    #[test]
+    fn crlf_home_end_and_typing_do_not_enter_line_ending_bytes() {
+        let mut document = document("a\r\nb");
+        let mut view = EditorView {
+            cursor: 1,
+            ..EditorView::default()
+        };
+        view.move_end(&document, false);
+        assert_eq!(view.cursor, 1);
+        view.insert_typed(&mut document, "x");
+        assert_eq!(document.text(), "ax\r\nb");
+
+        view.move_home(&document, false);
+        assert_eq!(view.cursor, 0);
+        view.cursor = 3;
+        view.insert(&mut document, "y");
+        assert_eq!(view.cursor, 3);
+        assert_eq!(document.text(), "axy\r\nb");
     }
 
     #[test]
@@ -657,7 +741,7 @@ mod tests {
 
     #[test]
     fn newline_preserves_crlf_convention() {
-        let mut document = Document::new("a\r\nb", None, LineEnding::Lf, 1024, "UTF-8");
+        let mut document = Document::new("a\r\nb", None, LineEnding::Lf, 1024, EncodingState::Utf8);
         let mut view = EditorView {
             cursor: 1,
             ..EditorView::default()

@@ -742,18 +742,26 @@ impl Application {
             Overlay::SaveConflict if key.code == KeyCode::Char('o') => {
                 let document_id = self.focused_editor().map(|(id, _)| id);
                 if let Some(document_id) = document_id {
-                    self.documents.save(document_id, true)?;
+                    if let Err(error) = self.documents.save(document_id, true) {
+                        self.message = Some(format!("Could not overwrite changed file: {error}"));
+                        return Ok(());
+                    }
                     self.finish_successful_save(document_id)?;
                 }
-                self.overlay = None;
-                self.focus_owner = FocusOwner::Workspace;
+                if matches!(self.overlay, Some(Overlay::SaveConflict)) {
+                    self.overlay = None;
+                    self.focus_owner = FocusOwner::Workspace;
+                }
             }
             Overlay::ConfirmSaveAsOverwrite { document_id, path }
                 if key.code == KeyCode::Char('o') =>
             {
                 let document_id = *document_id;
                 let path = path.clone();
-                self.documents.save_as(document_id, &path, true)?;
+                if let Err(error) = self.documents.save_as(document_id, &path, true) {
+                    self.message = Some(format!("Could not save document: {error}"));
+                    return Ok(());
+                }
                 self.overlay = None;
                 self.focus_owner = FocusOwner::Workspace;
                 self.finish_successful_save(document_id)?;

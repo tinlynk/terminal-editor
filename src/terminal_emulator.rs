@@ -15,6 +15,7 @@ pub enum TerminalColor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalCell {
     pub character: char,
+    pub combining: String,
     pub foreground: TerminalColor,
     pub background: TerminalColor,
     pub bold: bool,
@@ -26,6 +27,7 @@ impl Default for TerminalCell {
     fn default() -> Self {
         Self {
             character: ' ',
+            combining: String::new(),
             foreground: TerminalColor::Default,
             background: TerminalColor::Default,
             bold: false,
@@ -106,7 +108,7 @@ impl TerminalEmulator {
             .map(|row| {
                 row.iter()
                     .filter(|cell| !cell.continuation)
-                    .map(|cell| cell.character)
+                    .map(|cell| format!("{}{}", cell.character, cell.combining))
                     .collect::<String>()
                     .trim_end()
                     .to_owned()
@@ -189,6 +191,8 @@ struct Screen {
     cursor_row: usize,
     cursor_column: usize,
     saved_cursor: (usize, usize),
+    scroll_top: usize,
+    scroll_bottom: usize,
     current: TerminalCell,
     modes: TerminalModes,
     scrollback: VecDeque<Vec<TerminalCell>>,
@@ -212,6 +216,8 @@ impl Screen {
             cursor_row: 0,
             cursor_column: 0,
             saved_cursor: (0, 0),
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
             current: TerminalCell::default(),
             modes: TerminalModes::default(),
             scrollback: VecDeque::new(),
@@ -235,31 +241,59 @@ impl Screen {
         self.cursor_column = self.cursor_column.min(self.columns - 1);
         self.saved_cursor.0 = self.saved_cursor.0.min(self.rows - 1);
         self.saved_cursor.1 = self.saved_cursor.1.min(self.columns - 1);
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
     }
 
     fn line_feed(&mut self) {
-        if self.cursor_row + 1 < self.rows {
+        let has_custom_scroll_region =
+            self.scroll_top != 0 || self.scroll_bottom != self.rows.saturating_sub(1);
+        let below_scroll_region = has_custom_scroll_region
+            && self.cursor_row == self.scroll_bottom
+            && self.scroll_top <= self.cursor_row;
+        if !below_scroll_region && self.cursor_row + 1 < self.rows {
             self.cursor_row += 1;
             return;
         }
-        let removed = self.grid.remove(0);
-        if !self.modes.alternate_screen {
-            self.scrollback.push_back(removed);
-            while self.scrollback.len() > self.scrollback_limit {
-                self.scrollback.pop_front();
+        if below_scroll_region {
+            self.scroll_up(1);
+            self.cursor_row = self.scroll_bottom;
+        } else {
+            let removed = self.grid.remove(0);
+            if !self.modes.alternate_screen {
+                self.scrollback.push_back(removed);
+                while self.scrollback.len() > self.scrollback_limit {
+                    self.scrollback.pop_front();
+                }
             }
+            self.grid.push(blank_row(self.columns));
+            self.cursor_row = self.rows.saturating_sub(1);
         }
-        self.grid.push(blank_row(self.columns));
     }
 
     fn write_character(&mut self, character: char) {
         let width = character.width().unwrap_or(0);
         if width == 0 {
+            self.append_combining(character);
             return;
         }
-        if self.cursor_column >= self.columns || self.cursor_column + width > self.columns {
+        if self.cursor_column >= self.columns
+            || (width <= self.columns && self.cursor_column + width > self.columns)
+        {
             self.cursor_column = 0;
             self.line_feed();
+        }
+        if width <= self.columns && self.cursor_column + width > self.columns {
+            self.cursor_column = 0;
+            self.line_feed();
+        }
+        if width > self.columns {
+            let mut cell = self.current.clone();
+            cell.character = character;
+            cell.continuation = false;
+            self.grid[self.cursor_row][0] = cell;
+            self.cursor_column = self.columns;
+            return;
         }
         let mut cell = self.current.clone();
         cell.character = character;
@@ -282,6 +316,81 @@ impl Screen {
         };
         self.grid[self.cursor_row][start.min(self.columns)..end.min(self.columns)]
             .fill(TerminalCell::default());
+    }
+
+    fn append_combining(&mut self, character: char) {
+        if self.columns == 0 {
+            return;
+        }
+        let mut column = self.cursor_column;
+        if column > 0 {
+            column = column.saturating_sub(1);
+        }
+        if column >= self.columns {
+            return;
+        }
+        if self.grid[self.cursor_row][column].continuation {
+            while column > 0 && self.grid[self.cursor_row][column].continuation {
+                column = column.saturating_sub(1);
+            }
+        }
+        self.grid[self.cursor_row][column].combining.push(character);
+    }
+
+    fn scroll_up(&mut self, count: usize) {
+        let count = count.min(
+            self.scroll_bottom
+                .saturating_sub(self.scroll_top)
+                .saturating_add(1),
+        );
+        for _ in 0..count {
+            self.grid.remove(self.scroll_top);
+            self.grid
+                .insert(self.scroll_bottom, blank_row(self.columns));
+        }
+    }
+
+    fn scroll_down(&mut self, count: usize) {
+        let count = count.min(
+            self.scroll_bottom
+                .saturating_sub(self.scroll_top)
+                .saturating_add(1),
+        );
+        for _ in 0..count {
+            self.grid.remove(self.scroll_bottom);
+            self.grid.insert(self.scroll_top, blank_row(self.columns));
+        }
+    }
+
+    fn insert_lines(&mut self, count: usize) {
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        let count = count.min(
+            self.scroll_bottom
+                .saturating_sub(self.cursor_row)
+                .saturating_add(1),
+        );
+        for _ in 0..count {
+            self.grid.remove(self.scroll_bottom);
+            self.grid.insert(self.cursor_row, blank_row(self.columns));
+        }
+    }
+
+    fn delete_lines(&mut self, count: usize) {
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        let count = count.min(
+            self.scroll_bottom
+                .saturating_sub(self.cursor_row)
+                .saturating_add(1),
+        );
+        for _ in 0..count {
+            self.grid.remove(self.cursor_row);
+            self.grid
+                .insert(self.scroll_bottom, blank_row(self.columns));
+        }
     }
 
     fn clear_display(&mut self, mode: u16) {
@@ -409,7 +518,10 @@ impl Perform for Screen {
             b'\n' | 0x0b | 0x0c => self.line_feed(),
             b'\r' => self.cursor_column = 0,
             b'\x08' => self.cursor_column = self.cursor_column.saturating_sub(1),
-            b'\t' => self.cursor_column = ((self.cursor_column / 8) + 1) * 8,
+            b'\t' => {
+                self.cursor_column =
+                    (((self.cursor_column / 8) + 1) * 8).min(self.columns.saturating_sub(1))
+            }
             _ => {}
         }
     }
@@ -446,6 +558,29 @@ impl Perform for Screen {
             }
             'J' => self.clear_display(Self::param(params, 0, 0) as u16),
             'K' => self.clear_line(Self::param(params, 0, 0) as u16),
+            'L' => self.insert_lines(Self::param(params, 0, 1)),
+            'M' => self.delete_lines(Self::param(params, 0, 1)),
+            'S' => self.scroll_up(Self::param(params, 0, 1)),
+            'T' => self.scroll_down(Self::param(params, 0, 1)),
+            'r' if !private => {
+                let top = Self::param(params, 0, 1).saturating_sub(1);
+                let bottom = if params.iter().nth(1).is_some() {
+                    Self::param(params, 1, self.rows as u16).saturating_sub(1)
+                } else {
+                    self.rows.saturating_sub(1)
+                };
+                if top < self.rows && bottom < self.rows && top <= bottom {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom;
+                    self.cursor_row = top;
+                    self.cursor_column = 0;
+                } else if params.iter().next().is_none() {
+                    self.scroll_top = 0;
+                    self.scroll_bottom = self.rows.saturating_sub(1);
+                    self.cursor_row = 0;
+                    self.cursor_column = 0;
+                }
+            }
             'm' => self.set_sgr(params),
             'n' => match Self::param(params, 0, 0) {
                 5 => self.responses.push_back(b"\x1b[0n".to_vec()),
@@ -675,5 +810,28 @@ mod tests {
         let history = terminal.viewport_cells(2, 1);
         assert_ne!(live, history);
         assert!(history.iter().flatten().any(|cell| cell.character == 'o'));
+    }
+
+    #[test]
+    fn narrow_grid_handles_wide_and_combining_characters() {
+        let mut terminal = TerminalEmulator::new(3, 1, 10, false);
+        terminal.feed("界e\u{301}".as_bytes());
+        assert_eq!(terminal.visible_lines()[0], "界");
+        assert!(terminal.visible_lines().iter().any(|line| line == "é"));
+        assert!(terminal.cursor().0 < 3);
+    }
+
+    #[test]
+    fn scroll_regions_and_insert_delete_lines_are_bounded() {
+        let mut terminal = TerminalEmulator::new(4, 5, 10, false);
+        terminal.feed(b"one\rtwo\rthree\rfour");
+        terminal.feed(b"\x1b[2;4r\x1b[2;1H\x1b[L");
+        assert_eq!(terminal.cursor(), (1, 0));
+        terminal.feed(b"\x1b[M");
+        assert_eq!(terminal.cursor(), (1, 0));
+        terminal.feed(b"\x1b[S");
+        terminal.feed(b"\x1b[T");
+        assert_eq!(terminal.visible_cells().len(), 4);
+        assert!(terminal.visible_cells()[0].len() == 5);
     }
 }
