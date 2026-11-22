@@ -8,6 +8,9 @@ use super::{Application, FocusOwner, global_command};
 
 impl Application {
     pub(super) fn handle_event(&mut self, event: Event) -> Result<()> {
+        if !matches!(event, Event::Mouse(_)) || self.overlay.is_some() {
+            self.tab_drag = None;
+        }
         if self.overlay.is_some() {
             self.input.cancel_leader();
             return self.handle_overlay_event(event);

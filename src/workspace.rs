@@ -22,6 +22,7 @@ pub enum Pane {
 pub struct Workspace {
     pub layout: LayoutNode,
     pub panes: BTreeMap<PaneId, Pane>,
+    pub tabs: BTreeMap<PaneId, Vec<DocumentId>>,
     pub focused: PaneId,
     next_pane_id: u64,
     next_split_id: u64,
@@ -34,6 +35,7 @@ impl Workspace {
         Self {
             layout: LayoutNode::Pane(pane_id),
             panes: BTreeMap::from([(pane_id, Pane::Empty)]),
+            tabs: BTreeMap::from([(pane_id, Vec::new())]),
             focused: pane_id,
             next_pane_id: 2,
             next_split_id: 1,
@@ -52,6 +54,7 @@ impl Workspace {
                     view: EditorView::default(),
                 },
             )]),
+            tabs: BTreeMap::from([(pane_id, vec![document_id])]),
             focused: pane_id,
             next_pane_id: 2,
             next_split_id: 1,
@@ -107,7 +110,12 @@ impl Workspace {
             self.initial_split_ratio,
         );
         debug_assert!(inserted);
+        let tabs = match &pane {
+            Pane::Empty => Vec::new(),
+            Pane::Editor { document_id, .. } => vec![*document_id],
+        };
         self.panes.insert(pane_id, pane);
+        self.tabs.insert(pane_id, tabs);
         self.focused = pane_id;
         pane_id
     }
@@ -122,6 +130,7 @@ impl Workspace {
         };
         self.layout = layout;
         self.panes.remove(&target);
+        self.tabs.remove(&target);
         self.focused = *self.panes.keys().next().expect("one pane must remain");
         true
     }

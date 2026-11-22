@@ -24,15 +24,13 @@ pub(super) fn request_close(application: &mut Application) -> Result<()> {
         }
         Pane::Editor { document_id, .. } => {
             let document_id = *document_id;
-            let visible_views = application
+            let open_views = application
                 .workspace
-                .panes
+                .tabs
                 .values()
-                .filter(|pane| {
-                    matches!(pane, Pane::Editor { document_id: id, .. } if *id == document_id)
-                })
+                .filter(|tabs| tabs.contains(&document_id))
                 .count();
-            if visible_views == 1 && application.documents.get(document_id).is_modified() {
+            if open_views == 1 && application.documents.get(document_id).is_modified() {
                 application.overlay = Some(Overlay::ConfirmDocumentClose);
                 application.focus_owner = FocusOwner::Overlay;
             } else {
@@ -50,21 +48,33 @@ pub(super) fn close_focused_editor_view(application: &mut Application) {
     let Some((document_id, pane_id)) = application.focused_editor() else {
         return;
     };
-    let next_document = application
-        .documents
+    let tabs = application
+        .workspace
+        .tabs
+        .get_mut(&pane_id)
+        .expect("pane must exist");
+    let index = tabs
         .iter()
-        .find_map(|(id, _)| (id != document_id).then_some(id));
+        .position(|id| *id == document_id)
+        .expect("active tab must exist");
+    tabs.remove(index);
+    let next_document = tabs.get(index.min(tabs.len().saturating_sub(1))).copied();
+    application
+        .saved_editor_views
+        .remove(&(pane_id, document_id));
+    application.workspace.panes.insert(pane_id, Pane::Empty);
     if let Some(next_document) = next_document {
-        application.workspace.panes.insert(pane_id, Pane::Empty);
         application.unload_document_without_views(document_id);
         application.switch_editor_document(pane_id, next_document);
         return;
     }
     if application.workspace.panes.len() == 1 {
-        application.workspace.panes.insert(pane_id, Pane::Empty);
         application.unload_document_without_views(document_id);
     } else {
         application.workspace.close_focused();
+        application
+            .saved_editor_views
+            .retain(|(id, _), _| *id != pane_id);
         application.unload_document_without_views(document_id);
     }
 }
@@ -163,10 +173,10 @@ pub(super) fn finish_successful_save(
     }
     if application.pending_close_document == Some(document_id) {
         application.pending_close_document = None;
-        if let Some((pane_id, _)) = application.workspace.panes.iter().find(|(_, pane)| {
-            matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
-        }) {
-            application.workspace.focused = *pane_id;
+        if application
+            .focused_editor()
+            .is_some_and(|(id, _)| id == document_id)
+        {
             application.close_focused_editor_view();
         }
         application.overlay = None;
@@ -207,19 +217,43 @@ pub(super) fn open_confirmed_path(
             .split_with_editor(document_id, direction);
         return Ok(());
     }
-    if let Some((pane_id, _)) = application.workspace.panes.iter().find(|(_, pane)| {
-        matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
-    }) {
-        application.workspace.focused = *pane_id;
+    let focused = application.workspace.focused;
+    let existing = if application.workspace.tabs[&focused].contains(&document_id) {
+        Some(focused)
     } else {
-        let focused = application.workspace.focused;
+        application
+            .workspace
+            .tabs
+            .iter()
+            .find_map(|(pane_id, tabs)| tabs.contains(&document_id).then_some(*pane_id))
+    };
+    if let Some(pane_id) = existing {
+        application.switch_editor_document(pane_id, document_id);
+        application.workspace.focused = pane_id;
+    } else {
         let replaced_document = match application.workspace.panes.get(&focused) {
             Some(Pane::Editor { document_id, .. }) => Some(*document_id),
             _ => None,
         };
         application.switch_editor_document(focused, document_id);
         if let Some(replaced_document) = replaced_document {
-            application.unload_pristine_untitled_without_views(replaced_document);
+            let document = application.documents.get(replaced_document);
+            let shared =
+                application.workspace.tabs.iter().any(|(pane_id, tabs)| {
+                    *pane_id != focused && tabs.contains(&replaced_document)
+                });
+            if document.path.is_none() && !document.is_modified() && !shared {
+                application
+                    .workspace
+                    .tabs
+                    .get_mut(&focused)
+                    .unwrap()
+                    .retain(|id| *id != replaced_document);
+                application
+                    .saved_editor_views
+                    .remove(&(focused, replaced_document));
+                application.unload_pristine_untitled_without_views(replaced_document);
+            }
         }
     }
     Ok(())

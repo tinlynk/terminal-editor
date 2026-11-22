@@ -53,6 +53,14 @@ enum WorkbenchDrag {
     BottomTerminal,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TabDrag {
+    source: PaneId,
+    document: DocumentId,
+    origin: (u16, u16),
+    moved: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EditorVisibilityAnchor {
     pane_id: PaneId,
@@ -160,7 +168,7 @@ pub struct Application {
     pub theme: Theme,
     pub clipboard: String,
     pub message: Option<String>,
-    saved_editor_views: BTreeMap<crate::document::DocumentId, crate::editor::EditorView>,
+    saved_editor_views: BTreeMap<(PaneId, DocumentId), crate::editor::EditorView>,
     pending_terminal_control: Vec<u8>,
     pending_close_document: Option<crate::document::DocumentId>,
     quit_in_progress: bool,
@@ -169,6 +177,7 @@ pub struct Application {
     input: InputMapper,
     drag_split: Option<crate::layout::SplitterRect>,
     workbench_drag: Option<WorkbenchDrag>,
+    tab_drag: Option<TabDrag>,
     horizontal_scrollbar_drag_offset: Option<u16>,
     selection_drag: bool,
     scrollbar_drag: bool,
@@ -305,6 +314,7 @@ impl Application {
             input,
             drag_split: None,
             workbench_drag: None,
+            tab_drag: None,
             horizontal_scrollbar_drag_offset: None,
             selection_drag: false,
             scrollbar_drag: false,
@@ -374,6 +384,7 @@ impl Application {
             input: InputMapper::default(),
             drag_split: None,
             workbench_drag: None,
+            tab_drag: None,
             horizontal_scrollbar_drag_offset: None,
             selection_drag: false,
             scrollbar_drag: false,
@@ -441,6 +452,15 @@ impl Application {
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
         let (columns, rows) = crossterm::terminal::size()
             .map_err(|error| AppError::io("could not inspect terminal size", error))?;
+        self.handle_mouse_at(mouse, columns, rows)
+    }
+
+    fn handle_mouse_at(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        columns: u16,
+        rows: u16,
+    ) -> Result<()> {
         let geometry = render::geometry(
             self,
             Rect {
@@ -451,6 +471,39 @@ impl Application {
             },
         );
         self.title_control_hover = geometry.title_controls.action_at(mouse.column, mouse.row);
+        if let Some(mut drag) = self.tab_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    drag.moved |= drag.origin != (mouse.column, mouse.row);
+                    self.tab_drag = Some(drag);
+                    return Ok(());
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.tab_drag = None;
+                    let target = geometry
+                        .pane_layout
+                        .panes
+                        .iter()
+                        .find(|(_, area)| area.contains(mouse.column, mouse.row));
+                    if let Some((&pane_id, &area)) = target {
+                        if drag.moved && pane_id != drag.source {
+                            self.move_editor_tab(drag.source, pane_id, drag.document);
+                        } else if !drag.moved
+                            && pane_id == drag.source
+                            && render::editor_tab_at(self, pane_id, area, mouse.column, mouse.row)
+                                == Some(drag.document)
+                        {
+                            self.switch_editor_document(pane_id, drag.document);
+                            self.workspace.focused = pane_id;
+                            self.focus_owner = FocusOwner::Workspace;
+                        }
+                    }
+                    return Ok(());
+                }
+                MouseEventKind::Down(_) => self.tab_drag = None,
+                _ => {}
+            }
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some(area) = geometry.terminal
             && let Some(index) = render::terminal_tab_at(self, area, mouse.column, mouse.row)
@@ -600,20 +653,30 @@ impl Application {
                     .is_some_and(|area| area.contains(mouse.column, mouse.row))
                 {
                     self.focus_owner = FocusOwner::BottomTerminal;
+                } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && let Some((&pane_id, &pane_area)) = geometry
+                        .pane_layout
+                        .panes
+                        .iter()
+                        .find(|(_, area)| area.contains(mouse.column, mouse.row))
+                    && matches!(
+                        self.workspace.panes.get(&pane_id),
+                        Some(Pane::Editor { .. })
+                    )
+                    && let Some(document) =
+                        render::editor_tab_at(self, pane_id, pane_area, mouse.column, mouse.row)
+                {
+                    self.tab_drag = Some(TabDrag {
+                        source: pane_id,
+                        document,
+                        origin: (mouse.column, mouse.row),
+                        moved: false,
+                    });
                 } else if self
                     .workspace
                     .focus_at(&geometry.pane_layout, mouse.column, mouse.row)
                 {
                     self.focus_owner = FocusOwner::Workspace;
-                    let focused_id = self.workspace.focused;
-                    if let Some(pane_area) = geometry.pane_layout.panes.get(&focused_id)
-                        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                        && let Some(selected_doc_id) =
-                            render::editor_tab_at(self, *pane_area, mouse.column, mouse.row)
-                    {
-                        self.switch_editor_document(focused_id, selected_doc_id);
-                        return Ok(());
-                    }
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         && self.start_horizontal_scrollbar_drag(
                             &geometry.pane_layout,
@@ -870,27 +933,14 @@ impl Application {
         let Some(document_id) = self.open_document_ids().get(index).copied() else {
             return false;
         };
-        if let Some(pane_id) = self.workspace.panes.iter().find_map(|(pane_id, pane)| {
-            matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
-                .then_some(*pane_id)
-        }) {
-            self.workspace.focused = pane_id;
-            self.focus_owner = FocusOwner::Workspace;
-            return true;
-        }
-        let pane_id = if matches!(
-            self.workspace.focused_pane(),
-            Pane::Empty | Pane::Editor { .. }
-        ) {
-            Some(self.workspace.focused)
+        let pane_id = if self.workspace.tabs[&self.workspace.focused].contains(&document_id) {
+            self.workspace.focused
         } else {
             self.workspace
-                .panes
+                .tabs
                 .iter()
-                .find_map(|(pane_id, pane)| matches!(pane, Pane::Editor { .. }).then_some(*pane_id))
-        };
-        let Some(pane_id) = pane_id else {
-            return false;
+                .find_map(|(pane_id, tabs)| tabs.contains(&document_id).then_some(*pane_id))
+                .unwrap_or(self.workspace.focused)
         };
         self.switch_editor_document(pane_id, document_id);
         self.workspace.focused = pane_id;
@@ -1578,13 +1628,7 @@ impl Application {
             return;
         }
         let document_id = self.documents.new_untitled();
-        self.workspace.panes.insert(
-            self.workspace.focused,
-            Pane::Editor {
-                document_id,
-                view: crate::editor::EditorView::default(),
-            },
-        );
+        self.switch_editor_document(self.workspace.focused, document_id);
     }
 
     fn request_quit(&mut self) {
@@ -1610,13 +1654,14 @@ impl Application {
             self.request_quit();
             return Ok(());
         };
-        if let Some((pane_id, _)) = self.workspace.panes.iter().find(|(_, pane)| {
-            matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
-        }) {
-            self.workspace.focused = *pane_id;
-        } else {
-            self.switch_editor_document(self.workspace.focused, document_id);
-        }
+        let pane_id = self
+            .workspace
+            .tabs
+            .iter()
+            .find_map(|(pane_id, tabs)| tabs.contains(&document_id).then_some(*pane_id))
+            .unwrap_or(self.workspace.focused);
+        self.switch_editor_document(pane_id, document_id);
+        self.workspace.focused = pane_id;
         self.focus_owner = FocusOwner::Workspace;
         self.request_close()
     }
@@ -1782,17 +1827,72 @@ impl Application {
     }
 
     fn unload_document_without_views(&mut self, document_id: crate::document::DocumentId) {
-        let still_visible = self.workspace.panes.values().any(|pane| {
-            matches!(pane, Pane::Editor { document_id: open_id, .. } if *open_id == document_id)
-        });
-        if !still_visible {
+        let still_open = self
+            .workspace
+            .tabs
+            .values()
+            .any(|tabs| tabs.contains(&document_id));
+        if !still_open {
             self.deferred_external_changes.remove(&document_id);
             if let Err(error) = self.remove_recovery_for_document(document_id) {
                 self.message = Some(format!("Could not remove recovery data: {error}"));
             }
             self.documents.remove(document_id);
-            self.saved_editor_views.remove(&document_id);
+            self.saved_editor_views
+                .retain(|(_, id), _| *id != document_id);
         }
+    }
+
+    fn move_editor_tab(&mut self, source: PaneId, target: PaneId, document_id: DocumentId) {
+        let Some(index) = self
+            .workspace
+            .tabs
+            .get(&source)
+            .and_then(|tabs| tabs.iter().position(|id| *id == document_id))
+        else {
+            return;
+        };
+        if source == target || !self.workspace.panes.contains_key(&target) {
+            return;
+        }
+
+        let source_view = match &self.workspace.panes[&source] {
+            Pane::Editor {
+                document_id: active,
+                view,
+            } if *active == document_id => Some(view.clone()),
+            _ => self.saved_editor_views.remove(&(source, document_id)),
+        };
+        if !self.workspace.tabs[&target].contains(&document_id)
+            && let Some(view) = source_view
+        {
+            self.saved_editor_views.insert((target, document_id), view);
+        }
+        self.switch_editor_document(target, document_id);
+
+        let tabs = self
+            .workspace
+            .tabs
+            .get_mut(&source)
+            .expect("pane must exist");
+        tabs.remove(index);
+        let next = tabs.get(index.min(tabs.len().saturating_sub(1))).copied();
+        self.saved_editor_views.remove(&(source, document_id));
+        if matches!(&self.workspace.panes[&source], Pane::Editor { document_id: active, .. } if *active == document_id)
+        {
+            self.workspace.panes.insert(source, Pane::Empty);
+            if let Some(next) = next {
+                self.switch_editor_document(source, next);
+            }
+        }
+        if next.is_none() {
+            self.workspace.focused = source;
+            self.workspace.close_focused();
+            self.saved_editor_views
+                .retain(|(pane_id, _), _| *pane_id != source);
+        }
+        self.workspace.focused = target;
+        self.focus_owner = FocusOwner::Workspace;
     }
 
     fn switch_editor_document(
@@ -1808,6 +1908,14 @@ impl Application {
                 Pane::Editor { document_id, view } => Some((*document_id, view.clone())),
                 Pane::Empty => None,
             });
+        let tabs = self
+            .workspace
+            .tabs
+            .get_mut(&pane_id)
+            .expect("pane must exist");
+        if !tabs.contains(&document_id) {
+            tabs.push(document_id);
+        }
         if current
             .as_ref()
             .is_some_and(|(current_id, _)| *current_id == document_id)
@@ -1815,17 +1923,11 @@ impl Application {
             return;
         }
         if let Some((current_id, view)) = current {
-            let remains_visible = self.workspace.panes.iter().any(|(other_id, pane)| {
-                *other_id != pane_id
-                    && matches!(pane, Pane::Editor { document_id, .. } if *document_id == current_id)
-            });
-            if !remains_visible {
-                self.saved_editor_views.insert(current_id, view);
-            }
+            self.saved_editor_views.insert((pane_id, current_id), view);
         }
         let view = self
             .saved_editor_views
-            .remove(&document_id)
+            .remove(&(pane_id, document_id))
             .unwrap_or_default();
         self.workspace
             .panes
@@ -1873,7 +1975,10 @@ impl Application {
                         .map(|position| transform_position(position, change));
                 }
             }
-            if let Some(view) = self.saved_editor_views.get_mut(&document_id) {
+            for ((_, id), view) in &mut self.saved_editor_views {
+                if *id != document_id {
+                    continue;
+                }
                 view.cursor = transform_position(view.cursor, change);
                 view.selection_anchor = view
                     .selection_anchor
@@ -3412,32 +3517,499 @@ mod tests {
         let mut application = Application::new_for_test();
         let first_document = application.focused_document_id().unwrap();
         let second_document = application.documents.new_untitled();
-        let geometry = render::geometry(
-            &application,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 30,
-            },
-        );
+        application.switch_editor_document(application.workspace.focused, second_document);
+        application.switch_editor_document(application.workspace.focused, first_document);
+        let geometry = tab_geometry(&application);
         let focused_id = application.workspace.focused;
         let pane_area = *geometry.pane_layout.panes.get(&focused_id).unwrap();
 
         // First tab is " Untitled ", width is 10 chars, starts at pane_area.x + 1
         // Second tab starts after divider "│"
         // Let's test render::editor_tab_at
-        let clicked_first =
-            render::editor_tab_at(&application, pane_area, pane_area.x + 3, pane_area.y);
+        let clicked_first = render::editor_tab_at(
+            &application,
+            focused_id,
+            pane_area,
+            pane_area.x + 3,
+            pane_area.y,
+        );
         assert_eq!(clicked_first, Some(first_document));
 
-        let clicked_second =
-            render::editor_tab_at(&application, pane_area, pane_area.x + 15, pane_area.y);
+        let clicked_second = render::editor_tab_at(
+            &application,
+            focused_id,
+            pane_area,
+            pane_area.x + 15,
+            pane_area.y,
+        );
         assert_eq!(clicked_second, Some(second_document));
 
-        // Switch via editor tab click
-        application.switch_editor_document(focused_id, second_document);
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Down(MouseButton::Left),
+            pane_area.x + 15,
+            pane_area.y,
+        );
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Up(MouseButton::Left),
+            pane_area.x + 15,
+            pane_area.y,
+        );
         assert_eq!(application.focused_document_id(), Some(second_document));
+    }
+
+    fn tab_mouse(application: &mut Application, kind: MouseEventKind, column: u16, row: u16) {
+        application
+            .handle_mouse_at(
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                120,
+                30,
+            )
+            .unwrap();
+    }
+
+    fn tab_geometry(application: &Application) -> render::WorkbenchGeometry {
+        render::geometry(
+            application,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 30,
+            },
+        )
+    }
+
+    #[test]
+    fn editor_tab_drag_moves_document_and_preserves_views() {
+        for direction in [SplitDirection::Vertical, SplitDirection::Horizontal] {
+            let mut application = Application::new_for_test();
+            let source = application.workspace.focused;
+            let first = application.focused_document_id().unwrap();
+            application.documents.get_mut(first).insert(0, "source");
+            let second = application.documents.new_untitled();
+            application.switch_editor_document(source, second);
+            application.switch_editor_document(source, first);
+            let target = application.workspace.split_with_editor(second, direction);
+            assert_eq!(application.workspace.tabs[&source], vec![first, second]);
+            assert_eq!(application.workspace.tabs[&target], vec![second]);
+            application.documents.get_mut(second).insert(0, "target");
+            let Pane::Editor { view, .. } = application.workspace.panes.get_mut(&source).unwrap()
+            else {
+                panic!("editor");
+            };
+            view.cursor = 3;
+            let source_view = view.clone();
+            let Pane::Editor { view, .. } = application.workspace.panes.get_mut(&target).unwrap()
+            else {
+                panic!("editor");
+            };
+            view.cursor = 4;
+
+            let geometry = tab_geometry(&application);
+            let from = geometry.pane_layout.panes[&source];
+            let to = geometry.pane_layout.panes[&target];
+            // Drag the inactive second tab, without switching the source pane.
+            let x = (from.x + 1..from.x + from.width - 1)
+                .find(|x| {
+                    render::editor_tab_at(&application, source, from, *x, from.y) == Some(second)
+                })
+                .unwrap();
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                from.y,
+            );
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Drag(MouseButton::Left),
+                to.x + 1,
+                to.y + 1,
+            );
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Up(MouseButton::Left),
+                to.x + 1,
+                to.y + 1,
+            );
+            let Pane::Editor { document_id, view } = &application.workspace.panes[&source] else {
+                panic!("editor");
+            };
+            assert_eq!((*document_id, view), (first, &source_view));
+            assert_eq!(application.workspace.focused, target);
+            assert_eq!(application.workspace.tabs[&source], vec![first]);
+            assert_eq!(application.workspace.tabs[&target], vec![second]);
+            assert!(
+                !application
+                    .saved_editor_views
+                    .contains_key(&(source, second))
+            );
+            let Pane::Editor { document_id, view } = &application.workspace.panes[&target] else {
+                panic!("editor");
+            };
+            assert_eq!((*document_id, view.cursor), (second, 4));
+
+            // Move the last source tab and restore the target's saved view.
+            let geometry = tab_geometry(&application);
+            let from = geometry.pane_layout.panes[&source];
+            let to = geometry.pane_layout.panes[&target];
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Down(MouseButton::Left),
+                from.x + 2,
+                from.y,
+            );
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Drag(MouseButton::Left),
+                to.x + 1,
+                to.y + 1,
+            );
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Up(MouseButton::Left),
+                to.x + 1,
+                to.y + 1,
+            );
+            let Pane::Editor { document_id, view } = &application.workspace.panes[&target] else {
+                panic!("editor");
+            };
+            assert_eq!((*document_id, view.cursor), (first, 3));
+            assert_eq!(application.workspace.tabs[&target], vec![second, first]);
+            assert!(!application.workspace.panes.contains_key(&source));
+            assert_eq!(application.workspace.focused, target);
+            application.switch_editor_document(target, second);
+            let Pane::Editor { view, .. } = &application.workspace.panes[&target] else {
+                panic!("editor");
+            };
+            assert_eq!(view.cursor, 4);
+            assert!(application.documents.get(first).is_modified());
+            assert!(application.documents.get(second).is_modified());
+            assert!(application.overlay.is_none());
+        }
+    }
+
+    #[test]
+    fn moving_active_tab_restores_next_source_view_and_existing_target_view() {
+        let mut application = Application::new_for_test();
+        let third = application.workspace.focused;
+        let shared = application.focused_document_id().unwrap();
+        application.documents.get_mut(shared).insert(0, "unsaved");
+        let target = application
+            .workspace
+            .split_contextual(SplitDirection::Vertical);
+        let Pane::Editor { view, .. } = application.workspace.panes.get_mut(&target).unwrap()
+        else {
+            panic!("editor");
+        };
+        view.cursor = 5;
+        let target_other = application.documents.new_untitled();
+        application.switch_editor_document(target, target_other);
+
+        let source = application
+            .workspace
+            .split_with_editor(shared, SplitDirection::Horizontal);
+        let before = application.documents.new_untitled();
+        let after = application.documents.new_untitled();
+        application.switch_editor_document(source, before);
+        application.switch_editor_document(source, after);
+        let Pane::Editor { view, .. } = application.workspace.panes.get_mut(&source).unwrap()
+        else {
+            panic!("editor");
+        };
+        view.cursor = 2;
+        application.switch_editor_document(source, shared);
+        // Put the active tab in the middle to exercise the close-tab selection rule.
+        application
+            .workspace
+            .tabs
+            .get_mut(&source)
+            .unwrap()
+            .swap(0, 1);
+        let geometry = tab_geometry(&application);
+        let from = geometry.pane_layout.panes[&source];
+        let to = geometry.pane_layout.panes[&target];
+        let x = (from.x + 1..from.x + from.width - 1)
+            .find(|x| render::editor_tab_at(&application, source, from, *x, from.y) == Some(shared))
+            .unwrap();
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            from.y,
+        );
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Drag(MouseButton::Left),
+            to.x + 1,
+            to.y + 1,
+        );
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Up(MouseButton::Left),
+            to.x + 1,
+            to.y + 1,
+        );
+
+        assert_eq!(application.workspace.tabs[&source], vec![before, after]);
+        assert!(
+            matches!(&application.workspace.panes[&source], Pane::Editor { document_id, view } if *document_id == after && view.cursor == 2)
+        );
+        assert_eq!(
+            application.workspace.tabs[&target],
+            vec![shared, target_other]
+        );
+        assert!(
+            matches!(&application.workspace.panes[&target], Pane::Editor { document_id, view } if *document_id == shared && view.cursor == 5)
+        );
+        assert_eq!(application.workspace.tabs[&third], vec![shared]);
+        assert_eq!(application.workspace.focused, target);
+        assert_eq!(application.documents.get(shared).text(), "unsaved");
+        assert!(application.documents.get(shared).is_modified());
+        assert!(application.overlay.is_none());
+        assert!(
+            !application
+                .saved_editor_views
+                .contains_key(&(source, shared))
+        );
+        assert!(
+            application
+                .saved_editor_views
+                .contains_key(&(source, before))
+        );
+
+        application.request_close().unwrap();
+        assert!(application.overlay.is_none());
+        assert_eq!(application.documents.get(shared).text(), "unsaved");
+        application.workspace.focused = third;
+        application.request_close().unwrap();
+        assert!(matches!(
+            application.overlay,
+            Some(Overlay::ConfirmDocumentClose)
+        ));
+    }
+
+    #[test]
+    fn moving_inactive_tab_transfers_its_view_without_disturbing_source() {
+        let mut application = Application::new_for_test();
+        let source = application.workspace.focused;
+        let moved = application.focused_document_id().unwrap();
+        application.documents.get_mut(moved).insert(0, "dirty text");
+        let Pane::Editor { view, .. } = application.workspace.panes.get_mut(&source).unwrap()
+        else {
+            panic!("editor");
+        };
+        view.cursor = 4;
+        view.selection_anchor = Some(1);
+        let active = application.documents.new_untitled();
+        application.switch_editor_document(source, active);
+        let target_document = application.documents.new_untitled();
+        let target = application
+            .workspace
+            .split_with_editor(target_document, SplitDirection::Vertical);
+        application.move_editor_tab(source, target, moved);
+
+        assert_eq!(application.workspace.tabs[&source], vec![active]);
+        assert!(
+            matches!(&application.workspace.panes[&source], Pane::Editor { document_id, .. } if *document_id == active)
+        );
+        assert!(
+            matches!(&application.workspace.panes[&target], Pane::Editor { document_id, view } if *document_id == moved && view.cursor == 4 && view.selection_anchor == Some(1))
+        );
+        assert!(
+            !application
+                .saved_editor_views
+                .contains_key(&(source, moved))
+        );
+        assert_eq!(application.documents.get(moved).text(), "dirty text");
+        assert!(application.documents.get(moved).is_modified());
+        assert!(application.overlay.is_none());
+    }
+
+    #[test]
+    fn moving_last_tab_keeps_destination_focused_in_multiple_panes() {
+        let mut application = Application::new_for_test();
+        let first = application.workspace.focused;
+        let document = application.focused_document_id().unwrap();
+        application.documents.get_mut(document).insert(0, "dirty");
+        let target = application
+            .workspace
+            .split_contextual(SplitDirection::Vertical);
+        let source = application
+            .workspace
+            .split_contextual(SplitDirection::Horizontal);
+        application.move_editor_tab(source, target, document);
+
+        assert!(!application.workspace.panes.contains_key(&source));
+        assert!(!application.workspace.tabs.contains_key(&source));
+        assert!(
+            application
+                .saved_editor_views
+                .keys()
+                .all(|(pane, _)| *pane != source)
+        );
+        assert_eq!(application.workspace.focused, target);
+        assert_eq!(application.workspace.tabs[&target], vec![document]);
+        assert_eq!(application.workspace.tabs[&first], vec![document]);
+        assert_eq!(application.documents.get(document).text(), "dirty");
+        assert!(application.overlay.is_none());
+    }
+
+    #[test]
+    fn editor_tab_drag_accepts_empty_pane_and_rejects_invalid_drops() {
+        let mut application = Application::new_for_test();
+        let source = application.workspace.focused;
+        let document = application.focused_document_id().unwrap();
+        let other = application.documents.new_untitled();
+        application.switch_editor_document(source, other);
+        application.switch_editor_document(source, document);
+        let target = application
+            .workspace
+            .split_contextual(SplitDirection::Vertical);
+        application.workspace.panes.insert(target, Pane::Empty);
+        application.workspace.tabs.get_mut(&target).unwrap().clear();
+        application.workspace.focused = source;
+        application.bottom_terminal_visible = true;
+        let geometry = tab_geometry(&application);
+        let from = geometry.pane_layout.panes[&source];
+        let to = geometry.pane_layout.panes[&target];
+        let splitter = geometry.pane_layout.splitters[0].rect;
+        let explorer = geometry.explorer.unwrap();
+        let terminal = geometry.terminal.unwrap();
+        let x = (from.x + 1..from.x + from.width - 1)
+            .find(|x| render::editor_tab_at(&application, source, from, *x, from.y) == Some(other))
+            .unwrap();
+        let source_tabs = application.workspace.tabs[&source].clone();
+        let target_tabs = application.workspace.tabs[&target].clone();
+        for (drop_x, drop_y) in [
+            (from.x + 1, from.y + 1),
+            (splitter.x, splitter.y),
+            (explorer.x, explorer.y + 1),
+            (terminal.x + 1, terminal.y + 1),
+            (119, 29),
+        ] {
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                from.y,
+            );
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Drag(MouseButton::Left),
+                drop_x,
+                drop_y,
+            );
+            tab_mouse(
+                &mut application,
+                MouseEventKind::Up(MouseButton::Left),
+                drop_x,
+                drop_y,
+            );
+            assert!(
+                matches!(application.workspace.panes[&source], Pane::Editor { document_id, .. } if document_id == document)
+            );
+            assert!(matches!(application.workspace.panes[&target], Pane::Empty));
+            assert_eq!(application.workspace.tabs[&source], source_tabs);
+            assert_eq!(application.workspace.tabs[&target], target_tabs);
+            assert_eq!(application.workspace.focused, source);
+            assert!(application.tab_drag.is_none());
+        }
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            from.y,
+        );
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Drag(MouseButton::Left),
+            to.x + 1,
+            to.y + 1,
+        );
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Up(MouseButton::Left),
+            to.x + 1,
+            to.y + 1,
+        );
+        assert!(
+            matches!(application.workspace.panes[&source], Pane::Editor { document_id, .. } if document_id == document)
+        );
+        assert!(
+            matches!(application.workspace.panes[&target], Pane::Editor { document_id, .. } if document_id == other)
+        );
+        assert_eq!(application.workspace.tabs[&source], vec![document]);
+        assert_eq!(application.workspace.tabs[&target], vec![other]);
+        assert!(
+            !application
+                .saved_editor_views
+                .contains_key(&(source, other))
+        );
+    }
+
+    #[test]
+    fn editor_tab_drag_cancels_on_interruption_and_respects_header_bounds() {
+        let mut application = Application::new_for_test();
+        let source = application.workspace.focused;
+        let document = application.focused_document_id().unwrap();
+        let other = application.documents.new_untitled();
+        let target = application
+            .workspace
+            .split_with_editor(other, SplitDirection::Vertical);
+        application.workspace.focused = source;
+        let geometry = tab_geometry(&application);
+        let from = geometry.pane_layout.panes[&source];
+        let to = geometry.pane_layout.panes[&target];
+        assert_eq!(
+            render::editor_tab_at(&application, source, from, from.x, from.y),
+            None
+        );
+        assert_eq!(
+            render::editor_tab_at(&application, source, from, from.x + from.width - 1, from.y),
+            None
+        );
+
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Down(MouseButton::Left),
+            from.x + 2,
+            from.y,
+        );
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Null,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert!(application.tab_drag.is_none());
+        tab_mouse(
+            &mut application,
+            MouseEventKind::Up(MouseButton::Left),
+            to.x + 1,
+            to.y + 1,
+        );
+        assert!(
+            matches!(application.workspace.panes[&source], Pane::Editor { document_id, .. } if document_id == document)
+        );
+        assert!(
+            matches!(application.workspace.panes[&target], Pane::Editor { document_id, .. } if document_id == other)
+        );
+        assert_eq!(application.workspace.focused, source);
+
+        application.config.effective.editor.header_style =
+            crate::config::EditorHeaderStyle::Breadcrumbs;
+        assert_eq!(
+            render::editor_tab_at(&application, source, from, from.x + 2, from.y),
+            None
+        );
     }
 
     #[test]
@@ -4210,7 +4782,7 @@ mod tests {
         application
             .apply(Command::Insert("modified".to_owned()))
             .unwrap();
-        let other_document = application.documents.new_untitled();
+        let source = application.workspace.focused;
         application
             .apply(Command::Split(SplitDirection::Vertical))
             .unwrap();
@@ -4219,11 +4791,155 @@ mod tests {
         application.apply(Command::ClosePane).unwrap();
 
         assert!(application.overlay.is_none());
-        assert_eq!(application.workspace.panes.len(), 2);
-        assert_eq!(application.workspace.focused, split_pane);
-        assert_eq!(application.focused_document_id(), Some(other_document));
+        assert_eq!(application.workspace.panes.len(), 1);
+        assert_eq!(application.workspace.focused, source);
+        assert!(!application.workspace.panes.contains_key(&split_pane));
+        assert_eq!(application.focused_document_id(), Some(shared_document));
         assert!(application.documents.get(shared_document).is_modified());
         assert!(application.open_document_ids().contains(&shared_document));
+    }
+
+    #[test]
+    fn split_tabs_are_local_and_closing_a_shared_inactive_tab_preserves_dirty_data() {
+        let mut application = Application::new_for_test();
+        let source = application.workspace.focused;
+        let shared = application.focused_document_id().unwrap();
+        application.apply(Command::Insert("dirty".into())).unwrap();
+        let other = application.documents.new_untitled();
+        application.switch_editor_document(source, other);
+        application.switch_editor_document(source, shared);
+        application
+            .apply(Command::Split(SplitDirection::Vertical))
+            .unwrap();
+        let target = application.workspace.focused;
+        assert_eq!(application.workspace.tabs[&source], vec![shared, other]);
+        assert_eq!(application.workspace.tabs[&target], vec![shared]);
+
+        application.switch_editor_document(source, other);
+        application.apply(Command::ClosePane).unwrap();
+        assert!(application.overlay.is_none());
+        assert!(!application.workspace.panes.contains_key(&target));
+        assert_eq!(application.workspace.tabs[&source], vec![shared, other]);
+        assert!(application.documents.get(shared).is_modified());
+
+        application.workspace.focused = source;
+        application.switch_editor_document(source, shared);
+        application.apply(Command::ClosePane).unwrap();
+        assert_eq!(application.overlay, Some(Overlay::ConfirmDocumentClose));
+        assert!(application.documents.get(shared).is_modified());
+    }
+
+    #[test]
+    fn inactive_views_are_pane_local_and_track_shared_edits() {
+        let mut application = Application::new_for_test();
+        let source = application.workspace.focused;
+        let shared = application.focused_document_id().unwrap();
+        application.apply(Command::Insert("abcdef".into())).unwrap();
+        let target = application
+            .workspace
+            .split_contextual(SplitDirection::Vertical);
+        let Pane::Editor { view, .. } = application.workspace.panes.get_mut(&target).unwrap()
+        else {
+            panic!("editor");
+        };
+        view.cursor = 3;
+        view.selection_anchor = Some(2);
+        let other = application.documents.new_untitled();
+        application.switch_editor_document(target, other);
+        application.workspace.focused = source;
+        let Pane::Editor { view, .. } = application.workspace.focused_pane_mut() else {
+            panic!("editor");
+        };
+        view.cursor = 0;
+        application.apply(Command::Insert("X".into())).unwrap();
+        application.switch_editor_document(target, shared);
+        let Pane::Editor { view, .. } = &application.workspace.panes[&target] else {
+            panic!("editor");
+        };
+        assert_eq!(view.cursor, 4);
+        assert_eq!(view.selection_anchor, Some(3));
+        assert_eq!(application.documents.get(shared).text(), "Xabcdef");
+    }
+
+    #[test]
+    fn opening_in_a_split_adds_only_to_that_pane_and_explorer_finds_inactive_tabs() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let mut application = application_with_startup_path(directory.path());
+        application.apply(Command::Open(first)).unwrap();
+        let first_id = application.focused_document_id().unwrap();
+        let source = application.workspace.focused;
+        application
+            .apply(Command::Split(SplitDirection::Vertical))
+            .unwrap();
+        let target = application.workspace.focused;
+        application.apply(Command::Open(second)).unwrap();
+        let second_id = application.focused_document_id().unwrap();
+        assert_eq!(application.workspace.tabs[&source], vec![first_id]);
+        assert_eq!(
+            application.workspace.tabs[&target],
+            vec![first_id, second_id]
+        );
+        application.workspace.focused = source;
+        let area = Rect {
+            x: 0,
+            y: 1,
+            width: 24,
+            height: 20,
+        };
+        assert!(application.activate_open_editor_at(area.y + 3, area));
+        assert_eq!(application.workspace.focused, target);
+        assert_eq!(application.focused_document_id(), Some(second_id));
+        assert_eq!(application.workspace.tabs[&source], vec![first_id]);
+    }
+
+    #[test]
+    fn opening_a_file_keeps_a_shared_pristine_tab_in_both_panes() {
+        let mut application = Application::new_for_test();
+        let shared = application.focused_document_id().unwrap();
+        let source = application.workspace.focused;
+        application
+            .apply(Command::Split(SplitDirection::Vertical))
+            .unwrap();
+        let target = application.workspace.focused;
+        let path = application.explorer.root.join("opened.txt");
+        fs::write(&path, "file").unwrap();
+        application.apply(Command::Open(path)).unwrap();
+        let opened = application.focused_document_id().unwrap();
+        assert_eq!(application.workspace.tabs[&source], vec![shared]);
+        assert_eq!(application.workspace.tabs[&target], vec![shared, opened]);
+    }
+
+    #[test]
+    fn quit_finds_dirty_inactive_tabs_shared_with_another_pane() {
+        let mut application = Application::new_for_test();
+        let source = application.workspace.focused;
+        let shared = application.focused_document_id().unwrap();
+        application.apply(Command::Insert("dirty".into())).unwrap();
+        let target = application
+            .workspace
+            .split_contextual(SplitDirection::Vertical);
+        let other = application.documents.new_untitled();
+        application.switch_editor_document(target, other);
+        application.workspace.focused = source;
+        let third = application.documents.new_untitled();
+        application.switch_editor_document(source, third);
+
+        application.apply(Command::Quit).unwrap();
+        assert_eq!(application.overlay, Some(Overlay::ConfirmDocumentClose));
+        assert_eq!(application.focused_document_id(), Some(shared));
+        assert!(application.documents.get(shared).is_modified());
+        application
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert!(application.running);
+        assert!(application.documents.get(shared).is_modified());
     }
 
     #[test]
