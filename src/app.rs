@@ -4662,6 +4662,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("file.txt");
         fs::write(&path, "original").unwrap();
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
         let mut application = Application::new_for_test();
         let (document_id, _) = application.documents.open(&path).unwrap();
         application.switch_editor_document(application.workspace.focused, document_id);
@@ -4669,7 +4670,13 @@ mod tests {
             .documents
             .get_mut(document_id)
             .insert(8, " local");
-        fs::write(&path, "external").unwrap();
+        fs::write(&path, "external change").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
         let now = Instant::now();
         application.last_external_file_check = now - Duration::from_secs(2);
 
@@ -4826,12 +4833,15 @@ mod tests {
         let mut application = Application::new_for_test();
         let (document_id, _) = application.documents.open(&path).unwrap();
         application.switch_editor_document(application.workspace.focused, document_id);
-        fs::write(&path, "external").unwrap();
+        fs::write(&path, "external change").unwrap();
         let now = Instant::now();
         application.last_external_file_check = now - Duration::from_secs(2);
 
         assert!(application.refresh_document_lifecycle(now));
-        assert_eq!(application.documents.get(document_id).text(), "external");
+        assert_eq!(
+            application.documents.get(document_id).text(),
+            "external change"
+        );
         assert!(application.overlay.is_none());
     }
 
@@ -4847,7 +4857,7 @@ mod tests {
             .documents
             .get_mut(document_id)
             .insert(8, " local");
-        fs::write(&path, "external").unwrap();
+        fs::write(&path, "external change").unwrap();
         let now = Instant::now();
         application.last_external_file_check = now - Duration::from_secs(2);
         application.refresh_document_lifecycle(now);
